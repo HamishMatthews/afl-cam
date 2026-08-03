@@ -1,0 +1,24 @@
+# Obsidian personal config
+.obsidian/
+workspace*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Test captures
+*.mp4
+*.mkv
+*.avi
+*.mov
+captures/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
