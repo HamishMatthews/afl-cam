@@ -13,11 +13,27 @@ venv/
 *.mkv
 *.avi
 *.mov
+*.wav
 captures/
+outputs/
+test_outputs/
+calibration/
+
+# Personal Obsidian notes (project overview lives in README.md)
+# Project Overview.md
+
+# uv
+.python-version
 
 # System files
 .DS_Store
 Thumbs.db
+
+# Database
+*.db
+
+# Python egg-info
+*.egg-info/
 
 # IDE
 .vscode/
