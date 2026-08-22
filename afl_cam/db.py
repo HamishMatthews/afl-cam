@@ -21,7 +21,7 @@ class RecordingDB:
         self.path = Path(path) if path else DB_PATH
         self._conn: Optional[sqlite3.Connection] = None
 
-    # -- connection management --
+
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -100,28 +100,31 @@ class RecordingDB:
                     (session_id, rid))
         self.conn.commit()
 
-    # -- CRUD: recordings --
+
 
     def add(self, camera: str, device_path: str, resolution: str,
             file_path: str, framerate: int = 30, status: str = "recording",
             notes: str = "", session_id: Optional[int] = None,
-            created_at: Optional[str] = None) -> int:
+            created_at: Optional[str] = None, codec: str = "MJPEG",
+            container: str = "AVI") -> int:
         """Insert a new recording row. Returns the new row id."""
         if session_id is not None:
             cursor = self.conn.execute(
                 """INSERT INTO recordings
                    (camera, device_path, resolution, framerate, file_path,
-                    status, notes, session_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, notes, session_id, created_at, codec, container)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (camera, device_path, resolution, framerate, file_path,
-                 status, notes, session_id, created_at),
+                 status, notes, session_id, created_at, codec, container),
             )
         else:
             cursor = self.conn.execute(
                 """INSERT INTO recordings
-                   (camera, device_path, resolution, framerate, file_path, status, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (camera, device_path, resolution, framerate, file_path, status, notes),
+                   (camera, device_path, resolution, framerate, file_path,
+                    status, notes, codec, container)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (camera, device_path, resolution, framerate, file_path,
+                 status, notes, codec, container),
             )
         self.conn.commit()
         return cursor.lastrowid
@@ -147,7 +150,7 @@ class RecordingDB:
         )
         self.conn.commit()
 
-    # -- sessions --
+
 
     def add_session(self, created_at: str, folder: Optional[str] = None,
                     stitch_status: str = "none", notes: str = "") -> int:
@@ -251,7 +254,7 @@ class RecordingDB:
         self.conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
         self.conn.commit()
 
-    # -- formatting --
+
 
     def file_size_fmt(self, size_bytes: Optional[int]) -> str:
         """Human-readable file size."""

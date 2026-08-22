@@ -577,8 +577,44 @@ class _FFmpegVideoToolboxEncoder:
         return self._out_path
 
 
+class _FFmpegMPPEncoder:
+    """Rockchip MPP H.264 encode (RK3588) via the ffmpeg-rockchip build."""
+
+    def __init__(self, out_path: Path, fps: int, width: int, height: int, bitrate: str = "30M"):
+        self._out_path = out_path
+        # The fork's default pix-fmt negotiation picks nv16 and stalls on a
+        # software 422 conversion — force nv12 (see orange_pi_5_max_setup.md §5).
+        self._proc = subprocess.Popen([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-framerate", str(fps),
+            "-i", "pipe:0", "-vf", "format=nv12",
+            "-c:v", "h264_rkmpp", "-b:v", bitrate, str(out_path)
+        ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def write(self, frame_bgr: np.ndarray) -> None:
+        if self._proc.stdin:
+            try:
+                self._proc.stdin.write(frame_bgr.tobytes())
+            except BrokenPipeError:
+                pass
+
+    def close(self) -> Path:
+        if self._proc.stdin:
+            self._proc.stdin.close()
+        rc = self._proc.wait()
+        if rc != 0:
+            detail = self._proc.stderr.read().decode(errors="replace").strip()
+            raise RuntimeError(f"ffmpeg MPP encoder exited with code {rc}: {detail}")
+        return self._out_path
+
+
 def _open_encoder(out_path: Path, fps: int, width: int, height: int):
-    """One hardware encoder per OS: VAAPI on Linux, VideoToolbox on macOS."""
+    """One hardware encoder per OS/hardware.
+
+    RK3588 → h264_rkmpp (rockchip ffmpeg build), Intel Linux → VAAPI,
+    macOS → VideoToolbox.
+    """
     import shutil
     if shutil.which("ffmpeg") is None:
         raise StitchError(
@@ -586,6 +622,8 @@ def _open_encoder(out_path: Path, fps: int, width: int, height: int):
             "or brew install ffmpeg on macOS)")
     if sys.platform == "darwin":
         return _FFmpegVideoToolboxEncoder(out_path, fps, width, height)
+    if Path("/dev/mpp_service").exists():
+        return _FFmpegMPPEncoder(out_path, fps, width, height)
     return _FFmpegVAAPIEncoder(out_path, fps, width, height)
 
 
@@ -646,15 +684,15 @@ def _moving_average(a: np.ndarray, n: int) -> np.ndarray:
     return ret[n - 1:] / n
 
 
-def _estimate_frame_lag(cap0: cv2.VideoCapture, cap1: cv2.VideoCapture, overlap_dx: int, max_lag: int = 45) -> Tuple[int, float]:
+def _estimate_frame_lag(cap0, cap1, overlap_dx: int, max_lag: int = 45) -> Tuple[int, float]:
     w, h = 256, 144
     sx0 = int(overlap_dx * w / 3840)
     sw = w - sx0
     if sw < 20:
         return 0, 0.0
 
-    def _signature(cap: cv2.VideoCapture, x0: int, x1: int) -> np.ndarray:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    def _signature(cap, x0: int, x1: int) -> np.ndarray:
+        cap.seek_to(0)
         sig = []
         prev = None
         while True:
@@ -695,19 +733,115 @@ def _estimate_frame_lag(cap0: cv2.VideoCapture, cap1: cv2.VideoCapture, overlap_
     return best_lag, best_score
 
 
+class _CVFrameReader:
+    """Uniform reader interface over cv2.VideoCapture (AVI/MJPEG recordings)."""
+
+    def __init__(self, path: Path):
+        self._cap = cv2.VideoCapture(str(path))
+
+    def read(self):
+        return self._cap.read()
+
+    def seek_to(self, n: int):
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, n)
+
+    def release(self):
+        self._cap.release()
+
+
+class _H264FrameReader:
+    """Decode a raw .h264 elementary stream into BGR frames via an ffmpeg pipe.
+
+    Raw ES has no container index, so seek_to(n) restarts the decoder and
+    skips n frames — fine for the small clap-sync offsets used here.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.width, self.height = self._probe()
+        self._frame_bytes = self.width * self.height * 3
+        self._proc = None
+        self._start(0)
+
+    def _probe(self):
+        import subprocess as sp
+        try:
+            out = sp.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                 str(self.path)],
+                capture_output=True, text=True, timeout=15,
+            ).stdout.strip().split(",")
+            return int(out[0]), int(out[1])
+        except (ValueError, IndexError, sp.TimeoutExpired):
+            raise StitchError(f"Cannot probe {self.path} — not a decodable video")
+
+    def _stop_proc(self):
+        """Stop the decoder process.
+
+        Close the read end first — ffmpeg may be blocked writing into the
+        full pipe, and a SIGTERM alone doesn't interrupt that write.
+        """
+        if not self._proc:
+            return
+        try:
+            self._proc.stdout.close()
+        except Exception:
+            pass
+        if self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+
+    def _start(self, skip: int):
+        self._stop_proc()
+        self._proc = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-i", str(self.path), "-f", "rawvideo", "-pix_fmt", "bgr24",
+             "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for _ in range(skip):
+            if not self.read()[0]:
+                break
+
+    def read(self):
+        buf = self._proc.stdout.read(self._frame_bytes)
+        if len(buf) < self._frame_bytes:
+            return False, None
+        return True, np.frombuffer(buf, dtype=np.uint8).reshape(
+            self.height, self.width, 3)
+
+    def seek_to(self, n: int):
+        self._start(n)
+
+    def release(self):
+        self._stop_proc()
+        self._proc = None
+
+
+def _open_video_reader(path: Path):
+    """Reader for a recording: ffmpeg pipe for .mp4/.h264, OpenCV for .avi."""
+    if path.suffix.lower() in (".h264", ".mp4"):
+        return _H264FrameReader(path)
+    return _CVFrameReader(path)
+
+
 def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
                        fps: int = 30, mode: str = "quality",
                        output_width: int = 3840,
                        progress: Optional[Callable[[str], None]] = None) -> dict:
-    """Stitch a recorded AVI pair into out_dir."""
+    """Stitch a recorded cam0/cam1 pair (.h264 native or .avi legacy) into out_dir."""
 
     def _report(msg: str):
         log.info(f"stitch: {msg}")
         if progress:
             progress(msg)
 
-    cap0 = cv2.VideoCapture(str(cam0_path))
-    cap1 = cv2.VideoCapture(str(cam1_path))
+    cap0 = _open_video_reader(cam0_path)
+    cap1 = _open_video_reader(cam1_path)
 
     ok0, f0_raw = cap0.read()
     ok1, f1_raw = cap1.read()
@@ -738,8 +872,8 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
         else:
             _report("frame sync: cannot locate overlap, assuming 0 offset")
 
-    cap0.set(cv2.CAP_PROP_POS_FRAMES, max(0, -advance1))
-    cap1.set(cv2.CAP_PROP_POS_FRAMES, max(0, advance1))
+    cap0.seek_to(max(0, -advance1))
+    cap1.seek_to(max(0, advance1))
 
     ok0, f0 = cap0.read()
     ok1, f1 = cap1.read()

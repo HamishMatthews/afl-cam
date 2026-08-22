@@ -13,9 +13,10 @@ from typing import Optional
 
 from .config import CAMERAS, RESOLUTIONS, DEFAULT_RESOLUTION, CAPTURES_DIR, DB_PATH, ROOT_DIR, PLATFORM
 from .capture import (camera_device, camera_present, capture_frame,
-                      set_auto_exposure, start_audio_capture, stop_audio_procs)
+                      set_auto_exposure, set_manual_exposure,
+                      start_audio_capture, stop_audio_procs)
 from .db import RecordingDB
-from .engine import make_recorder
+from .engine import make_recorder, is_rockchip
 
 log = logging.getLogger("afl_cam.cli")
 
@@ -114,6 +115,8 @@ def _start_session_recording(db, cameras, res_key, duration_sec):
             file_path=str(output.relative_to(ROOT_DIR)),
             framerate=res["fps"], status="recording",
             session_id=session_id, created_at=session_time,
+            codec=getattr(recorder, "codec", "MJPEG"),
+            container=getattr(recorder, "container", "AVI"),
         )
         recorders.append((recorder, row_id, output))
         print(f"  {c} → {session_dir.name}/{output.name}")
@@ -126,10 +129,15 @@ def _start_session_recording(db, cameras, res_key, duration_sec):
             audio_procs.append(proc)
             print(f"  {c} mic → {session_dir.name}/{c}.wav")
 
-    # Set auto exposure AFTER the streams open — opening a 4K stream can
-    # reset controls, and mode 1 (Manual) records almost-black frames.
-    for c in cameras:
-        set_auto_exposure(c)
+    # Exposure: on RK3588 the native recorder needs fixed manual exposure
+    # (auto-exposure can settle at ~50 ms and cap the sensor at ~20 fps);
+    # on other Linux the GStreamer path sets AE after the streams open.
+    if is_rockchip():
+        for c in cameras:
+            set_manual_exposure(c)
+    else:
+        for c in cameras:
+            set_auto_exposure(c)
 
     return session_id, session_dir, recorders, audio_procs
 
@@ -289,7 +297,7 @@ def cmd_list(args):
 
 
 def cmd_play(args):
-    """Play a recording in VLC."""
+    """Play a recording in mpv."""
     db = RecordingDB(DB_PATH)
     rec = db.get(args.id)
     db.close()
@@ -307,7 +315,8 @@ def cmd_play(args):
         sys.exit(1)
 
     print(f"Playing: {rec['camera']} — {rec['resolution']} — {filepath.name}")
-    subprocess.Popen(["vlc", str(filepath)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(["mpv", str(filepath)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def cmd_info(args):
@@ -401,24 +410,33 @@ def _resolve_session_dir(db, session) -> Optional[Path]:
 
 
 def _session_recording_paths(db, session) -> tuple[Optional[Path], Optional[Path]]:
-    """Locate cam0/cam1 recordings for a session (folder first, DB paths as fallback)."""
+    """Locate cam0/cam1 recordings for a session.
+
+    Prefers the exact file_path stored in the DB (covers both .h264 native
+    recordings and legacy .avi), with a folder scan as fallback.
+    """
     folder = _resolve_session_dir(db, session)
-    cam0 = folder / "cam0.avi"
-    cam1 = folder / "cam1.avi"
+    cam0 = cam1 = None
     for rec in db.session_recordings(session["id"]):
-        if not (cam0.exists()) and rec["camera"] == "cam0" and rec["file_path"]:
-            p = Path(rec["file_path"])
-            if not p.is_absolute():
-                p = ROOT_DIR / p
-            if p.exists():
+        if rec["camera"] not in ("cam0", "cam1") or not rec["file_path"]:
+            continue
+        p = Path(rec["file_path"])
+        if not p.is_absolute():
+            p = ROOT_DIR / p
+        if p.exists():
+            if rec["camera"] == "cam0":
                 cam0 = p
-        if not (cam1.exists()) and rec["camera"] == "cam1" and rec["file_path"]:
-            p = Path(rec["file_path"])
-            if not p.is_absolute():
-                p = ROOT_DIR / p
-            if p.exists():
+            elif rec["camera"] == "cam1":
                 cam1 = p
-    return cam0 if cam0.exists() else None, cam1 if cam1.exists() else None
+    for label, ext in (("cam0", "mp4"), ("cam0", "h264"), ("cam0", "avi"),
+                       ("cam1", "mp4"), ("cam1", "h264"), ("cam1", "avi")):
+        candidate = folder / f"{label}.{ext}"
+        if candidate.exists():
+            if label == "cam0" and cam0 is None:
+                cam0 = candidate
+            elif label == "cam1" and cam1 is None:
+                cam1 = candidate
+    return cam0, cam1
 
 
 def _stitch_session(db, session, args) -> bool:
@@ -524,7 +542,7 @@ def cmd_stitch_video(args):
     return 0 if ok else 1
 
 
-# ── path helpers ────────────────────────────────────────────────────────────
+# path helpers
 
 def _resolve_path(p: str, out_dir: Path) -> Path:
     """Resolve a path string: absolute, relative to out_dir, or relative to cwd."""

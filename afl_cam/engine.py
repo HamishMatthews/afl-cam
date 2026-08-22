@@ -1,9 +1,10 @@
 """Camera preview and recording backends.
 
-Linux uses GStreamer (v4l2src, MJPEG passthrough into AVI). macOS uses
-OpenCV's AVFoundation backend (VideoCapture + MJPEG VideoWriter). Both
-expose the same interface; make_preview()/make_recorder() select the
-backend for the current OS.
+Linux/RK3588 uses the native MPP recorder (V4L2 MJPEG → jpegd → rkvenc → .h264).
+Other Linux uses GStreamer (v4l2src, MJPEG passthrough into AVI). macOS uses
+OpenCV's AVFoundation backend (VideoCapture + MJPEG VideoWriter). All backends
+expose the same interface; make_preview()/make_recorder() select the backend
+for the current OS/hardware.
 """
 
 import logging
@@ -32,9 +33,7 @@ if PLATFORM != "darwin":
     Gst.init(None)
 
 
-# ---------------------------------------------------------------------------
 # Utilities
-# ---------------------------------------------------------------------------
 
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -44,9 +43,7 @@ def _make_filename(camera: str, resolution_key: str) -> str:
     return f"{camera}_{_timestamp()}_{resolution_key}.{CONTAINER}"
 
 
-# ---------------------------------------------------------------------------
 # Linux backend — GStreamer pipelines
-# ---------------------------------------------------------------------------
 
 def _bus_watch(pipeline: Gst.Pipeline, on_eos: Callable, on_error: Callable):
     """GLib-free bus poller — runs in a thread, calls back on EOS/error."""
@@ -91,7 +88,7 @@ class CameraPreview:
         self._callback: Optional[Callable] = None
         self._lock = Lock()
 
-    # -- pipeline construction --
+
 
     def _build(self):
         pipe = (
@@ -104,7 +101,7 @@ class CameraPreview:
         self._pipeline = Gst.parse_launch(pipe)
         self._sink = self._pipeline.get_by_name("sink")
 
-    # -- control --
+
 
     def start(self, on_frame: Callable):
         """Start preview. *on_frame* is called with (bytes, width, height)."""
@@ -135,7 +132,7 @@ class CameraPreview:
     def running(self) -> bool:
         return self._running
 
-    # -- frame delivery --
+
 
     def _on_new_sample(self, sink) -> Gst.FlowReturn:
         sample = sink.emit("pull-sample")
@@ -174,7 +171,7 @@ class CameraRecorder:
         self._running = False
         self._lock = Lock()
 
-    # -- pipeline --
+
 
     def _build(self, output: Path, num_buffers: int = 0):
         """Build the recording pipeline.
@@ -193,7 +190,7 @@ class CameraRecorder:
         self._pipeline = Gst.parse_launch(pipe)
         self._output_path = output
 
-    # -- control --
+
 
     def start(self, duration_sec: float = 0,
               on_done: Optional[Callable] = None,
@@ -274,9 +271,188 @@ class CameraRecorder:
         return self._output_path
 
 
-# ---------------------------------------------------------------------------
+# Rockchip backend — native MPP recorder (V4L2 → jpegd → rkvenc → .h264)
+
+def is_rockchip() -> bool:
+    """True on RK3588-class boards (vendor kernel with the MPP service node)."""
+    return PLATFORM == "linux" and Path("/dev/mpp_service").exists()
+
+
+def ensure_cam2h264() -> Optional[Path]:
+    """Compile the native recorder if missing or older than its source.
+
+    Returns the binary path, or None if the build fails (gcc/librockchip_mpp
+    missing — see orange_pi_5_max_setup.md).
+    """
+    import subprocess
+
+    from .config import NATIVE_RECORDER_BIN, NATIVE_RECORDER_SRC
+
+    if NATIVE_RECORDER_BIN.exists() and NATIVE_RECORDER_SRC.exists() and \
+            NATIVE_RECORDER_BIN.stat().st_mtime >= NATIVE_RECORDER_SRC.stat().st_mtime:
+        return NATIVE_RECORDER_BIN
+
+    cmd = [
+        "gcc", "-O2", "-I/usr/local/include/rockchip",
+        "-o", str(NATIVE_RECORDER_BIN), str(NATIVE_RECORDER_SRC),
+        "-L/usr/local/lib", "-lrockchip_mpp", "-lpthread",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.error("cam2h264 build failed: %s", e)
+        return None
+    if result.returncode != 0:
+        log.error("cam2h264 build failed: %s", result.stderr.strip())
+        return None
+    log.info("Built native recorder: %s", NATIVE_RECORDER_BIN)
+    return NATIVE_RECORDER_BIN
+
+
+class CameraRecorderMPP:
+    """Native hardware recorder for a single camera (RK3588).
+
+    Runs the cam2h264 binary: USB MJPEG capture → jpegd decode (NV12, hardware)
+    → rkvenc H.264 encode (hardware) → raw .h264 elementary stream. No ffmpeg,
+    no format conversions; ~0.2 cores per stream at 4K30.
+
+    Exposes the same interface as CameraRecorder.
+    """
+
+    codec = "H264"
+    container = "mp4"
+
+    def __init__(self, device: str, label: str = "",
+                 resolution_key: str = DEFAULT_RESOLUTION):
+        self.device = device
+        self.label = label or device
+        self.resolution_key = resolution_key
+        res = RESOLUTIONS[resolution_key]
+        self.width = res["width"]
+        self.height = res["height"]
+        self.fps = res["fps"]
+
+        self._proc = None
+        self._monitor: Optional[Thread] = None
+        self._start_time: float = 0
+        self._on_done: Optional[Callable] = None
+        self._output_path: Optional[Path] = None
+        self._raw_path: Optional[Path] = None
+        self._running = False
+        self._lock = Lock()
+
+
+
+    def start(self, duration_sec: float = 0,
+              on_done: Optional[Callable] = None,
+              output_dir: Optional[Path] = None) -> Path:
+        """Start recording (see CameraRecorder.start for the contract)."""
+        import signal
+        import subprocess
+
+        from .config import CAPTURES_DIR
+
+        with self._lock:
+            if self._running:
+                raise RuntimeError(f"Already recording: {self.label}")
+
+            recorder = ensure_cam2h264()
+            if recorder is None:
+                raise RuntimeError(
+                    "Native recorder unavailable — build it first "
+                    "(see orange_pi_5_max_setup.md §8)")
+
+            if output_dir is not None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output = output_dir / f"{self.label}.mp4"
+            else:
+                output = CAPTURES_DIR / _make_filename(self.label, self.resolution_key)
+                CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+
+            # The recorder writes a raw H.264 elementary stream; it gets
+            # remuxed (stream copy, no re-encode) to .mp4 on completion.
+            raw = output.with_suffix(".raw.h264")
+
+            # 0 = record until stop(); otherwise record exactly N frames
+            frames = int(duration_sec * self.fps) if duration_sec > 0 else 0
+
+            log_path = output.with_suffix(".rec.log")
+            cmd = [str(recorder), self.device, str(raw), str(frames),
+                   str(self.width), str(self.height), str(self.fps)]
+
+            self._output_path = output
+            self._raw_path = raw
+            self._on_done = on_done
+            self._start_time = time.time()
+            self._running = True
+
+            with open(log_path, "w") as logf:
+                self._proc = subprocess.Popen(
+                    cmd, stdout=logf, stderr=subprocess.STDOUT)
+
+            log.info("Recording started: %s → %s (%dx%d, %.0fs, MPP native)",
+                     self.label, output.name, self.width, self.height, duration_sec)
+
+            self._monitor = Thread(target=self._wait_proc, daemon=True)
+            self._monitor.start()
+
+            return output
+
+    def _wait_proc(self):
+        rc = self._proc.wait() if self._proc else 1
+        elapsed = time.time() - self._start_time
+        with self._lock:
+            self._running = False
+            output = self._output_path
+            raw = self._raw_path
+            on_done = self._on_done
+        ok = rc == 0 and raw is not None and raw.exists() and \
+            self._remux(raw, output)
+        log.info("Recording %s: %s (%.1fs, rc=%d)",
+                 "complete" if ok else "error", self.label, elapsed, rc)
+        if on_done:
+            on_done(ok, output, elapsed)
+
+    @staticmethod
+    def _remux(raw: Path, out: Path) -> bool:
+        """Stream-copy the raw H.264 ES into an .mp4 container (no re-encode)."""
+        import subprocess
+
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-i", str(raw), "-c", "copy", str(out)],
+            capture_output=True, text=True, timeout=60)
+        if result.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            raw.unlink(missing_ok=True)
+            return True
+        log.error("remux failed for %s: %s", raw.name, result.stderr.strip())
+        return False
+
+    def stop(self):
+        """Signal the recorder to finish (SIGINT → graceful flush)."""
+        import signal
+
+        with self._lock:
+            if not self._running:
+                return
+            log.info("Stopping recording: %s", self.label)
+            proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @property
+    def output_path(self) -> Optional[Path]:
+        return self._output_path
+
+
 # macOS backend — OpenCV (AVFoundation)
-# ---------------------------------------------------------------------------
 
 class CameraPreviewCV:
     """Low-res live preview for a single camera (macOS).
@@ -443,9 +619,7 @@ class CameraRecorderCV:
         return self._output_path
 
 
-# ---------------------------------------------------------------------------
 # Backend selection
-# ---------------------------------------------------------------------------
 
 def make_preview(device: str, label: str = "",
                  width: int = PREVIEW_WIDTH, height: int = PREVIEW_HEIGHT,
@@ -458,7 +632,13 @@ def make_preview(device: str, label: str = "",
 
 def make_recorder(device: str, label: str = "",
                   resolution_key: str = DEFAULT_RESOLUTION):
-    """Recording backend for the current OS."""
+    """Recording backend for the current OS/hardware.
+
+    macOS → OpenCV/AVFoundation; RK3588 Linux → native MPP recorder;
+    other Linux → GStreamer MJPEG→AVI.
+    """
     if PLATFORM == "darwin":
         return CameraRecorderCV(device, label, resolution_key)
+    if is_rockchip():
+        return CameraRecorderMPP(device, label, resolution_key)
     return CameraRecorder(device, label, resolution_key)

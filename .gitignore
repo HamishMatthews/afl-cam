@@ -14,10 +14,14 @@ venv/
 *.avi
 *.mov
 *.wav
+*.h264
 captures/
 outputs/
 test_outputs/
 calibration/
+
+# Native MPP recorder (compiled)
+afl_cam/native/cam2h264
 
 # Personal Obsidian notes (project overview lives in README.md)
 # Project Overview.md

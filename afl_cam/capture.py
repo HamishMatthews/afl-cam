@@ -111,6 +111,30 @@ def set_auto_exposure(cam_key: str):
                        capture_output=True)
 
 
+def set_manual_exposure(cam_key: str, exposure_time: int = 100):
+    """Set manual exposure BEFORE recording (RK3588/MPP path).
+
+    These cameras' auto-exposure can settle at ~50 ms exposure, which caps
+    the sensor at ~20 fps (exposure-rate-limited). A fixed short exposure
+    (100 = 10 ms) keeps both cameras at a consistent ~30 fps. Controls do
+    NOT reset on stream open, so setting before recording is sufficient.
+    """
+    from .config import EXPOSURE_TIME
+
+    if exposure_time is None:
+        exposure_time = EXPOSURE_TIME
+    dev = CAMERAS.get(cam_key)
+    if not dev or not os.path.exists(dev):
+        return
+    subprocess.run([
+        "v4l2-ctl", "-d", dev,
+        "--set-ctrl=auto_exposure=1",
+        f"--set-ctrl=exposure_time_absolute={exposure_time}",
+    ], capture_output=True)
+    log.info("Manual exposure set: %s (auto_exposure=1, exposure=%s)",
+             cam_key, exposure_time)
+
+
 def list_devices() -> int:
     """Enumerate cameras and microphones. Returns a process exit code."""
     if PLATFORM == "darwin":

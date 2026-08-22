@@ -27,16 +27,9 @@ from .sessions import new_session_dir, session_dir_is_safe, remove_session_dir
 log = logging.getLogger("afl_cam.ui")
 
 
-def _lazy_gst():
-    """Import GStreamer bindings on first use (Linux playback only)."""
-    gi.require_version("Gst", "1.0")
-    from gi.repository import Gst
-    return Gst
 
 
-# ---------------------------------------------------------------------------
 # Preview panel — one per camera
-# ---------------------------------------------------------------------------
 
 class PreviewPanel(Gtk.Frame):
     """Displays live preview for one camera."""
@@ -117,9 +110,7 @@ class PreviewPanel(Gtk.Frame):
         GLib.idle_add(self._status_label.set_text, text)
 
 
-# ---------------------------------------------------------------------------
 # Control bar — resolution, duration, record/stop, swap
-# ---------------------------------------------------------------------------
 
 class ControlBar(Gtk.Box):
     """Recording controls."""
@@ -210,9 +201,7 @@ class ControlBar(Gtk.Box):
             self.dur_entry.set_sensitive(True)
 
 
-# ---------------------------------------------------------------------------
 # Recording list — tree view of past recordings
-# ---------------------------------------------------------------------------
 
 class RecordingList(Gtk.ScrolledWindow):
     """Browseable list of recording sessions (grouped cam0/cam1 + stitch status)."""
@@ -304,190 +293,8 @@ class RecordingList(Gtk.ScrolledWindow):
             it = model.iter_next(it)
 
 
-# ---------------------------------------------------------------------------
-# Playback dialog — in-app video player
-# ---------------------------------------------------------------------------
 
-class PlaybackDialog(Gtk.Dialog):
-    """Plays a recording using playbin + gtksink (native GTK widget, works on Wayland)."""
-
-    def __init__(self, parent, filepath: str):
-        super().__init__(
-            title=f"Playing: {Path(filepath).name}",
-            transient_for=parent,
-            modal=True,
-            destroy_with_parent=True,
-        )
-        self.set_default_size(960, 600)
-        self._pipeline = None
-        self._duration_ns = 0
-        self._position_update_id = None
-        self._seeking = False
-        self._playing = False
-
-        # --- Video area ---
-        self._video_box = Gtk.Box()
-        self._video_box.set_size_request(640, 360)
-        self.vbox.pack_start(self._video_box, True, True, 0)
-
-        # --- Controls ---
-        ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        ctrl.set_margin_start(8)
-        ctrl.set_margin_end(8)
-        ctrl.set_margin_top(4)
-        ctrl.set_margin_bottom(8)
-
-        self._play_btn = Gtk.Button(label="Play")
-        self._play_btn.connect("clicked", self._on_play_pause)
-        ctrl.pack_start(self._play_btn, False, False, 0)
-
-        self._pos_label = Gtk.Label(label="0:00")
-        ctrl.pack_start(self._pos_label, False, False, 0)
-
-        self._scrubber = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1000, 10)
-        self._scrubber.set_draw_value(False)
-        self._scrubber.connect("change-value", self._on_scrub_change)
-        ctrl.pack_start(self._scrubber, True, True, 0)
-
-        self._dur_label = Gtk.Label(label="0:00")
-        ctrl.pack_start(self._dur_label, False, False, 0)
-
-        close_btn = Gtk.Button(label="Close")
-        close_btn.connect("clicked", lambda b: self._stop_and_destroy())
-        ctrl.pack_start(close_btn, False, False, 0)
-
-        self.vbox.pack_start(ctrl, False, False, 0)
-        self.show_all()
-        self._start_pipeline(filepath)
-
-    # -- pipeline (playbin + gtksink, Linux) --
-
-    def _start_pipeline(self, filepath):
-        self._Gst = _lazy_gst()
-        Gst = self._Gst
-        self._pipeline = Gst.ElementFactory.make("playbin", "player")
-        if self._pipeline is None:
-            return
-
-        self._pipeline.set_property("uri", f"file://{filepath}")
-
-        # Use gtksink — renders natively into a GTK widget (X11 + Wayland)
-        self._gtksink = Gst.ElementFactory.make("gtksink", "gtsink")
-        if self._gtksink is None:
-            log.error("gtksink not available")
-            return
-
-        self._pipeline.set_property("video-sink", self._gtksink)
-        self._pipeline.set_property("audio-sink", Gst.ElementFactory.make("fakesink", None))
-
-        # Embed the gtksink widget into our video_box
-        widget = self._gtksink.props.widget
-        self._video_box.pack_start(widget, True, True, 0)
-        widget.show()
-
-        bus = self._pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message::error", self._on_error)
-        bus.connect("message::eos", self._on_eos)
-        bus.connect("message::state-changed", self._on_state_changed)
-
-        # Start paused so user sees first frame
-        self._pipeline.set_state(Gst.State.PAUSED)
-
-    # -- bus handlers --
-
-    def _on_state_changed(self, bus, msg):
-        if msg.src != self._pipeline:
-            return
-        old, new, pending = msg.parse_state_changed()
-        if new == self._Gst.State.PLAYING:
-            self._playing = True
-            GLib.idle_add(self._play_btn.set_label, "Pause")
-            self._start_position_updates()
-        elif new == self._Gst.State.PAUSED and old != self._Gst.State.READY:
-            self._playing = False
-            GLib.idle_add(self._play_btn.set_label, "Play")
-            self._stop_position_updates()
-        elif new == self._Gst.State.NULL:
-            self._stop_position_updates()
-
-    def _on_error(self, bus, msg):
-        err, debug = msg.parse_error()
-        log.error("Playback: %s", err)
-        GLib.idle_add(self._stop_and_destroy)
-
-    def _on_eos(self, bus, msg):
-        # Loop back to start
-        if self._pipeline:
-            self._pipeline.seek_simple(self._Gst.Format.TIME,
-                                       self._Gst.SeekFlags.FLUSH | self._Gst.SeekFlags.KEY_UNIT, 0)
-            self._pipeline.set_state(self._Gst.State.PAUSED)
-
-    # -- position tracking --
-
-    def _start_position_updates(self):
-        if self._position_update_id is None:
-            self._position_update_id = GLib.timeout_add(250, self._update_position)
-
-    def _stop_position_updates(self):
-        if self._position_update_id is not None:
-            GLib.source_remove(self._position_update_id)
-            self._position_update_id = None
-
-    def _update_position(self) -> bool:
-        if not self._pipeline or self._seeking:
-            return True
-        ok, dur = self._pipeline.query_duration(self._Gst.Format.TIME)
-        if ok and dur > 0:
-            self._duration_ns = dur
-            dur_sec = dur / self._Gst.SECOND
-            m, s = int(dur_sec) // 60, int(dur_sec) % 60
-            GLib.idle_add(self._dur_label.set_text, f"{m}:{s:02d}")
-        ok, pos = self._pipeline.query_position(self._Gst.Format.TIME)
-        if ok and self._duration_ns > 0:
-            pos_sec = pos / self._Gst.SECOND
-            m, s = int(pos_sec) // 60, int(pos_sec) % 60
-            GLib.idle_add(self._pos_label.set_text, f"{m}:{s:02d}")
-            frac = pos / self._duration_ns
-            GLib.idle_add(self._scrubber.set_value, frac * 1000)
-        return True
-
-    # -- controls --
-
-    def _on_play_pause(self, btn):
-        if not self._pipeline:
-            return
-        if self._playing:
-            self._pipeline.set_state(self._Gst.State.PAUSED)
-        else:
-            self._pipeline.set_state(self._Gst.State.PLAYING)
-
-    def _on_scrub_change(self, scale, scroll, value):
-        """Called when user drags the scrubber (change-value is more responsive)."""
-        if not self._pipeline or self._duration_ns == 0:
-            return
-        target_ns = int(self._duration_ns * (value / 1000.0))
-        self._pipeline.seek_simple(
-            self._Gst.Format.TIME,
-            self._Gst.SeekFlags.FLUSH | self._Gst.SeekFlags.KEY_UNIT, target_ns,
-        )
-
-    # -- cleanup --
-
-    def _stop_pipeline(self):
-        self._stop_position_updates()
-        if self._pipeline:
-            self._pipeline.set_state(self._Gst.State.NULL)
-            self._pipeline = None
-
-    def _stop_and_destroy(self):
-        self._stop_pipeline()
-        self.destroy()
-
-
-# ---------------------------------------------------------------------------
 # Main window
-# ---------------------------------------------------------------------------
 
 class MainWindow(Gtk.ApplicationWindow):
     """Top-level afl-cam window."""
@@ -516,7 +323,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._build_ui()
         self._start_previews()
 
-    # -- UI construction --
+
 
     def _build_ui(self):
         # Header bar
@@ -534,7 +341,7 @@ class MainWindow(Gtk.ApplicationWindow):
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.add(main)
 
-        # --- Preview panels (side by side) ---
+# Preview panels (side by side) 
         preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         preview_box.set_margin_start(8)
         preview_box.set_margin_end(8)
@@ -546,13 +353,13 @@ class MainWindow(Gtk.ApplicationWindow):
         preview_box.pack_start(self._right_panel, True, True, 0)
         main.pack_start(preview_box, True, True, 0)
 
-        # --- Controls ---
+# Controls 
         self._controls = ControlBar()
         self._controls.swap_btn.connect("clicked", self._on_swap)
         self._controls.record_btn.connect("clicked", self._on_record_toggle)
         main.pack_start(self._controls, False, False, 0)
 
-        # --- Recording list ---
+# Recording list 
         self._recording_list = RecordingList()
         main.pack_start(self._recording_list, True, True, 0)
 
@@ -585,7 +392,7 @@ class MainWindow(Gtk.ApplicationWindow):
         # Initial list load
         GLib.idle_add(self._recording_list.refresh)
 
-    # -- Preview management --
+
 
     def _start_previews(self):
         """Start live previews on both cameras."""
@@ -633,7 +440,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._start_previews()
         log.info("Cameras swapped: left=%s right=%s", self._panel_cams[0], self._panel_cams[1])
 
-    # -- Recording --
+
 
     def _on_record_toggle(self, _btn):
         if self._recording:
@@ -774,21 +581,13 @@ class MainWindow(Gtk.ApplicationWindow):
         """Restart previews after recording finishes."""
         GLib.timeout_add(500, self._start_previews)
 
-    # -- Playback --
+
 
     def _on_play(self, _btn):
+        # Only individual recordings can be played; session rows do nothing.
         rec_id = self._recording_list.get_selected_recording_id()
         if rec_id is None:
-            # Session row selected — play the first complete recording (cam0 preferred)
-            session_id = self._recording_list.get_selected_session_id()
-            if session_id is None:
-                return
-            for rec in self._db.session_recordings(session_id):
-                if rec["status"] == "complete" and rec["file_path"]:
-                    rec_id = rec["id"]
-                    break
-            if rec_id is None:
-                return
+            return
         rec = self._db.get(rec_id)
         if not rec:
             return
@@ -797,10 +596,10 @@ class MainWindow(Gtk.ApplicationWindow):
             filepath = ROOT_DIR / filepath
         if filepath.exists():
             if PLATFORM == "darwin":
-                # No gtksink on macOS — hand off to QuickTime Player
                 subprocess.Popen(["open", str(filepath)])
             else:
-                PlaybackDialog(self, str(filepath))
+                subprocess.Popen(["mpv", str(filepath)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _on_delete(self, _btn):
         session_id = self._recording_list.get_selected_session_id()
@@ -853,7 +652,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._db.delete_session(session_id)
         self._recording_list.refresh()
 
-    # -- Stitching --
+
 
     def _on_stitch(self, _btn):
         if self._recording or self._stitching:
@@ -959,7 +758,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._controls.record_btn.set_sensitive(not busy)
         self._controls.swap_btn.set_sensitive(not busy)
 
-    # -- Shutdown --
+
 
     def _on_destroy(self, _widget):
         self._stop_previews()
@@ -972,9 +771,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._db.close()
 
 
-# ---------------------------------------------------------------------------
 # Application entry point
-# ---------------------------------------------------------------------------
 
 class AflCamApp(Gtk.Application):
     def __init__(self):
