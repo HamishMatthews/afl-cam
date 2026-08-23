@@ -1,8 +1,15 @@
-"""Extract bundle-adjusted camera params (K, R per camera) via OpenCV's
-stitcher and dump them for the analytic GPU spherical shader.
+"""Extract camera params for the analytic GPU spherical shader.
 
-Uses the same estimateTransform flow as the product's VideoStitcher, but
-exports only the (K, R) math — no OpenCV remap machinery.
+Intrinsics come from the MEASURED checkerboard calibration
+(calibration/cam{0,1}_calib.npz) — the two cameras' independent 5-coeff fits
+agree on K to 0.04%, the trustworthy signal. The fitted distortion
+coefficients describe the BOARD's waviness (paper board), not the lens, and
+are zeroed: the stitch treats the lens as pinhole + measured K.
+
+The inter-camera rotation R comes from OpenCV's stitcher bundle adjustment
+on the RAW stills (the same estimateTransform flow the product uses) — its R
+is the photometrically validated one (the ray-angle Kabsch fit is biased by
+parallax: it landed 2.8 deg from the photometric optimum).
 
 Usage: python3 scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> <out_dir>
 """
@@ -17,6 +24,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from afl_cam.stitcher import Stitcher, _build_uint8_weights, _spherical_bounds, _spherical_maps  # noqa: E402
 
+CALIB_DIR = Path(__file__).resolve().parent.parent / "calibration"
+
+
+def load_measured(cam_key):
+    f = CALIB_DIR / f"{cam_key}_calib.npz"
+    if not f.exists():
+        raise SystemExit(f"missing {f.name} — run scripts/calibrate.py first")
+    d = np.load(f)
+    return {"mtx": d["mtx"], "dist": d["dist"].ravel()}
+
 
 def main() -> None:
     cam0_path, cam1_path, out_dir = sys.argv[1], sys.argv[2], Path(sys.argv[3])
@@ -29,9 +46,11 @@ def main() -> None:
     src_w, src_h = f0.shape[1], f0.shape[0]
     full_size = (src_w, src_h)
 
-    stills = Stitcher()
-    left, right = stills._undistort_pair(f0, f1)
+    calibs = [load_measured("cam0"), load_measured("cam1")]
+    print(f"measured calib: cam0 fx={calibs[0]['mtx'][0,0]:.1f} "
+          f"cam1 fx={calibs[1]['mtx'][0,0]:.1f} (distortion zeroed)")
 
+    stills = Stitcher()
     stitcher = None
     cameras = None
     work_scale = None
@@ -43,7 +62,7 @@ def main() -> None:
             s.setSeamEstimationResol(stills._seam_resol)
             s.setCompositingResol(-1)
             s.setPanoConfidenceThresh(stills._pano_confidence)
-            if s.estimateTransform([stills._enhance(left), stills._enhance(right)]) == cv2.Stitcher_OK:
+            if s.estimateTransform([stills._enhance(f0), stills._enhance(f1)]) == cv2.Stitcher_OK:
                 stitcher, cameras = s, s.cameras()
                 break
         if cameras is not None:
@@ -51,10 +70,23 @@ def main() -> None:
             focals = [cam.focal / work_scale for cam in cameras]
             if all(0.3 * src_w < f < 3.0 * src_w for f in focals):
                 break
-            stitcher = cameras = None
-
+            stitcher, cameras = None, None
     if stitcher is None:
-        raise SystemExit("calibration failed")
+        raise SystemExit("bundle estimation failed")
+
+    # override the estimator's intrinsics with the measured ones
+    cam_dump = []
+    for idx, cam in enumerate(cameras):
+        m = calibs[idx]["mtx"]
+        fx, fy, cx, cy = m[0, 0], m[1, 1], m[0, 2], m[1, 2]
+        cam.focal = fx * work_scale
+        cam.ppx = cx * work_scale
+        cam.ppy = cy * work_scale
+        cam.aspect = fy / fx
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+        R = np.asarray(cam.R, dtype=np.float64).reshape(3, 3)
+        cam_dump.append((K, R))
+        print(f"cam{idx}: K=[[{fx:.1f},0,{cx:.1f}],[0,{fy:.1f},{cy:.1f}]]")
 
     # spherical geometry, plain math (same formulas the GPU shader will use)
     w_scale = float(np.median([cam.focal for cam in cameras])) / work_scale
@@ -69,22 +101,8 @@ def main() -> None:
     out_w = int(np.ceil(nat_cw * k_scale)) // 2 * 2
     out_h = int(np.ceil(nat_ch * k_scale)) // 2 * 2
 
-    # per-camera K (at work scale, then rescaled to full res) and R
-    cam_dump = []
-    for idx, cam in enumerate(cameras):
-        f = cam.focal / work_scale
-        cx = cam.ppx / work_scale
-        cy = cam.ppy / work_scale
-        aspect = getattr(cam, "aspect", 1.0)
-        K = np.array([[f, 0, cx], [0, f * aspect, cy], [0, 0, 1]], dtype=np.float64)
-        R = np.asarray(cam.R, dtype=np.float64).reshape(3, 3)
-        cam_dump.append((K, R))
-        print(f"cam{idx}: focal={f:.1f} pp=({cx:.1f},{cy:.1f}) aspect={aspect:.3f}")
-
-    # build the float maps with plain math for a python-side reference
-    undist_maps = [None, None]
-    m0 = _spherical_maps(cameras[0], work_scale, full_size, k_scale, undist_maps[0], w_scale)
-    m1 = _spherical_maps(cameras[1], work_scale, full_size, k_scale, undist_maps[1], w_scale)
+    m0 = _spherical_maps(cameras[0], work_scale, full_size, k_scale, None, w_scale)
+    m1 = _spherical_maps(cameras[1], work_scale, full_size, k_scale, None, w_scale)
 
     off0 = (int(round((b0[0] - min_x) * k_scale)), int(round((b0[1] - min_y) * k_scale)))
     off1 = (int(round((b1[0] - min_x) * k_scale)), int(round((b1[1] - min_y) * k_scale)))
@@ -111,8 +129,12 @@ def main() -> None:
     w0 = full_weights(roi0, mask0, overlap_roi, w0u)
     w1 = full_weights(roi1, mask1, overlap_roi, w1u)
 
-    # GPU-ready params: per-camera K (3 rows), R (3 rows), plus the spherical
-    # warp constants the shader evaluates per pixel (see _spherical_maps)
+    # GPU-ready params: per-cam block (28 floats):
+    #   krinv(9) tl(2) off(2) mapwh(2) pin fx,fy,cx,cy(4) raw fx,fy,cx,cy(4)
+    #   k1,k2,p1,p2,k3(5)
+    # Distortion is zeroed (see module docstring); the pinhole and raw
+    # matrices are then identical, and the shader's forward-distortion solve
+    # degenerates to a no-op.
     with open(out_dir / "cams.txt", "w") as fh:
         fh.write(f"canvas_w {out_w}\ncanvas_h {out_h}\nsrc_w {src_w}\nsrc_h {src_h}\n")
         fh.write(f"warp_scale {w_scale}\n")
@@ -123,6 +145,7 @@ def main() -> None:
                     fh.write(name + str(idx) + " " + " ".join(f"{v:.12g}" for v in row) + "\n")
             tl_x, tl_y, _, _ = _spherical_bounds(cameras[idx], work_scale, full_size, w_scale)
             fh.write(f"cam{idx} tl {tl_x} {tl_y}\n")
+            fh.write(f"cam{idx} dist " + " ".join(f"{v:.6g}" for v in calibs[idx]["dist"]) + "\n")
 
     np.repeat(w0[:, :, None].astype(np.uint8), 4, axis=2).tofile(out_dir / "w0.bin")
     np.repeat(w1[:, :, None].astype(np.uint8), 4, axis=2).tofile(out_dir / "w1.bin")
@@ -130,12 +153,12 @@ def main() -> None:
     cv2.cvtColor(f1, cv2.COLOR_BGR2RGB).tofile(out_dir / "cam1.rgb")
 
     # flat GPU params: [0..3] dims, [4] warp_scale, [5..7] pad,
-    # cam0 [8..23], cam1 [24..39]: krinv(9) tl(2) off(2) mapwh(2) pad(1)
-    params = np.zeros(40, np.float32)
+    # cam0 [8..35], cam1 [36..63]
+    params = np.zeros(64, np.float32)
     params[0:4] = [out_w, out_h, src_w, src_h]
     params[4] = w_scale
     for bidx, (K, R) in enumerate(cam_dump):
-        base = 8 + bidx * 16
+        base = 8 + bidx * 28
         krinv = (K @ R.T).astype(np.float32).ravel()
         params[base:base + 9] = krinv
         b = b0 if bidx == 0 else b1
@@ -144,11 +167,15 @@ def main() -> None:
         params[base + 9:base + 11] = [b[0], b[1]]
         params[base + 11:base + 13] = [off[0], off[1]]
         params[base + 13:base + 15] = [mshape[1], mshape[0]]
+        params[base + 15:base + 19] = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
+        params[base + 19:base + 23] = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
+        params[base + 23:base + 28] = calibs[bidx]["dist"]
     params.tofile(out_dir / "params.bin")
-    print(f"params.bin: warp_scale={w_scale:.1f}, krinv0={params[8:11]}, tl0={params[17:19]}, off0={params[19:21]}, map0={params[21:23]}")
+    print(f"params.bin: warp_scale={w_scale:.1f}, krinv0={params[8:11]}, "
+          f"pin0={params[23:27]}, raw0={params[27:31]}, dist0={params[31:36]}")
 
-    # python-side reference from the same plain math (float maps + remap,
-    # which agrees with plain bilinear to 0.18 — verified)
+    # python-side reference from the same plain math (distortion is zero, so
+    # the stills warp directly — the GPU must match this exactly)
     warp0 = cv2.remap(f0, m0[0], m0[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     warp1 = cv2.remap(f1, m1[0], m1[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     p0 = np.zeros((out_h, out_w, 3), np.uint8)

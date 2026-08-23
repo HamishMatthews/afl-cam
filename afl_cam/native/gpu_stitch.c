@@ -211,20 +211,20 @@ int main(int argc, char **argv) {
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     void *params_data = read_file((snprintf(path, sizeof path, "%s/params.bin", dir), path), &len);
-    if (len != 40 * sizeof(float)) { fprintf(stderr, "params.bin size mismatch (%zu)\n", len); return 1; }
+    if (len != 64 * sizeof(float)) { fprintf(stderr, "params.bin size mismatch (%zu)\n", len); return 1; }
     float *pf = params_data;
     p.canvas_w = (uint32_t)pf[0]; p.canvas_h = (uint32_t)pf[1]; p.src_w = (uint32_t)pf[2]; p.src_h = (uint32_t)pf[3];
     printf("params: canvas %ux%u, src %ux%u, warp_scale %.1f\n", p.canvas_w, p.canvas_h, p.src_w, p.src_h, pf[4]);
     float pdims[4] = { (float)p.canvas_w, (float)p.canvas_h, (float)p.src_w, (float)p.src_h };
     VkBufferCreateInfo pbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                .size = 40 * sizeof(float), .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
+                                .size = len, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
     VkBuffer pbuf;
     CHECK(vkCreateBuffer(dev, &pbci, NULL, &pbuf));
     VkDeviceMemory pbmem = alloc_bind_buffer(dev, &mprops, pbuf,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void *pmap;
-    CHECK(vkMapMemory(dev, pbmem, 0, 40 * sizeof(float), 0, &pmap));
-    memcpy(pmap, params_data, 40 * sizeof(float));
+    CHECK(vkMapMemory(dev, pbmem, 0, len, 0, &pmap));
+    memcpy(pmap, params_data, len);
     vkUnmapMemory(dev, pbmem);
 
     /* ---- command buffer: ONE recording (uploads + dispatch) ---- */
@@ -323,7 +323,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 4; i++)
         dii[i] = (VkDescriptorImageInfo){ smp[i], ivs[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorBufferInfo obi = { obuf, 0, out_size };
-    VkDescriptorBufferInfo pbi = { pbuf, 0, 40 * sizeof(float) };
+    VkDescriptorBufferInfo pbi = { pbuf, 0, len };
     VkWriteDescriptorSet wds[6] = {0};
     for (int i = 0; i < 4; i++)
         wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
