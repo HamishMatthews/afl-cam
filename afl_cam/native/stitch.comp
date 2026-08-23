@@ -1,0 +1,70 @@
+#version 450
+
+// GPU stitch, ANALYTIC spherical warp: each output pixel projects through the
+// per-camera (K @ R^T) into the source frame — the exact math of
+// afl_cam.stitcher._spherical_maps, evaluated in the shader. No map textures,
+// no OpenCV machinery: out = tex0(s0) * w0 + tex1(s1) * w1.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D tex0;
+layout(set = 0, binding = 1) uniform sampler2D tex1;
+layout(set = 0, binding = 2) uniform sampler2D w0;
+layout(set = 0, binding = 3) uniform sampler2D w1;
+layout(set = 0, binding = 4) buffer SSBO { uint data[]; } ssbo;
+layout(set = 0, binding = 5) buffer ParamsBuf { float f[]; } P;
+
+const float PI = 3.14159265359;
+
+// returns source pixel coords (continuous), or (-1,-1) when outside the map
+vec2 warp_cam(int cam, vec2 p) {
+    int base = 8 + cam * 16;           // f layout: krinv(9) tl(2) off(2) mapwh(2) pad(1)
+    float tl_x = P.f[base + 9], tl_y = P.f[base + 10];
+    float off_x = P.f[base + 11], off_y = P.f[base + 12];
+    float map_w = P.f[base + 13], map_h = P.f[base + 14];
+
+    vec2 mc = p - vec2(off_x, off_y);
+    if (mc.x < 0.0 || mc.x >= map_w || mc.y < 0.0 || mc.y >= map_h)
+        return vec2(-1.0);
+
+    float u = (mc.x + tl_x) / P.f[4];
+    float v = (mc.y + tl_y) / P.f[4];
+
+    float sin_v = sin(PI - v);
+    vec3 dir = vec3(sin_v * sin(u), cos(PI - v), sin_v * cos(u));
+
+    vec3 xyz;
+    xyz.x = P.f[base] * dir.x + P.f[base + 1] * dir.y + P.f[base + 2] * dir.z;
+    xyz.y = P.f[base + 3] * dir.x + P.f[base + 4] * dir.y + P.f[base + 5] * dir.z;
+    xyz.z = P.f[base + 6] * dir.x + P.f[base + 7] * dir.y + P.f[base + 8] * dir.z;
+
+    if (xyz.z <= 0.0)
+        return vec2(-1.0);
+    return xyz.xy / xyz.z;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(P.f[0]) || p.y >= int(P.f[1])) return;
+
+    vec2 canvas_dims = vec2(P.f[0], P.f[1]);
+    vec2 src_dims = vec2(P.f[2], P.f[3]);
+    vec2 c = vec2(p);
+    vec2 uv = (c + vec2(0.5)) / canvas_dims;   // exact texel p (NEAREST)
+
+    vec2 s0 = warp_cam(0, c);
+    vec2 s1 = warp_cam(1, c);
+
+    float w0v = texture(w0, uv).r;
+    float w1v = texture(w1, uv).r;
+
+    vec3 c0 = texture(tex0, s0 / src_dims).rgb;   // s0 < 0 -> border black
+    vec3 c1 = texture(tex1, s1 / src_dims).rgb;
+
+    vec3 outv = c0 * w0v + c1 * w1v;
+    uint packed =
+        (uint(outv.r * 255.0 + 0.5) & 0xffu) |
+        ((uint(outv.g * 255.0 + 0.5) & 0xffu) << 8) |
+        ((uint(outv.b * 255.0 + 0.5) & 0xffu) << 16);
+    ssbo.data[uint(p.y * int(P.f[0]) + p.x)] = packed;
+}

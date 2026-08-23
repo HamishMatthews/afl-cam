@@ -42,3 +42,5 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+afl_cam/native/stitch.spv
+afl_cam/native/gpu_stitch
