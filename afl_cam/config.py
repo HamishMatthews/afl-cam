@@ -11,14 +11,18 @@ DB_PATH = ROOT_DIR / "recordings.db"
 
 PLATFORM = sys.platform  # "linux" or "darwin"
 
-# Camera devices (UVC), matched by USB port:
-#   Linux (Orange Pi 5 Max) — /dev/video0 = cam0 (Bus 1, xhci.12),
-#                              /dev/video2 = cam1 (Bus 3, xhci.11);
-#                              video1/video3 are the same cameras' metadata nodes
+# Camera devices (UVC), matched by USB port. Each camera exposes TWO video
+# nodes on the same interface (main + metadata); the main node is the one
+# that streams.
+#   Linux (Orange Pi 5 Max) — xhci.11 camera = video0 (+video2), xhci.12
+#                              camera = video1 (+video3). Node numbers can
+#                              shuffle across reboots — if a preview is dead,
+#                              check /sys/class/video4linux/ for the current
+#                              mapping (lsusb + udevadm info -q all -n).
 #   macOS  — AVFoundation device indices (find them with 'afl-cam list-devices')
 CAMERAS = {
     "cam0": "/dev/video0" if PLATFORM == "linux" else "0",
-    "cam1": "/dev/video2" if PLATFORM == "linux" else "1",
+    "cam1": "/dev/video1" if PLATFORM == "linux" else "1",
 }
 
 # Camera → its USB microphone, recorded alongside the video for clap-based

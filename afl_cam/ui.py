@@ -51,6 +51,12 @@ class PreviewPanel(Gtk.Frame):
         self._drawing.connect("draw", self._on_draw)
         box.pack_start(self._drawing, True, True, 0)
 
+        # Prominent camera identity header (e.g. "cam0 — /dev/video0")
+        self._title_label = Gtk.Label()
+        self._title_label.set_markup(f"<b>{GLib.markup_escape_text(label)}</b>")
+        self._title_label.set_halign(Gtk.Align.CENTER)
+        box.pack_start(self._title_label, False, False, 0)
+
         self._status_label = Gtk.Label(label="offline")
         self._status_label.set_halign(Gtk.Align.CENTER)
         box.pack_start(self._status_label, False, False, 0)
@@ -60,6 +66,7 @@ class PreviewPanel(Gtk.Frame):
     def set_label(self, label: str):
         self._label = label
         self.set_label_widget(Gtk.Label(label=label))
+        self._title_label.set_markup(f"<b>{GLib.markup_escape_text(label)}</b>")
 
     def update_frame(self, data: bytes, width: int, height: int):
         """Called from engine thread — schedule GTK update via idle_add."""

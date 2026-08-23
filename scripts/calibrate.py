@@ -279,9 +279,16 @@ def process_frames(pattern_str, name):
         return None
 
     print(f"\nCalibrating from {len(obj_points)} frames (pattern {pattern[0]}x{pattern[1]})...")
+    # 5-coeff fit for K only: the flexible model absorbs the board's physical
+    # waviness (paper board) into the distortion coefficients, which is exactly
+    # why its per-camera fx values agree to 0.04% — the reliable signal. The
+    # fitted k's themselves describe the BOARD, not the lens (cv2's undistort
+    # map shows ~0.2% real displacement), so they are zeroed for downstream
+    # use: the stitch treats the lens as pinhole + measured K.
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj_points, img_points, frame_size, None, None,
     )
+    dist = np.zeros_like(dist)
 
     print(f"  RMS error: {ret:.4f}  (good < 0.5)")
     print(f"  fx={mtx[0,0]:.1f}  fy={mtx[1,1]:.1f}  fx/fy={mtx[0,0]/mtx[1,1]:.4f} "
