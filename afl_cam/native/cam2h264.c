@@ -53,10 +53,12 @@ int main(int argc, char **argv)
     RK_U32 width          = (argc > 4) ? atoi(argv[4]) : 3840;
     RK_U32 height         = (argc > 5) ? atoi(argv[5]) : 2160;
     RK_U32 fps            = (argc > 6) ? atoi(argv[6]) : 30;
+    RK_S32 exposure       = (argc > 7) ? atoi(argv[7]) : 100;   /* units of 100us */
 
     int fd = -1, ret = 0;
     int stream_on = 0;
     FILE *fp_out = NULL;
+    FILE *fp_pts = NULL;
 
     /* V4L2 */
     v4l2_buf_t *v4l2_bufs = NULL;
@@ -117,6 +119,24 @@ int main(int argc, char **argv)
     parm.parm.capture.timeperframe.numerator = 1;
     parm.parm.capture.timeperframe.denominator = fps;
     ioctl(fd, VIDIOC_S_PARM, &parm); /* best effort */
+
+    /* Manual exposure: auto-exposure can settle at ~50ms, capping the sensor
+     * at ~20 fps and making the two recordings drift apart in time. A fixed
+     * short exposure (daytime use) keeps both cameras at the requested rate.
+     * Set AFTER S_FMT (stream open can reset controls) and BEFORE STREAMON. */
+    {
+        struct v4l2_control ctrl;
+        memset(&ctrl, 0, sizeof(ctrl));
+        ctrl.id = V4L2_CID_EXPOSURE_AUTO;   /* 0x009a0901 */
+        ctrl.value = V4L2_EXPOSURE_MANUAL;  /* 1 */
+        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+            fprintf(stderr, "set exposure manual failed: %s\n", strerror(errno));
+        ctrl.id = V4L2_CID_EXPOSURE_ABSOLUTE; /* 0x009a0902 */
+        ctrl.value = exposure;
+        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+            fprintf(stderr, "set exposure time failed: %s\n", strerror(errno));
+        fprintf(stderr, "exposure: manual, %d (%dms)\n", exposure, exposure / 10);
+    }
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
@@ -250,6 +270,25 @@ int main(int argc, char **argv)
     if (!fp_out) {
         fprintf(stderr, "open %s failed: %s\n", out_path, strerror(errno));
         goto OUT;
+    }
+
+    /* PTS sidecar: one line per encoded frame — the V4L2 buffer's kernel
+     * timestamp in microseconds (monotonic clock). Both cameras share this
+     * clock, so the stitcher can pair frames exactly (the USB-camera
+     * equivalent of hardware sync). Path: <name>.raw.h264 -> <name>.pts */
+    {
+        char pts_path[1024];
+        char *dot;
+        snprintf(pts_path, sizeof pts_path, "%s", out_path);
+        dot = strstr(pts_path, ".raw.h264");
+        if (dot)
+            strcpy(dot, ".pts");
+        else
+            strncat(pts_path, ".pts", sizeof pts_path - strlen(pts_path) - 1);
+        fp_pts = fopen(pts_path, "w");
+        if (!fp_pts)
+            fprintf(stderr, "open %s failed (no frame sync sidecar): %s\n",
+                    pts_path, strerror(errno));
     }
 
     /* SPS/PPS header */
@@ -399,6 +438,12 @@ int main(int argc, char **argv)
                 if (len < 4 || memcmp(ptr, sc, 4) != 0)
                     fwrite(sc, 1, 4, fp_out);
                 fwrite(ptr, 1, len, fp_out);
+                if (fp_pts) {
+                    RK_S64 pkt_pts = mpp_packet_get_pts(enc_pkt);
+                    if (pkt_pts <= 0)
+                        pkt_pts = pts_us;   /* encoder didn't propagate — use capture time */
+                    fprintf(fp_pts, "%lld\n", (long long)pkt_pts);
+                }
             }
             mpp_packet_deinit(&enc_pkt);
         }
@@ -456,6 +501,8 @@ OUT:
         close(fd);
     if (fp_out)
         fclose(fp_out);
+    if (fp_pts)
+        fclose(fp_pts);
 
     return ret;
 }

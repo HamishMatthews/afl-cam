@@ -829,6 +829,18 @@ def _open_video_reader(path: Path):
     return _CVFrameReader(path)
 
 
+def _load_pts(path: Path) -> Optional[np.ndarray]:
+    """Kernel-timestamp sidecar (us, monotonic) written by cam2h264, or None."""
+    try:
+        with open(path) as fh:
+            lines = fh.read().split()
+        if len(lines) < 10:
+            return None
+        return np.asarray([int(x) for x in lines], dtype=np.int64)
+    except (OSError, ValueError):
+        return None
+
+
 def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
                        fps: int = 30, mode: str = "quality",
                        output_width: int = 3840,
@@ -848,32 +860,57 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
     if not ok0 or not ok1:
         raise StitchError("Could not read first frames from recordings.")
 
-    advance1 = 0
-    # Prefer clap-based sync when audio tracks exist — the clap transient is
-    # a millisecond-precise marker shared by both recordings.
-    wav0 = out_dir / "cam0.wav"
-    wav1 = out_dir / "cam1.wav"
-    if wav0.exists() and wav1.exists():
-        audio_lag = _audio_frame_lag(wav0, wav1, fps)
-        if audio_lag is not None and abs(audio_lag) <= 90:
-            advance1 = audio_lag
-            _report(f"frame sync: clap offset {advance1:+d} frames")
-    if advance1 == 0:
-        offset = _find_translation(f0_raw, f1_raw, Stitcher()._enhance)
-        if offset is not None:
-            overlap_dx = int(round(offset[0]))
-            if overlap_dx > 200:
-                advance1, lag_score = _estimate_frame_lag(cap0, cap1, overlap_dx)
-                if lag_score > 0.3:
-                    _report(f"frame sync: cam1 offset {advance1:+d} frames (corr {lag_score:.2f})")
-                else:
-                    _report("frame sync: unreliable, assuming 0 offset")
-                    advance1 = 0
-        else:
-            _report("frame sync: cannot locate overlap, assuming 0 offset")
+    # PTS-sidecar pairing first: each recorder stamps frames with the SHARED
+    # kernel clock (monotonic) at capture time — the USB-camera equivalent of
+    # hardware sync. Frame-accurate for both start offset AND dropped frames.
+    pts0 = _load_pts(cam0_path.with_suffix(".pts"))
+    pts1 = _load_pts(cam1_path.with_suffix(".pts"))
+    pair = None
+    if pts0 is not None and pts1 is not None:
+        # pair every cam0 frame with the cam1 frame whose kernel timestamp
+        # is nearest, and TRIM to the overlap window: the stitch starts where
+        # BOTH cameras are live (no frozen duplicated frames at the start).
+        s0 = int(np.searchsorted(pts0, pts1[0]))
+        pair = np.searchsorted(pts1, pts0)
+        pair = np.clip(pair, 0, len(pts1) - 1)
+        lo = np.clip(pair - 1, 0, len(pts1) - 1)
+        pair = np.where(np.abs(pts1[lo] - pts0) < np.abs(pts1[pair] - pts0), lo, pair)
+        pair = pair[s0:]
+        advance1 = s0
+        _report(f"frame sync: pts sidecar — trimmed {s0} frames at start "
+                f"({(pts1[0] - pts0[s0]) / 1e6:+.2f}s between first frames)")
 
-    cap0.seek_to(max(0, -advance1))
-    cap1.seek_to(max(0, advance1))
+    if pair is None:
+        advance1 = 0
+        # Prefer clap-based sync when audio tracks exist — the clap transient
+        # is a millisecond-precise marker shared by both recordings.
+        wav0 = out_dir / "cam0.wav"
+        wav1 = out_dir / "cam1.wav"
+        if wav0.exists() and wav1.exists():
+            audio_lag = _audio_frame_lag(wav0, wav1, fps)
+            if audio_lag is not None and abs(audio_lag) <= 90:
+                advance1 = audio_lag
+                _report(f"frame sync: clap offset {advance1:+d} frames")
+        if advance1 == 0:
+            offset = _find_translation(f0_raw, f1_raw, Stitcher()._enhance)
+            if offset is not None:
+                overlap_dx = int(round(offset[0]))
+                if overlap_dx > 200:
+                    advance1, lag_score = _estimate_frame_lag(cap0, cap1, overlap_dx)
+                    if lag_score > 0.3:
+                        _report(f"frame sync: cam1 offset {advance1:+d} frames (corr {lag_score:.2f})")
+                    else:
+                        _report("frame sync: unreliable, assuming 0 offset")
+                        advance1 = 0
+            else:
+                _report("frame sync: cannot locate overlap, assuming 0 offset")
+
+    if pair is not None:
+        cap0.seek_to(0)
+        cap1.seek_to(0)
+    else:
+        cap0.seek_to(max(0, -advance1))
+        cap1.seek_to(max(0, advance1))
 
     ok0, f0 = cap0.read()
     ok1, f1 = cap1.read()
@@ -913,12 +950,41 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
 
     idx, t0 = 0, time.time()
     last_report = 0.0
+    pair_idx = 0
+    cam1_last = None
+    j_cur = -1
+    skip_left = advance1 if pair is not None else 0
 
     while True:
         ok0, frame0 = cap0.read()
-        ok1, frame1 = cap1.read()
-        if not ok0 or not ok1:
+        if not ok0 or frame0 is None:
             break
+        if skip_left > 0:
+            skip_left -= 1
+            continue
+
+        if pair is not None:
+            # stream cam1 forward to the frame whose kernel timestamp is
+            # closest to cam0's current frame (skip/duplicate as needed)
+            j = int(pair[pair_idx]) if pair_idx < len(pair) else int(pair[-1])
+            pair_idx += 1
+            if j == j_cur:
+                frame1 = cam1_last
+            else:
+                while j_cur < j:
+                    ok1, f1 = cap1.read()
+                    if not ok1 or f1 is None:
+                        j_cur = j  # cam1 ended: reuse its last frame
+                        break
+                    cam1_last = f1
+                    j_cur += 1
+                frame1 = cam1_last
+            if frame1 is None:
+                break
+        else:
+            ok1, frame1 = cap1.read()
+            if not ok1 or frame1 is None:
+                break
 
         pano = vs.stitch(frame0, frame1)
         if pano.shape[:2] != (oh, ow):

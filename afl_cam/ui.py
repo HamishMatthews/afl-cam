@@ -19,6 +19,7 @@ from .config import (
     PREVIEW_WIDTH, PREVIEW_HEIGHT, CAPTURES_DIR, DB_PATH, ROOT_DIR, PLATFORM,
 )
 from .capture import (camera_device, camera_present, set_auto_exposure,
+                      set_manual_exposure,
                       start_audio_capture, stop_audio_procs)
 from .db import RecordingDB
 from .engine import make_preview, make_recorder
@@ -536,10 +537,12 @@ class MainWindow(Gtk.ApplicationWindow):
             if proc:
                 self._audio_procs.append(proc)
 
-        # Set auto exposure AFTER the streams open — opening a 4K stream can
-        # reset controls, and mode 1 (Manual) records almost-black frames.
+        # Manual exposure AFTER the streams open (the recorder sets it itself
+        # too; re-assert here in case the open reset it). Auto-exposure can
+        # settle at ~50ms and cap the sensor at ~20 fps — the recordings then
+        # run 1.5x the requested time and drift apart.
         for cam_key in ("cam0", "cam1"):
-            set_auto_exposure(cam_key)
+            set_manual_exposure(cam_key)
 
         self._recording = True
         self._controls.set_recording(True)

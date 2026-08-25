@@ -19,7 +19,7 @@ import cv2
 from .config import (
     CAMERAS, RESOLUTIONS, DEFAULT_RESOLUTION,
     PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_FPS,
-    CAPTURES_DIR, CONTAINER, PLATFORM,
+    CAPTURES_DIR, CONTAINER, PLATFORM, EXPOSURE_TIME,
 )
 
 log = logging.getLogger(__name__)
@@ -378,7 +378,8 @@ class CameraRecorderMPP:
 
             log_path = output.with_suffix(".rec.log")
             cmd = [str(recorder), self.device, str(raw), str(frames),
-                   str(self.width), str(self.height), str(self.fps)]
+                   str(self.width), str(self.height), str(self.fps),
+                   str(EXPOSURE_TIME)]
 
             self._output_path = output
             self._raw_path = raw
