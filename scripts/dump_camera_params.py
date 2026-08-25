@@ -36,7 +36,19 @@ def load_measured(cam_key):
 
 
 def main() -> None:
-    cam0_path, cam1_path, out_dir = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+    argv = sys.argv[1:]
+    canvas_width = None
+    if "--canvas-width" in argv:
+        i = argv.index("--canvas-width")
+        if i + 1 >= len(argv):
+            raise SystemExit("--canvas-width needs a value")
+        canvas_width = int(argv[i + 1])
+        del argv[i:i + 2]
+    if len(argv) != 3:
+        raise SystemExit(
+            "usage: python3 scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> "
+            "<out_dir> [--canvas-width W]")
+    cam0_path, cam1_path, out_dir = argv[0], argv[1], Path(argv[2])
     out_dir.mkdir(parents=True, exist_ok=True)
 
     f0 = cv2.imread(cam0_path)
@@ -97,9 +109,9 @@ def main() -> None:
     min_y = min(b0[1], b1[1])
     max_y = max(b0[1] + b0[3], b1[1] + b1[3])
     nat_cw, nat_ch = max_x - min_x, max_y - min_y
-    k_scale = 1.0  # native resolution
-    out_w = int(np.ceil(nat_cw * k_scale)) // 2 * 2
-    out_h = int(np.ceil(nat_ch * k_scale)) // 2 * 2
+    # scale_k = canvas pixels per native unit: 1.0 = native (~5760 wide),
+    # or scaled to a target width (3840 for the live-stitch encoder).
+    k_scale = (canvas_width / nat_cw) if canvas_width else 1.0
 
     m0 = _spherical_maps(cameras[0], work_scale, full_size, k_scale, None, w_scale)
     m1 = _spherical_maps(cameras[1], work_scale, full_size, k_scale, None, w_scale)
@@ -108,6 +120,11 @@ def main() -> None:
     off1 = (int(round((b1[0] - min_x) * k_scale)), int(round((b1[1] - min_y) * k_scale)))
     roi0 = (off0[1], off0[1] + m0[0].shape[0], off0[0], off0[0] + m0[0].shape[1])
     roi1 = (off1[1], off1[1] + m1[0].shape[0], off1[0], off1[0] + m1[0].shape[1])
+    # Canvas dims derive from the rounded rois (not ceil of the native span)
+    # so every camera map fits exactly at any scale. Even dims required for
+    # NV12 2x2 chroma blocks in the GPU path.
+    out_w = (max(roi0[3], roi1[3]) + 1) // 2 * 2
+    out_h = (max(roi0[1], roi1[1]) + 1) // 2 * 2
 
     mask0 = (m0[0] >= 0).astype(np.uint8) * 255
     mask1 = (m1[0] >= 0).astype(np.uint8) * 255
@@ -156,7 +173,10 @@ def main() -> None:
     # cam0 [8..35], cam1 [36..63]
     params = np.zeros(64, np.float32)
     params[0:4] = [out_w, out_h, src_w, src_h]
-    params[4] = w_scale
+    # warp_scale and tl are in CANVAS units — scale them with k_scale so the
+    # shader's (mc + tl)/warp_scale stays equivalent to the native math:
+    #   u = (i/k + tl)/w == (i + tl*k)/(w*k)
+    params[4] = w_scale * k_scale
     for bidx, (K, R) in enumerate(cam_dump):
         base = 8 + bidx * 28
         krinv = (K @ R.T).astype(np.float32).ravel()
@@ -164,7 +184,7 @@ def main() -> None:
         b = b0 if bidx == 0 else b1
         off = off0 if bidx == 0 else off1
         mshape = m0[0].shape if bidx == 0 else m1[0].shape
-        params[base + 9:base + 11] = [b[0], b[1]]
+        params[base + 9:base + 11] = [b[0] * k_scale, b[1] * k_scale]
         params[base + 11:base + 13] = [off[0], off[1]]
         params[base + 13:base + 15] = [mshape[1], mshape[0]]
         params[base + 15:base + 19] = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
