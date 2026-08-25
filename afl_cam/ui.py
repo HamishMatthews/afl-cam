@@ -21,7 +21,7 @@ from .config import (
 from .capture import (camera_device, camera_present, set_auto_exposure,
                       start_audio_capture, stop_audio_procs)
 from .db import RecordingDB
-from .engine import make_preview, make_recorder
+from .engine import can_live_stitch, make_preview, make_recorder
 from .sessions import new_session_dir, session_dir_is_safe, remove_session_dir
 
 log = logging.getLogger("afl_cam.ui")
@@ -492,6 +492,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
         # Create the session (folder + DB row) and record into it
         session_dir = new_session_dir()
+        self._session_dir = session_dir
+        self._live_stitch = False
         session_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._session_id = self._db.add_session(
             created_at=session_time,
@@ -501,6 +503,41 @@ class MainWindow(Gtk.ApplicationWindow):
         self._recorders.clear()
         self._db_ids.clear()
         self._durations.clear()
+
+        # Live GPU stitch (cam2stitch): one process records BOTH cameras and
+        # writes the panorama directly — no post-stitch step. Falls back to
+        # per-camera recording when the probe fails or a camera is missing.
+        if (LIVE_STITCH and PLATFORM == "linux"
+                and camera_present("cam0") and camera_present("cam1")
+                and can_live_stitch()):
+            from .engine import StitchRecorderMPP
+
+            dev0 = camera_device("cam0")
+            dev1 = camera_device("cam1")
+            recorder = StitchRecorderMPP(dev0, dev1, label="stitch",
+                                         resolution_key=res_key)
+            try:
+                output = recorder.start(
+                    duration_sec=duration,
+                    on_done=self._on_recorder_done,
+                    output_dir=session_dir,
+                )
+            except RuntimeError as e:
+                log.error("Live stitch start failed (%s) — per-camera fallback", e)
+            else:
+                row_id = self._db.add(
+                    camera="stitch", device_path=f"{dev0}+{dev1}",
+                    resolution=RESOLUTIONS[res_key]["label"],
+                    file_path=str(output.relative_to(ROOT_DIR)),
+                    status="recording",
+                    session_id=self._session_id,
+                    created_at=session_time,
+                )
+                self._db_ids.append(row_id)
+                self._recorders.append(recorder)
+                log.info("Live stitch recording: %s", output.name)
+                self._live_stitch = True
+                return self._finish_recording_start()
 
         for cam_key in ["cam0", "cam1"]:
             dev = camera_device(cam_key)
@@ -524,12 +561,16 @@ class MainWindow(Gtk.ApplicationWindow):
             self._db_ids.append(row_id)
             self._recorders.append(recorder)
 
+        return self._finish_recording_start()
+
+    def _finish_recording_start(self):
+        session_dir = self._session_dir
         if not self._recorders:
             log.error("No cameras available to record")
             self._resume_previews()
             return
 
-        # Record the camera microphones for clap-based timecode sync
+        # Record the camera microphones (clap fallback / audio track)
         self._audio_procs = []
         for cam_key in ("cam0", "cam1"):
             proc = start_audio_capture(cam_key, session_dir / f"{cam_key}.wav")
@@ -692,6 +733,12 @@ class MainWindow(Gtk.ApplicationWindow):
 
         # Verify the session has both recordings before starting
         recs = {r["camera"]: r for r in self._db.session_recordings(session_id)}
+        if "stitch" in recs and Path(str(ROOT_DIR / recs["stitch"]["file_path"])).exists():
+            # recorded with live GPU stitch — nothing to do in post
+            self._db.update_session_stitch_status(session_id, "stitched")
+            self._recording_list.refresh()
+            self._controls.status_label.set_text("✓ Stitched live during recording")
+            return
         if "cam0" not in recs or "cam1" not in recs:
             dialog = Gtk.MessageDialog(
                 transient_for=self, modal=True,

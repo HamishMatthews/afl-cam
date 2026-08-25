@@ -278,6 +278,59 @@ def is_rockchip() -> bool:
     return PLATFORM == "linux" and Path("/dev/mpp_service").exists()
 
 
+def ensure_cam2stitch() -> Optional[Path]:
+    """Compile the live-stitch recorder if missing or stale."""
+    import subprocess
+
+    from .config import STITCH_RECORDER_BIN, STITCH_RECORDER_SRC
+
+    if STITCH_RECORDER_BIN.exists() and STITCH_RECORDER_SRC.exists() and \
+            STITCH_RECORDER_BIN.stat().st_mtime >= STITCH_RECORDER_SRC.stat().st_mtime:
+        return STITCH_RECORDER_BIN
+
+    cmd = [
+        "gcc", "-O2", "-I/usr/local/include/rockchip",
+        "-o", str(STITCH_RECORDER_BIN), str(STITCH_RECORDER_SRC),
+        "-L/usr/local/lib", "-lrockchip_mpp", "-lvulkan", "-lpthread",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.error("cam2stitch build failed: %s", e)
+        return None
+    if result.returncode != 0:
+        log.error("cam2stitch build failed: %s", result.stderr.strip()[-400:])
+        return None
+    return STITCH_RECORDER_BIN
+
+
+def can_live_stitch() -> bool:
+    """Probe gate: Vulkan + shader + params init succeeds (--probe).
+
+    Runs before each live recording; the UI falls back to per-camera
+    recording when this is False.
+    """
+    import subprocess
+
+    from .config import (STITCH_PARAMS_DIR, STITCH_RECORDER_BIN,
+                         STITCH_SHADER, VK_ICD_FILENAMES, VK_LD_LIBRARY_PATH)
+
+    if not STITCH_RECORDER_BIN.exists() or not STITCH_PARAMS_DIR.exists():
+        return False
+    env = dict(os.environ,
+               VK_DRIVER_FILES=VK_ICD_FILENAMES,
+               LD_LIBRARY_PATH=VK_LD_LIBRARY_PATH + ":"
+               + os.environ.get("LD_LIBRARY_PATH", ""))
+    try:
+        result = subprocess.run(
+            [str(STITCH_RECORDER_BIN), "--probe", str(STITCH_PARAMS_DIR),
+             str(STITCH_SHADER)],
+            capture_output=True, text=True, timeout=60, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and "OK" in result.stdout
+
+
 def ensure_cam2h264() -> Optional[Path]:
     """Compile the native recorder if missing or older than its source.
 
@@ -449,6 +502,134 @@ class CameraRecorderMPP:
             if not self._running:
                 return
             log.info("Stopping recording: %s", self.label)
+            proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @property
+    def output_path(self) -> Optional[Path]:
+        return self._output_path
+
+
+class StitchRecorderMPP:
+    """Live dual-camera stitched recorder (RK3588, cam2stitch).
+
+    One process opens BOTH UVC cameras (MJPEG → jpegd NV12), pairs frames
+    by kernel timestamp, stitches on the Mali GPU and encodes the composite
+    panorama — no post-stitch step. Same interface as CameraRecorderMPP.
+    """
+
+    codec = "H264"
+    container = "mp4"
+
+    def __init__(self, device0: str, device1: str, label: str = "stitch",
+                 resolution_key: str = DEFAULT_RESOLUTION):
+        self.device0 = device0
+        self.device1 = device1
+        self.label = label
+        self.resolution_key = resolution_key
+        res = RESOLUTIONS[resolution_key]
+        self.width = res["width"]
+        self.height = res["height"]
+        self.fps = res["fps"]
+
+        self._proc = None
+        self._monitor: Optional[Thread] = None
+        self._start_time: float = 0
+        self._on_done: Optional[Callable] = None
+        self._output_path: Optional[Path] = None
+        self._raw_path: Optional[Path] = None
+        self._running = False
+        self._lock = Lock()
+
+    def start(self, duration_sec: float = 0,
+              on_done: Optional[Callable] = None,
+              output_dir: Optional[Path] = None) -> Path:
+        """Start a live-stitched recording (contract as CameraRecorderMPP)."""
+        import signal
+        import subprocess
+
+        from .config import (CAPTURES_DIR, EXPOSURE_TIME, STITCH_PARAMS_DIR,
+                             STITCH_RECORDER_BIN, STITCH_SHADER,
+                             VK_ICD_FILENAMES, VK_LD_LIBRARY_PATH)
+
+        with self._lock:
+            if self._running:
+                raise RuntimeError(f"Already recording: {self.label}")
+
+            recorder = ensure_cam2stitch()
+            if recorder is None:
+                raise RuntimeError("Live-stitch recorder unavailable — build failed")
+
+            if output_dir is not None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output = output_dir / f"{self.label}.mp4"
+            else:
+                output = CAPTURES_DIR / _make_filename(self.label, self.resolution_key)
+                CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+
+            raw = output.with_suffix(".raw.h264")
+            frames = int(duration_sec * self.fps) if duration_sec > 0 else 0
+            log_path = output.with_suffix(".rec.log")
+            cmd = [str(recorder), self.device0, self.device1,
+                   str(STITCH_PARAMS_DIR), str(raw), str(frames),
+                   str(self.width), str(self.height), str(self.fps),
+                   str(EXPOSURE_TIME),
+                   str(int(duration_sec)) if duration_sec > 0 else "0",
+                   str(STITCH_SHADER)]
+
+            self._output_path = output
+            self._raw_path = raw
+            self._on_done = on_done
+            self._start_time = time.time()
+            self._running = True
+
+            # libmali env — subprocesses don't inherit the shell's env
+            env = dict(os.environ,
+                       VK_DRIVER_FILES=VK_ICD_FILENAMES,
+                       LD_LIBRARY_PATH=VK_LD_LIBRARY_PATH + ":"
+                       + os.environ.get("LD_LIBRARY_PATH", ""))
+            with open(log_path, "w") as logf:
+                self._proc = subprocess.Popen(
+                    cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
+
+            log.info("Live stitch started: %s → %s (%.0fs, GPU)",
+                     self.label, output.name, duration_sec)
+
+            self._monitor = Thread(target=self._wait_proc, daemon=True)
+            self._monitor.start()
+            return output
+
+    def _wait_proc(self):
+        rc = self._proc.wait() if self._proc else 1
+        elapsed = time.time() - self._start_time
+        with self._lock:
+            self._running = False
+            output = self._output_path
+            raw = self._raw_path
+            on_done = self._on_done
+        ok = rc == 0 and raw is not None and raw.exists() and \
+            CameraRecorderMPP._remux(raw, output)
+        log.info("Live stitch %s: %s (%.1fs, rc=%d)",
+                 "complete" if ok else "error", self.label, elapsed, rc)
+        if on_done:
+            on_done(ok, output, elapsed)
+
+    def stop(self):
+        """Signal the recorder to finish (SIGINT → graceful flush)."""
+        import signal
+
+        with self._lock:
+            if not self._running:
+                return
+            log.info("Stopping live stitch: %s", self.label)
             proc = self._proc
         if proc and proc.poll() is None:
             try:

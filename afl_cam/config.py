@@ -98,6 +98,23 @@ EXPOSURE_TIME = 0
 # Default recording duration (0 = manual stop)
 DEFAULT_DURATION = 0
 
+# Live GPU stitching at record time: cam2stitch records BOTH cameras in one
+# process and writes the stitched panorama directly (no post step). When the
+# probe fails or a camera is missing the UI falls back to per-camera
+# recording. Off switch: AFL_CAM_LIVE_STITCH=0.
+LIVE_STITCH = os.environ.get("AFL_CAM_LIVE_STITCH", "1") == "1"
+STITCH_RECORDER_SRC = ROOT_DIR / "afl_cam" / "native" / "cam2stitch.c"
+STITCH_RECORDER_BIN = ROOT_DIR / "afl_cam" / "native" / "cam2stitch"
+STITCH_SHADER = ROOT_DIR / "afl_cam" / "native" / "stitch_nv12.spv"
+STITCH_PARAMS_DIR = ROOT_DIR / "calibration" / "stitch_live"
+STITCH_CANVAS_WIDTH = 3840
+
+# libmali Vulkan env for the cam2stitch subprocess (spawned processes do not
+# inherit the interactive shell's env; the ICD lives in a non-standard dir)
+VK_ICD_FILENAMES = "/opt/libmali-g610/usr/share/vulkan/icd.d/mali.json"
+VK_LD_LIBRARY_PATH = ("/opt/libmali-g610/usr/lib/aarch64-linux-gnu:"
+                      "/opt/libmali-g610/usr/lib/aarch64-linux-gnu/mali")
+
 # SQLite pragmas
 DB_PRAGMAS = {
     "journal_mode": "WAL",

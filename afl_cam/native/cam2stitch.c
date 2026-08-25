@@ -984,6 +984,22 @@ static void usage(const char *argv0) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 3 && !strcmp(argv[1], "--probe")) {
+        /* Vulkan+shader+params init only: "OK" + exit 0 when live stitch
+         * is available (the engine's fallback gate). */
+        const char *pdir = argv[2];
+        const char *spv = argc > 3 ? argv[3] : "afl_cam/native/stitch_nv12.spv";
+        char path[1024];
+        size_t len;
+        void *pd = read_file((snprintf(path, sizeof path, "%s/params.bin", pdir), path), &len);
+        if (len != 64 * sizeof(float)) { fprintf(stderr, "params.bin size mismatch\n"); return 1; }
+        void *w0d = read_file((snprintf(path, sizeof path, "%s/w0.bin", pdir), path), &len);
+        void *w1d = read_file((snprintf(path, sizeof path, "%s/w1.bin", pdir), path), &len);
+        gpu_t g = {0};
+        gpu_init(&g, spv, pd, w0d, w1d);
+        printf("OK\n");
+        return 0;
+    }
     if (argc >= 2 && !strcmp(argv[1], "-src")) {
         if (argc < 6) { usage(argv[0]); return 1; }
         return run_src_mode(argv[2], argv[3], argv[4], argv[5],
