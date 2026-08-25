@@ -1,5 +1,10 @@
 # Hardware Stitching at Record Time — Plan
 
+> **Superseded 2026-08-25 by [live_stitch_plan.md](live_stitch_plan.md).** The RGA
+> perspective-transform path below is dead — librga 1.10.6 on this board has no
+> perspective API, and the Mali-G610 Vulkan compute stitch (analytic spherical warp,
+> 9.3 ms/frame, SSIM 0.9997) is validated and is the chosen path. Kept for history.
+
 Investigation plan for stitching the two camera feeds on RK3588 hardware at record time,
 instead of the current offline OpenCV/CPU stitch. **Planning only — implementation is a
 separate (much bigger) piece of work.**
