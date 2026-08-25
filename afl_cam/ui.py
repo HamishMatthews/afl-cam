@@ -39,6 +39,7 @@ class PreviewPanel(Gtk.Frame):
         self._label = label
         self._pixbuf: GdkPixbuf.Pixbuf | None = None
         self._lock = Lock()
+        self._got_frame = False
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.set_margin_start(4)
@@ -82,6 +83,7 @@ class PreviewPanel(Gtk.Frame):
                     owned, GdkPixbuf.Colorspace.RGB, False, 8,
                     width, height, width * 3,
                 )
+                self._got_frame = True
             except Exception as e:
                 log.warning("Failed to create pixbuf: %s", e)
                 return False
@@ -115,6 +117,15 @@ class PreviewPanel(Gtk.Frame):
 
     def set_status(self, text: str):
         GLib.idle_add(self._status_label.set_text, text)
+
+    def reset_frame_flag(self):
+        with self._lock:
+            self._got_frame = False
+
+    @property
+    def got_frame(self) -> bool:
+        with self._lock:
+            return self._got_frame
 
 
 # Control bar — resolution, duration, record/stop, swap
@@ -410,6 +421,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._stop_previews()
 
         # Left panel
+        self._left_panel.reset_frame_flag()
         if camera_present(left_cam):
             p = make_preview(camera_device(left_cam), label=left_cam)
             p.start(on_frame=lambda d, w, h, panel=self._left_panel: panel.update_frame(d, w, h))
@@ -420,6 +432,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self._left_panel.set_status(f"offline ({left_cam})")
 
         # Right panel
+        self._right_panel.reset_frame_flag()
         if camera_present(right_cam):
             p = make_preview(camera_device(right_cam), label=right_cam)
             p.start(on_frame=lambda d, w, h, panel=self._right_panel: panel.update_frame(d, w, h))
@@ -433,6 +446,16 @@ class MainWindow(Gtk.ApplicationWindow):
         # mode 1 = Manual (almost-black frames), and stream open can reset it.
         for cam_key in (left_cam, right_cam):
             set_auto_exposure(cam_key)
+
+        # Watchdog: a pipeline can reach PLAYING without ever delivering
+        # frames (e.g. the node is the camera's metadata device) — flag it.
+        GLib.timeout_add(3000, self._check_preview_frames)
+
+    def _check_preview_frames(self) -> bool:
+        for side, panel in (("left", self._left_panel), ("right", self._right_panel)):
+            if self._previews.get(side) is not None and not panel.got_frame:
+                panel.set_status("no frames — wrong device?")
+        return False  # one-shot
 
     def _stop_previews(self):
         for p in self._previews.values():

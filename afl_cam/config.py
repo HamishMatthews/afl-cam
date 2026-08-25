@@ -1,5 +1,8 @@
 """Constants and configuration for afl-cam."""
 
+import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,19 +14,43 @@ DB_PATH = ROOT_DIR / "recordings.db"
 
 PLATFORM = sys.platform  # "linux" or "darwin"
 
-# Camera devices (UVC), matched by USB port. Each camera exposes TWO video
-# nodes on the same interface (main + metadata); the main node is the one
-# that streams.
-#   Linux (Orange Pi 5 Max) — xhci.11 camera = video0 (+video2), xhci.12
-#                              camera = video1 (+video3). Node numbers can
-#                              shuffle across reboots — if a preview is dead,
-#                              check /sys/class/video4linux/ for the current
-#                              mapping (lsusb + udevadm info -q all -n).
-#   macOS  — AVFoundation device indices (find them with 'afl-cam list-devices')
-CAMERAS = {
-    "cam0": "/dev/video0" if PLATFORM == "linux" else "0",
-    "cam1": "/dev/video1" if PLATFORM == "linux" else "1",
+# Camera devices (UVC). Each camera exposes TWO video nodes on the same
+# interface: a main node (streams MJPG) and a metadata node (no formats).
+# Node numbers SHUFFLE ACROSS REBOOTS, so they are resolved at runtime:
+# the USB controller port (xhci.12 = cam0, xhci.11 = cam1 — the rig wiring)
+# plus MJPG support identify each camera's main node. The static map is a
+# fallback for when discovery fails.
+#   macOS — AVFoundation device indices (find them with 'afl-cam list-devices')
+def _discover_cameras():
+    try:
+        found = {}
+        for node in sorted(os.listdir("/sys/class/video4linux")):
+            link = os.readlink(f"/sys/class/video4linux/{node}")
+            m = re.search(r"xhci-hcd\.(\d+)\.auto", link)
+            if not m or m.group(1) in found:
+                continue
+            out = subprocess.run(
+                ["v4l2-ctl", "-d", f"/dev/{node}", "--list-formats"],
+                capture_output=True, text=True, timeout=5).stdout
+            if "MJPG" in out:
+                found[m.group(1)] = f"/dev/{node}"
+        by_ctl = {"cam0": "12", "cam1": "11"}
+        resolved = {k: found[ctl] for k, ctl in by_ctl.items() if ctl in found}
+        if len(resolved) == 2:
+            return resolved
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+CAMERAS = _discover_cameras() if PLATFORM == "linux" else {
+    "cam0": "0",
+    "cam1": "1",
 }
+if CAMERAS is None:
+    CAMERAS = {
+        "cam0": "/dev/video0",
+        "cam1": "/dev/video1",
+    }
 
 # Camera → its USB microphone, recorded alongside the video for clap-based
 # timecode syncing:
