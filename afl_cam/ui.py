@@ -156,6 +156,17 @@ class ControlBar(Gtk.Box):
         self.res_combo.set_active_id(DEFAULT_RESOLUTION)
         self.pack_start(self.res_combo, False, False, 0)
 
+        # Record mode: live GPU stitch, or separate cameras + stitch later
+        self.pack_start(Gtk.Label(label="Mode:"), False, False, 0)
+        self.mode_combo = Gtk.ComboBoxText()
+        self.mode_combo.append("live", "Live stitch")
+        self.mode_combo.append("separate", "Separate + stitch")
+        self.mode_combo.set_active_id("live")
+        self.mode_combo.set_tooltip_text(
+            "Live stitch: one panorama recorded directly on the GPU.\n"
+            "Separate + stitch: record both cameras, stitch afterwards.")
+        self.pack_start(self.mode_combo, False, False, 0)
+
         # Duration with manual +/- buttons
         self.pack_start(Gtk.Label(label="Duration (s):"), False, False, 0)
         self.dur_entry = Gtk.Entry()
@@ -204,18 +215,25 @@ class ControlBar(Gtk.Box):
     def get_resolution(self) -> str:
         return self.res_combo.get_active_id() or DEFAULT_RESOLUTION
 
+    def get_record_mode(self) -> str:
+        """'live' (GPU stitch during recording) or 'separate' (record both
+        cameras, stitch afterwards with the Stitch button)."""
+        return self.mode_combo.get_active_id() or "live"
+
     def set_recording(self, active: bool):
         if active:
             self.record_btn.set_label("Stop Recording")
             self.record_btn.get_style_context().remove_class("suggested-action")
             self.record_btn.get_style_context().add_class("destructive-action")
             self.res_combo.set_sensitive(False)
+            self.mode_combo.set_sensitive(False)
             self.dur_entry.set_sensitive(False)
         else:
             self.record_btn.set_label("Record")
             self.record_btn.get_style_context().remove_class("destructive-action")
             self.record_btn.get_style_context().add_class("suggested-action")
             self.res_combo.set_sensitive(True)
+            self.mode_combo.set_sensitive(True)
             self.dur_entry.set_sensitive(True)
 
 
@@ -506,8 +524,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
         # Live GPU stitch (cam2stitch): one process records BOTH cameras and
         # writes the panorama directly — no post-stitch step. Falls back to
-        # per-camera recording when the probe fails or a camera is missing.
+        # per-camera recording when the probe fails, a camera is missing, or
+        # the user chose "Separate + stitch" mode.
         if (LIVE_STITCH and PLATFORM == "linux"
+                and self._controls.get_record_mode() == "live"
                 and camera_present("cam0") and camera_present("cam1")
                 and can_live_stitch()):
             from .engine import StitchRecorderMPP

@@ -1079,7 +1079,7 @@ int main(int argc, char **argv) {
                                 "rc:bps_min", "rc:bps_max" };
         RK_S32 vals[8] = { (RK_S32)g.canvas_w, (RK_S32)g.canvas_h,
                            (RK_S32)ehs, (RK_S32)evs, MPP_FMT_YUV420SP,
-                           20000000, 19000000, 21000000 };
+                           30000000, 28500000, 31500000 };
         for (int i = 0; i < 8; i++)
             mpp_enc_cfg_set_s32(enc_cfg, keys[i], vals[i]);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
