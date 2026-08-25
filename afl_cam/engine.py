@@ -420,15 +420,15 @@ class CameraRecorderMPP:
 
     @staticmethod
     def _remux(raw: Path, out: Path) -> bool:
-        """Mux the raw H.264 ES into .mp4 with per-frame timestamps from the
-        `.pts` sidecar (kernel monotonic clock) — VFR, so playback speed is
-        real-life speed even when auto-exposure runs below 30 fps."""
-        from afl_cam.retime import retime_file
+        """Mux the raw H.264 ES into .mp4 as CFR at the REAL rate measured
+        from the `.pts` sidecar (kernel monotonic clock) — so playback speed
+        is real-life speed even when auto-exposure runs below 30 fps."""
+        from afl_cam.retime import mux_with_pts_rate
 
-        if retime_file(raw, out.with_suffix(".pts"), out):
+        if mux_with_pts_rate(raw, out.with_suffix(".pts"), out,
+                             fallback_fps=30.0):
             raw.unlink(missing_ok=True)
             return True
-        log.error("pts retime failed for %s — falling back to CFR copy", raw.name)
         import subprocess
 
         result = subprocess.run(

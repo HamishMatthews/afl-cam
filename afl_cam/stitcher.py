@@ -866,6 +866,7 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
     pts0 = _load_pts(cam0_path.with_suffix(".pts"))
     pts1 = _load_pts(cam1_path.with_suffix(".pts"))
     pair = None
+    out_fps = fps
     if pts0 is not None and pts1 is not None:
         # pair every cam0 frame with the cam1 frame whose kernel timestamp
         # is nearest, and TRIM to the overlap window: the stitch starts where
@@ -884,6 +885,15 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
         advance1 = s0
         _report(f"frame sync: pts sidecar — trimmed {s0} frames at start "
                 f"({(pts1[0] - pts0[s0]) / 1e6:+.2f}s between first frames)")
+        # The output container is CFR at the MEDIAN paired rate (measured
+        # from the sidecars BEFORE encoding) — real-life playback speed, and
+        # a plain regular container that every player reads reliably.
+        if n_out > 1:
+            paired_ts = (pts0[s0:s0 + n_out] + pts1[pair[:n_out]]) // 2
+            out_fps = int(max(1, min(60, round(
+                1e6 / float(np.median(np.diff(paired_ts)))))))
+            _report(f"frame sync: output CFR at measured {out_fps} fps "
+                    f"({n_out} frames in the overlap window)")
 
     if pair is None:
         advance1 = 0
@@ -956,7 +966,7 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
         ow = output_width
 
     _report(f"encoding {ow}x{oh}")
-    enc = _open_encoder(out_dir / "stitch_video.mp4", fps, ow, oh)
+    enc = _open_encoder(out_dir / "stitch_video.mp4", out_fps, ow, oh)
 
     idx, t0 = 0, time.time()
     last_report = 0.0
@@ -1024,19 +1034,14 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
         raise StitchError("No frames written. Recordings may be empty.")
 
     if pair is not None and out_path is not None and out_pts:
-        # Re-time the container with the paired kernel timestamps (VFR): the
-        # output then plays at real-life speed and its duration equals the
-        # true overlap span, not a fixed-30 fps stretch.
+        # Diagnostic sidecar: the kernel timestamp of each output frame
+        # (midpoint of the source pair). The container itself is CFR at the
+        # measured rate — no VFR, no post-retime.
         pts_path = out_dir / "stitch_video.pts"
         with open(pts_path, "w") as fh:
             fh.write("\n".join(str(t) for t in out_pts) + "\n")
-        from afl_cam.retime import retime_file
-
-        if retime_file(out_path, pts_path, out_path):
-            _report(f"output retimed to real time "
-                    f"({(out_pts[-1] - out_pts[0]) / 1e6:.2f}s span)")
-        else:
-            _report("output retime failed — left at fixed 30 fps")
+        _report(f"output: {idx} frames at {out_fps} fps "
+                f"({(out_pts[-1] - out_pts[0]) / 1e6:.2f}s real span)")
 
     return {
         "video_path": out_path,
