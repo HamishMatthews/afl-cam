@@ -15,7 +15,7 @@ gi.require_version("GLib", "2.0")
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib
 
 from .config import (
-    CAMERAS, RESOLUTIONS, DEFAULT_RESOLUTION,
+    CAMERAS, RESOLUTIONS, DEFAULT_RESOLUTION, LIVE_STITCH,
     PREVIEW_WIDTH, PREVIEW_HEIGHT, CAPTURES_DIR, DB_PATH, ROOT_DIR, PLATFORM,
 )
 from .capture import (camera_device, camera_present, set_auto_exposure,
