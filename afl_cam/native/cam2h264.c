@@ -168,7 +168,9 @@ int main(int argc, char **argv)
         set_exposure(fd, V4L2_EXPOSURE_MANUAL, exposure);
         fprintf(stderr, "exposure: fixed manual, %d (%dms)\n", exposure, exposure / 10);
     } else {
-        set_exposure(fd, V4L2_EXPOSURE_AUTO, 0);
+        /* This camera's auto mode is menu value 3 ("Aperture Priority"),
+         * NOT the generic V4L2_EXPOSURE_AUTO (0) — that value is rejected. */
+        set_exposure(fd, 3, 0);
         fprintf(stderr, "exposure: auto settle, then lock\n");
     }
 
@@ -450,12 +452,12 @@ int main(int argc, char **argv)
             double l = frame_luma(dec_frame);
             if (l >= 0) {
                 if (lock_phase == 0) {
-                    if (count >= 30) { luma_acc += l; luma_n++; }
-                    if (count >= 59) {
+                    if (count >= 60) { luma_acc += l; luma_n++; }
+                    if (count >= 119) {
                         target_luma = luma_n ? luma_acc / luma_n : 64.0;
                         set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
                         lock_phase = 1;
-                        refine_left = 15;
+                        refine_left = 30;
                         luma_acc = 0.0; luma_n = 0;
                         fprintf(stderr, "exposure: auto settled at luma %.0f, locking...\n",
                                 target_luma);
@@ -465,19 +467,22 @@ int main(int argc, char **argv)
                     if (--refine_left == 0) {
                         double meas = luma_n ? luma_acc / luma_n : target_luma;
                         double ratio = meas > 1.0 ? target_luma / meas : 1.0;
-                        if (ratio < 0.5) ratio = 0.5;
-                        if (ratio > 2.0) ratio = 2.0;
+                        /* gentle steps + a hard ceiling: long exposures cap
+                         * the sensor fps (50ms -> 20fps, 160ms -> 6fps) —
+                         * never chase brightness at the cost of frame rate */
+                        if (ratio < 0.75) ratio = 0.75;
+                        if (ratio > 1.33) ratio = 1.33;
                         lock_exp = (RK_S32)(lock_exp * ratio + 0.5);
-                        if (lock_exp < 3) lock_exp = 3;
-                        if (lock_exp > 2047) lock_exp = 2047;
+                        if (lock_exp < 30) lock_exp = 30;    /* 3ms */
+                        if (lock_exp > 330) lock_exp = 330;  /* 33ms = 30fps */
                         set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
                         luma_acc = 0.0; luma_n = 0;
-                        if (++refine_rounds >= 3) {
+                        if (++refine_rounds >= 5) {
                             lock_pending = 0;
                             fprintf(stderr, "exposure: locked at %d (%dms)\n",
                                     lock_exp, lock_exp / 10);
                         } else {
-                            refine_left = 15;
+                            refine_left = 30;
                         }
                     }
                 }
