@@ -871,6 +871,11 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
         # is nearest, and TRIM to the overlap window: the stitch starts where
         # BOTH cameras are live (no frozen duplicated frames at the start).
         s0 = int(np.searchsorted(pts0, pts1[0]))
+        # Also trim the END to the overlap window: the stitch stops where
+        # EITHER camera ends (each runs its own rate under auto-exposure, so
+        # they finish at different real times — no frozen trailing frames).
+        e_cut = int(np.searchsorted(pts0, pts1[-1], side="right"))
+        n_out = max(0, e_cut - s0)
         pair = np.searchsorted(pts1, pts0)
         pair = np.clip(pair, 0, len(pts1) - 1)
         lo = np.clip(pair - 1, 0, len(pts1) - 1)
@@ -959,11 +964,14 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
     cam1_last = None
     j_cur = -1
     skip_left = advance1 if pair is not None else 0
+    consumed = 0
+    out_pts = []  # kernel timestamp of each output frame (midpoint of the pair)
 
     while True:
         ok0, frame0 = cap0.read()
         if not ok0 or frame0 is None:
             break
+        consumed += 1
         if skip_left > 0:
             skip_left -= 1
             continue
@@ -998,6 +1006,11 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
         enc.write(pano)
         idx += 1
 
+        if pair is not None:
+            out_pts.append(int((pts0[s0 + consumed - 1] + pts1[j]) // 2))
+            if idx >= n_out:
+                break
+
         if time.time() - last_report > 2.5:
             _report(f"frame {idx} ({idx / (time.time() - t0):.1f} fps)")
             last_report = time.time()
@@ -1009,6 +1022,21 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
 
     if idx == 0:
         raise StitchError("No frames written. Recordings may be empty.")
+
+    if pair is not None and out_path is not None and out_pts:
+        # Re-time the container with the paired kernel timestamps (VFR): the
+        # output then plays at real-life speed and its duration equals the
+        # true overlap span, not a fixed-30 fps stretch.
+        pts_path = out_dir / "stitch_video.pts"
+        with open(pts_path, "w") as fh:
+            fh.write("\n".join(str(t) for t in out_pts) + "\n")
+        from afl_cam.retime import retime_file
+
+        if retime_file(out_path, pts_path, out_path):
+            _report(f"output retimed to real time "
+                    f"({(out_pts[-1] - out_pts[0]) / 1e6:.2f}s span)")
+        else:
+            _report("output retime failed — left at fixed 30 fps")
 
     return {
         "video_path": out_path,

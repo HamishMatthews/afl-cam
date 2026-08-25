@@ -373,13 +373,17 @@ class CameraRecorderMPP:
             # remuxed (stream copy, no re-encode) to .mp4 on completion.
             raw = output.with_suffix(".raw.h264")
 
-            # 0 = record until stop(); otherwise record exactly N frames
+            # 0 = record until stop(); otherwise record for the requested
+            # wall-clock duration — the frame count is only a 30 fps backstop
+            # (auto-exposure can run the sensor slower than 30 fps, and the
+            # recording must still cover duration_sec of REAL time).
             frames = int(duration_sec * self.fps) if duration_sec > 0 else 0
 
             log_path = output.with_suffix(".rec.log")
             cmd = [str(recorder), self.device, str(raw), str(frames),
                    str(self.width), str(self.height), str(self.fps),
-                   str(EXPOSURE_TIME)]
+                   str(EXPOSURE_TIME),
+                   str(int(duration_sec)) if duration_sec > 0 else "0"]
 
             self._output_path = output
             self._raw_path = raw
@@ -416,7 +420,15 @@ class CameraRecorderMPP:
 
     @staticmethod
     def _remux(raw: Path, out: Path) -> bool:
-        """Stream-copy the raw H.264 ES into an .mp4 container (no re-encode)."""
+        """Mux the raw H.264 ES into .mp4 with per-frame timestamps from the
+        `.pts` sidecar (kernel monotonic clock) — VFR, so playback speed is
+        real-life speed even when auto-exposure runs below 30 fps."""
+        from afl_cam.retime import retime_file
+
+        if retime_file(raw, out.with_suffix(".pts"), out):
+            raw.unlink(missing_ok=True)
+            return True
+        log.error("pts retime failed for %s — falling back to CFR copy", raw.name)
         import subprocess
 
         result = subprocess.run(

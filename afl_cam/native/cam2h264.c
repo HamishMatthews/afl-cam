@@ -92,6 +92,7 @@ int main(int argc, char **argv)
     RK_U32 height         = (argc > 5) ? atoi(argv[5]) : 2160;
     RK_U32 fps            = (argc > 6) ? atoi(argv[6]) : 30;
     RK_S32 exposure       = (argc > 7) ? atoi(argv[7]) : 0;     /* 0 = auto-lock, else 100us units */
+    RK_S32 wall_sec       = (argc > 8) ? atoi(argv[8]) : 0;     /* 0 = unlimited; else stop after this many WALL seconds */
 
     int fd = -1, ret = 0;
     int stream_on = 0;
@@ -354,6 +355,10 @@ int main(int argc, char **argv)
     /* main loop */
     fprintf(stderr, "recording %u frames to %s\n", frames, out_path);
     t_start = now_us();
+    /* Wall-clock deadline: auto-exposure can run the sensor below the
+     * requested fps, and the user asked for duration_sec of REAL time —
+     * the frame count is only a 30 fps backstop. */
+    int64_t t_deadline = wall_sec > 0 ? t_start + (int64_t)wall_sec * 1000000 : 0;
 
     /* auto-settle-then-lock exposure state (exposure <= 0) */
     int lock_pending = (exposure <= 0);
@@ -374,7 +379,8 @@ int main(int argc, char **argv)
         goto OUT;
     }
 
-    while (g_running && count < frames) {
+    while (g_running && (frames == 0 || count < frames) &&
+           !(t_deadline && now_us() > t_deadline)) {
         struct v4l2_buffer vbuf;
         memset(&vbuf, 0, sizeof(vbuf));
         vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
