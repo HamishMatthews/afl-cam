@@ -465,19 +465,34 @@ int main(int argc, char **argv)
                     if (count >= 60) { luma_acc += l; luma_n++; }
                     if (count >= 119) {
                         target_luma = luma_n ? luma_acc / luma_n : 64.0;
-                        if (dt_n > 0) {
-                            lock_exp = (RK_S32)((dt_sum / dt_n) / 100);
-                            if (lock_exp < 30) lock_exp = 30;
-                            if (lock_exp > 600) lock_exp = 600;
+                        /* This camera's manual mode disables the internal
+                         * analog gain that auto mode uses to reach brightness
+                         * in dim light (no V4L2 gain control exists) — so a
+                         * manual lock can NEVER match auto's brightness when
+                         * the scene needs gain. Lock only when auto already
+                         * runs at ~30fps (exposure <= ~33ms, bright scene,
+                         * gain-free); otherwise stay in auto — the pts
+                         * sidecar keeps sync perfect at any frame rate. */
+                        if (dt_n > 0 && (dt_sum / dt_n) > 33333) {
+                            lock_pending = 0;
+                            fprintf(stderr, "exposure: auto needs %.1fms (>33ms) — "
+                                    "staying in auto for brightness\n",
+                                    (dt_sum / dt_n) / 1000.0);
+                        } else {
+                            if (dt_n > 0) {
+                                lock_exp = (RK_S32)((dt_sum / dt_n) / 100);
+                                if (lock_exp < 30) lock_exp = 30;
+                                if (lock_exp > 330) lock_exp = 330;
+                            }
+                            set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
+                            lock_phase = 1;
+                            refine_left = 30;
+                            luma_acc = 0.0; luma_n = 0;
+                            fprintf(stderr, "exposure: auto settled at luma %.0f "
+                                    "(dt %.1fms) -> manual %d (%dms), refining...\n",
+                                    target_luma, dt_n ? (dt_sum / dt_n) / 1000.0 : 0.0,
+                                    lock_exp, lock_exp / 10);
                         }
-                        set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
-                        lock_phase = 1;
-                        refine_left = 30;
-                        luma_acc = 0.0; luma_n = 0;
-                        fprintf(stderr, "exposure: auto settled at luma %.0f "
-                                "(dt %.1fms) -> manual %d (%dms), refining...\n",
-                                target_luma, dt_n ? (dt_sum / dt_n) / 1000.0 : 0.0,
-                                lock_exp, lock_exp / 10);
                     }
                 } else {
                     luma_acc += l; luma_n++;
@@ -488,7 +503,7 @@ int main(int argc, char **argv)
                         if (ratio > 1.25) ratio = 1.25;
                         lock_exp = (RK_S32)(lock_exp * ratio + 0.5);
                         if (lock_exp < 30) lock_exp = 30;    /* 3ms */
-                        if (lock_exp > 600) lock_exp = 600;  /* 60ms */
+                        if (lock_exp > 330) lock_exp = 330;  /* 33ms = 30fps */
                         set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
                         luma_acc = 0.0; luma_n = 0;
                         int converged = (ratio > 0.9 && ratio < 1.11);
