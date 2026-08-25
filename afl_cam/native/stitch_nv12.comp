@@ -19,9 +19,11 @@
 // sampling the blend at the 2x2 BLOCK CENTER (2bx+1, 2by+1) — the warp is
 // defined on pixel corners, so the center is at +1.
 //
-// SSBO layout (uint32, low byte = value):
-//   [0 .. cw*ch)                 Y plane (one uint per pixel)
-//   [cw*ch .. cw*ch*2)           interleaved UV (one uint per byte)
+// SSBO layout (uint32, 4 bytes packed per uint — the SSBO is 2*cw*ch bytes
+// (half of the one-byte-per-uint layout), so the CPU repack reads 22MB
+// instead of 88MB at full canvas):
+//   [0 .. (cw/4)*ch)             Y plane: 4 pixels per uint, x in LSB..MSB
+//   [(cw/4)*ch .. )              interleaved UV: one block per uint (u | v<<8)
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -116,25 +118,41 @@ vec3 blend_at(vec2 p, vec2 src_dims, vec2 canvas_dims) {
 }
 
 void main() {
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     int cw = int(P.f[0]), ch = int(P.f[1]);
-    if (p.x >= cw || p.y >= ch) return;
+    int cw4 = cw / 4;
+    if (gid.x >= cw4 || gid.y >= ch) return;
 
     vec2 src_dims = vec2(P.f[2], P.f[3]);
     vec2 canvas_dims = vec2(P.f[0], P.f[1]);
-    vec2 pc = vec2(p);
 
-    vec3 rgb = blend_at(pc, src_dims, canvas_dims);
-    uint yq = uint(rgb_to_y(rgb) * 255.0 + 0.5) & 0xffu;
-    OUT.d[p.y * cw + p.x] = yq;
+    // four Y pixels per thread, packed LSB..MSB into one uint
+    // (manually unrolled — the libmali LLVM backend has miscompiled loops)
+    vec2 pc0 = vec2(gid.x * 4, gid.y);
+    vec2 pc1 = vec2(gid.x * 4 + 1, gid.y);
+    vec2 pc2 = vec2(gid.x * 4 + 2, gid.y);
+    vec2 pc3 = vec2(gid.x * 4 + 3, gid.y);
+    uint y0 = uint(rgb_to_y(blend_at(pc0, src_dims, canvas_dims)) * 255.0 + 0.5) & 0xffu;
+    uint y1 = uint(rgb_to_y(blend_at(pc1, src_dims, canvas_dims)) * 255.0 + 0.5) & 0xffu;
+    uint y2 = uint(rgb_to_y(blend_at(pc2, src_dims, canvas_dims)) * 255.0 + 0.5) & 0xffu;
+    uint y3 = uint(rgb_to_y(blend_at(pc3, src_dims, canvas_dims)) * 255.0 + 0.5) & 0xffu;
+    OUT.d[gid.y * cw4 + gid.x] = y0 | (y1 << 8) | (y2 << 16) | (y3 << 24);
 
-    // chroma: (even,even) threads only, blend at the block center (2bx+1,2by+1)
-    if ((p.x & 1) == 0 && (p.y & 1) == 0) {
-        vec3 rgbc = blend_at(pc + vec2(1.0, 1.0), src_dims, canvas_dims);
-        uint uq = uint(rgb_to_u(rgbc) * 255.0 + 0.5) & 0xffu;
-        uint vq = uint(rgb_to_v(rgbc) * 255.0 + 0.5) & 0xffu;
-        uint uv_base = uint(cw * ch);
-        OUT.d[uv_base + (p.y / 2) * cw + p.x] = uq;
-        OUT.d[uv_base + (p.y / 2) * cw + p.x + 1] = vq;
+    // chroma: even rows only — the 4 pixels cover TWO 2x2 blocks:
+    // block 2*gx (center 4*gx+1) and block 2*gx+1 (center 4*gx+3),
+    // one packed uint (u | v<<8) per block
+    if ((gid.y & 1) == 0) {
+        uint uv_base = uint(cw4 * ch);
+        uint row = uint(gid.y / 2) * uint(cw / 2);
+        vec2 pc0c = vec2(gid.x * 4 + 1, gid.y + 1);
+        vec3 rgb0 = blend_at(pc0c, src_dims, canvas_dims);
+        uint u0 = uint(rgb_to_u(rgb0) * 255.0 + 0.5) & 0xffu;
+        uint v0 = uint(rgb_to_v(rgb0) * 255.0 + 0.5) & 0xffu;
+        OUT.d[uv_base + row + gid.x * 2] = u0 | (v0 << 8);
+        vec2 pc1c = vec2(gid.x * 4 + 3, gid.y + 1);
+        vec3 rgb1 = blend_at(pc1c, src_dims, canvas_dims);
+        uint u1 = uint(rgb_to_u(rgb1) * 255.0 + 0.5) & 0xffu;
+        uint v1 = uint(rgb_to_v(rgb1) * 255.0 + 0.5) & 0xffu;
+        OUT.d[uv_base + row + gid.x * 2 + 1] = u1 | (v1 << 8);
     }
 }

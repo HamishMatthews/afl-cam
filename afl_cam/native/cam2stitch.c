@@ -27,6 +27,7 @@
  */
 
 #include <errno.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -69,6 +70,14 @@ static void sig_handler(int sig)
 {
     (void)sig;
     g_running = 0;
+}
+
+static void crash_handler(int sig)
+{
+    void *bt[32];
+    int n = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, n, 2);
+    _exit(128 + sig);
 }
 
 typedef struct { void *start; size_t length; } v4l2_buf_t;
@@ -239,7 +248,7 @@ static void gpu_init(gpu_t *g, const char *spv_path,
                 g->canvas_w, g->canvas_h);
         exit(1);
     }
-    g->ssbo_size = (VkDeviceSize)g->canvas_w * g->canvas_h * 8;  /* byte per uint, padded */
+    g->ssbo_size = (VkDeviceSize)g->canvas_w * g->canvas_h * 2;  /* 4 Y bytes or 1 UV block per uint: cw*ch/2 uints */
     g->stage_size = (VkDeviceSize)g->src_w * g->src_h * 3;       /* two tight NV12 frames */
     g->tight_size = (size_t)g->canvas_w * g->canvas_h * 3 / 2;
 
@@ -576,8 +585,8 @@ static void gpu_init(gpu_t *g, const char *spv_path,
                              0, 0, NULL, 0, NULL, 4, bars);
         vkCmdBindPipeline(s->cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(s->cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &s->dset, 0, NULL);
-        /* one thread per canvas pixel */
-        vkCmdDispatch(s->cb, (g->canvas_w + 15) / 16, (g->canvas_h + 15) / 16, 1);
+        /* one thread per 4-pixel Y group (packed SSBO) */
+        vkCmdDispatch(s->cb, (g->canvas_w / 4 + 15) / 16, (g->canvas_h + 15) / 16, 1);
         CHECK(vkEndCommandBuffer(s->cb));
     }
     g->k = 0;
@@ -620,16 +629,205 @@ static void gpu_stitch(gpu_t *g, const void *nv0, const void *nv1, void *tight_o
     g_times[0] = t1 - t0; g_times[1] = t2 - t1; g_times[2] = t3 - t2;
     g_times[3] = t4 - t3;
 
-    /* repack: SSBO holds one byte per uint32 in NV12 order — Y plane first,
-     * then interleaved UV (cw*ch/2 uints) */
+    /* repack: SSBO packs 4 Y bytes per uint32 (LSB..MSB = x..x+3) and one
+     * (u | v<<8) uint per chroma block — unpack to tight NV12 */
     uint32_t *o32 = s->ssbo_map;
     uint8_t *out = tight_out;
-    for (size_t i = 0; i < (size_t)g->canvas_w * g->canvas_h; i++)
-        out[i] = (uint8_t)o32[i];
-    for (size_t i = 0; i < (size_t)g->canvas_w * g->canvas_h / 2; i++)
-        out[(size_t)g->canvas_w * g->canvas_h + i] =
-            (uint8_t)o32[(size_t)g->canvas_w * g->canvas_h + i];
+    size_t cw4 = (size_t)g->canvas_w / 4;
+    for (size_t row = 0; row < (size_t)g->canvas_h; row++) {
+        uint8_t *orow = out + row * (size_t)g->canvas_w;
+        const uint32_t *irow = o32 + row * cw4;
+        for (size_t x = 0; x < cw4; x++) {
+            uint32_t pk = irow[x];
+            orow[4 * x + 0] = (uint8_t)(pk & 0xffu);
+            orow[4 * x + 1] = (uint8_t)((pk >> 8) & 0xffu);
+            orow[4 * x + 2] = (uint8_t)((pk >> 16) & 0xffu);
+            orow[4 * x + 3] = (uint8_t)((pk >> 24) & 0xffu);
+        }
+    }
+    size_t uv_uints = (size_t)g->canvas_w / 2 * ((size_t)g->canvas_h / 2);
+    uint8_t *uv = out + (size_t)g->canvas_w * g->canvas_h;
+    for (size_t i = 0; i < uv_uints; i++) {
+        uint32_t pk = o32[(size_t)g->canvas_h * cw4 + i];
+        uv[2 * i + 0] = (uint8_t)(pk & 0xffu);
+        uv[2 * i + 1] = (uint8_t)((pk >> 8) & 0xffu);
+    }
     g_times[4] = now_us() - t4;
+}
+
+/* ======================= encode worker (pipelined) ======================= */
+
+/* main thread: pair → copy → submit GPU. Worker: repack SSBO → encoder.
+ * The stages overlap: while the GPU runs frame i the worker encodes frame
+ * i-3 and main copies frame i+1's pair. */
+
+typedef struct {
+    int slot;           /* GPU slot whose SSBO holds the packed frame */
+    int64_t pts;        /* midpoint pts; < 0 = skip (startup padding) */
+    int enc_idx;        /* encoder input frame index */
+} work_item;
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    work_item items[16];
+    int head, tail, count, stop;
+} work_q_t;
+
+typedef struct {
+    gpu_t *g;
+    work_q_t *q;
+    MppCtx enc_ctx;
+    MppApi *enc_mpi;
+    MppFrame enc_in[4];
+    MppBuffer enc_in_buf[4];
+    MppBuffer enc_out_buf[4];
+    RK_U32 ehs, evs;
+    FILE *fp_out, *fp_pts;
+    pthread_mutex_t ack_mu;
+    pthread_cond_t ack_cv;
+    int ack_done[3];
+    int enc_count;
+    int drained_total;
+    int put_total;
+    int64_t t_put_us;
+} worker_ctx_t;
+
+/* unpack one GPU slot's packed SSBO into strided NV12 planes (the encoder
+ * buffer layout: row stride ehs, UV plane at ehs*evs, rows cw wide) */
+static void repack_ssbo_to(gpu_t *g, int slot, void *enc_ptr,
+                           RK_U32 ehs, RK_U32 evs) {
+    uint32_t *o32 = g->slots[slot].ssbo_map;
+    uint8_t *dst = enc_ptr;
+    size_t cw = g->canvas_w, ch = g->canvas_h;
+    size_t cw4 = cw / 4;
+    for (size_t row = 0; row < ch; row++) {
+        uint8_t *orow = dst + row * ehs;
+        const uint32_t *irow = o32 + row * cw4;
+        for (size_t x = 0; x < cw4; x++) {
+            uint32_t pk = irow[x];
+            orow[4 * x + 0] = (uint8_t)(pk & 0xffu);
+            orow[4 * x + 1] = (uint8_t)((pk >> 8) & 0xffu);
+            orow[4 * x + 2] = (uint8_t)((pk >> 16) & 0xffu);
+            orow[4 * x + 3] = (uint8_t)((pk >> 24) & 0xffu);
+        }
+    }
+    size_t uv_uints = (cw / 2) * (ch / 2);
+    uint8_t *uv = dst + (size_t)ehs * evs;
+    for (size_t row = 0; row < ch / 2; row++) {
+        uint8_t *orow = uv + row * ehs;
+        const uint32_t *irow = o32 + ch * cw4 + row * (cw / 2);
+        for (size_t x = 0; x < cw / 2; x++) {
+            uint32_t pk = irow[x];
+            orow[2 * x + 0] = (uint8_t)(pk & 0xffu);
+            orow[2 * x + 1] = (uint8_t)((pk >> 8) & 0xffu);
+        }
+    }
+}
+
+static void worker_put_frame(worker_ctx_t *w, MppFrame ef, MppBuffer out_buf) {
+    MppPacket enc_pkt = NULL;
+    mpp_packet_init_with_buffer(&enc_pkt, out_buf);
+    mpp_packet_set_length(enc_pkt, 0);
+    MppMeta fmeta = mpp_frame_get_meta(ef);
+    if (fmeta)
+        mpp_meta_set_packet(fmeta, KEY_OUTPUT_PACKET, enc_pkt);
+    mpp_packet_deinit(&enc_pkt);
+    MPP_RET ret = w->enc_mpi->encode_put_frame(w->enc_ctx, ef);
+    if (ret) fprintf(stderr, "encode_put_frame failed %d\n", ret);
+}
+
+static int worker_drain(worker_ctx_t *w, int64_t fallback_pts) {
+    static const RK_U8 sc[4] = { 0, 0, 0, 1 };
+    int got = 0;
+    for (;;) {
+        MppPacket enc_pkt = NULL;
+        MPP_RET ret = w->enc_mpi->encode_get_packet(w->enc_ctx, &enc_pkt);
+        if (ret == MPP_ERR_TIMEOUT || !enc_pkt)
+            break;
+        if (ret)
+            break;
+        got++;
+        void *ptr = mpp_packet_get_pos(enc_pkt);
+        size_t plen = mpp_packet_get_length(enc_pkt);
+        if (ptr && plen) {
+            if (plen < 4 || memcmp(ptr, sc, 4) != 0)
+                fwrite(sc, 1, 4, w->fp_out);
+            fwrite(ptr, 1, plen, w->fp_out);
+            if (w->fp_pts) {
+                RK_S64 pkt_pts = mpp_packet_get_pts(enc_pkt);
+                if (pkt_pts <= 0)
+                    pkt_pts = fallback_pts;
+                fprintf(w->fp_pts, "%lld\n", (long long)pkt_pts);
+            }
+        }
+        mpp_packet_deinit(&enc_pkt);
+        w->enc_count++;
+        w->drained_total++;
+    }
+    return got;
+}
+
+static void *encode_worker(void *arg) {
+    worker_ctx_t *w = arg;
+    for (;;) {
+        work_item it;
+        pthread_mutex_lock(&w->q->mu);
+        while (w->q->count == 0 && !w->q->stop)
+            pthread_cond_wait(&w->q->cv, &w->q->mu);
+        if (w->q->count == 0) {
+            pthread_mutex_unlock(&w->q->mu);
+            break;
+        }
+        it = w->q->items[w->q->head % 16];
+        w->q->head++;
+        w->q->count--;
+        pthread_mutex_unlock(&w->q->mu);
+
+        if (it.slot == -1) {
+            /* EOS flush */
+            MppFrame ef = w->enc_in[0];
+            mpp_frame_set_eos(ef, 1);
+            worker_put_frame(w, ef, w->enc_out_buf[0]);
+            worker_drain(w, 0);
+            break;
+        }
+        if (it.pts < 0)
+            continue;   /* startup padding item — nothing to encode */
+
+        /* enc-frame reuse safety: this item is put frame #seq; enc_in[
+         * seq % ENC_RING] was last used by put frame #seq-4, whose packet is
+         * the (seq-3)-th — block until it has drained (packets arrive in
+         * frame order, so a short catch-up drain suffices) */
+        int seq = w->put_total;
+        int need = seq - 3;
+        while (w->drained_total < need) {
+            if (worker_drain(w, it.pts) <= 0)
+                usleep(2000);
+        }
+
+        MppFrame ef = w->enc_in[it.enc_idx];
+        mpp_frame_set_pts(ef, it.pts);
+        w->put_total++;
+        void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[it.enc_idx]);
+        if (it.slot == -2) {
+            /* CAM2STITCH_NOGPU diagnostic: grey frame */
+            memset(enc_ptr, 128, (size_t)w->ehs * w->evs);
+            memset((char *)enc_ptr + (size_t)w->ehs * w->evs, 128,
+                   (size_t)w->ehs * w->evs / 2);
+        } else {
+            repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
+            pthread_mutex_lock(&w->ack_mu);
+            w->ack_done[it.slot] = 1;
+            pthread_cond_broadcast(&w->ack_cv);
+            pthread_mutex_unlock(&w->ack_mu);
+        }
+        int64_t t0 = now_us();
+        worker_put_frame(w, ef, w->enc_out_buf[it.enc_idx]);
+        worker_drain(w, it.pts);
+        w->t_put_us = now_us() - t0;
+    }
+    return NULL;
 }
 
 /* ======================= camera capture ring ======================= */
@@ -1104,6 +1302,8 @@ int main(int argc, char **argv) {
     const char *spv_path = argc > 11 ? argv[11] : "afl_cam/native/stitch_nv12.spv";
 
     signal(SIGINT, sig_handler);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
     signal(SIGTERM, sig_handler);
 
     RK_S32 ret = 0;
@@ -1186,19 +1386,26 @@ int main(int argc, char **argv) {
     if (ret) { fprintf(stderr, "enc set cfg failed %d\n", ret); return 1; }
     cma_print("after SET_CFG");
 
+    const int ENC_RING = 4;
     MppBufferGroup enc_pkt_grp = NULL;
     ret = mpp_buffer_group_get_internal(&enc_pkt_grp, MPP_BUFFER_TYPE_DRM);
-    ret |= mpp_buffer_group_limit_config(enc_pkt_grp, 4 * 1024 * 1024, 4);
+    /* 8 buffers: 4 for the rotating output packets + headroom so
+     * mpp_packet_init_with_buffer never fails while packets are in flight
+     * (a 4-buffer limit exhausted → the SPS/PPS header get fails and
+     * encoder packets alias stale memory — corrupt CABAC streams) */
+    ret |= mpp_buffer_group_limit_config(enc_pkt_grp, 4 * 1024 * 1024, 8);
     if (ret) { fprintf(stderr, "enc pkt grp failed %d\n", ret); return 1; }
-    MppBuffer enc_out_buf = NULL;
-    ret = mpp_buffer_get(enc_pkt_grp, &enc_out_buf, 4 * 1024 * 1024);
-    if (ret) { fprintf(stderr, "enc out buffer get failed %d\n", ret); return 1; }
+    MppBuffer enc_out_buf[4] = {0};
+    for (int i = 0; i < ENC_RING; i++) {
+        ret = mpp_buffer_get(enc_pkt_grp, &enc_out_buf[i], 4 * 1024 * 1024);
+        if (ret) { fprintf(stderr, "enc out buffer get failed %d\n", ret); return 1; }
+    }
 
     /* encoder INPUT frame group (canvas-sized buffers exceed the packet
-     * group's 4MB limit — own group, single buffer, reused after each drain) */
+     * group's 4MB limit — own group, ENC_RING buffers for async pipeline) */
     MppBufferGroup enc_in_grp = NULL;
     ret = mpp_buffer_group_get_internal(&enc_in_grp, MPP_BUFFER_TYPE_DRM);
-    ret |= mpp_buffer_group_limit_config(enc_in_grp, ehs * evs * 3 / 2, 1);
+    ret |= mpp_buffer_group_limit_config(enc_in_grp, ehs * evs * 3 / 2, 4);
     if (ret) { fprintf(stderr, "enc in grp failed %d\n", ret); return 1; }
 
 
@@ -1240,10 +1447,11 @@ int main(int argc, char **argv) {
             mpp_buffer_put(hdr_buf);
     }
 
-    /* ---- encoder input frame (ONE, reused after each drain — CMA budget) ---- */
-    MppFrame enc_in[1] = {0};
-    MppBuffer enc_in_buf[1] = {0};
-    for (int i = 0; i < 1; i++) {
+    /* ---- encoder input frames (ENC_RING deep — the worker fills frame i
+     * while the encoder still owns i-1..i-3) ---- */
+    MppFrame enc_in[4] = {0};
+    MppBuffer enc_in_buf[4] = {0};
+    for (int i = 0; i < ENC_RING; i++) {
         mpp_frame_init(&enc_in[i]);
         mpp_frame_set_width(enc_in[i], g.canvas_w);
         mpp_frame_set_height(enc_in[i], g.canvas_h);
@@ -1271,8 +1479,33 @@ int main(int argc, char **argv) {
     MppFrame cur1 = NULL;
     int out_count = 0;
     int skipped_start = 0, dup_count = 0, skip_count = 0;
-    int enc_idx = 0;
-    const int ENC_RING = 1;
+
+    /* ---- pipelined worker (repack + encode) ---- */
+    worker_ctx_t w = {0};
+    w.g = &g;
+    w.q = &(work_q_t){ .mu = PTHREAD_MUTEX_INITIALIZER };
+    w.enc_ctx = enc_ctx;
+    w.enc_mpi = enc_mpi;
+    for (int i = 0; i < ENC_RING; i++) {
+        w.enc_in[i] = enc_in[i];
+        w.enc_in_buf[i] = enc_in_buf[i];
+        w.enc_out_buf[i] = enc_out_buf[i];
+    }
+    w.ehs = ehs; w.evs = evs;
+    w.fp_out = fp_out; w.fp_pts = fp_pts;
+    pthread_cond_init(&w.q->cv, NULL);
+    pthread_cond_init(&w.ack_cv, NULL);
+    pthread_mutex_init(&w.ack_mu, NULL);
+    for (int k = 0; k < 3; k++)
+        w.ack_done[k] = 1;   /* nothing pending before the first submits */
+    pthread_t wthread;
+    pthread_create(&wthread, NULL, encode_worker, &w);
+
+    /* per-GPU-slot pending frame info (pts/enc idx assigned at submit time,
+     * pushed to the worker when the slot's result comes back 3 frames later) */
+    int64_t pend_pts[3] = { -1, -1, -1 };
+    int pend_enc[3] = { -1, -1, -1 };
+    int enc_next = 0;
 
     /* wait for cam1's first frame to learn the start trim */
     cur1_idx = ring_take(&cams[1].ring, &cur1, &cur1_pts);
@@ -1322,7 +1555,8 @@ int main(int argc, char **argv) {
             pair_pts = cur1_pts;
         }
 
-        /* stitch */
+        /* ---- pipelined GPU stage (main thread) ---- */
+        int64_t mid = (p0_pts + pair_pts) / 2;
         int64_t t_stage = now_us();
         /* our cached mmap of the decoder buffers (MPP's own mapping is
          * uncached — the 24.9MB staging copy would take ~200ms) */
@@ -1335,118 +1569,83 @@ int main(int argc, char **argv) {
         /* DMA-written memory via a cached alias: invalidate before reads */
         mpp_buffer_sync_ro_begin(cams[0].ring.slots[f0_idx].buf);
         mpp_buffer_sync_ro_begin(cams[1].ring.slots[pair_idx].buf);
-        if (!nogpu)
-            gpu_stitch(&g, y0_ptr, y1_ptr, tight);
-        else
-            memset(tight, 128, g.tight_size ? g.tight_size : 8628480);
-        int64_t t_gpu = now_us() - t_stage; t_stage = now_us();
 
-        /* encode */
-        MppFrame ef = enc_in[enc_idx];
-        MppBuffer efb = enc_in_buf[enc_idx];
-        enc_idx = (enc_idx + 1) % ENC_RING;
-        int64_t mid = (p0_pts + pair_pts) / 2;
-        mpp_frame_set_pts(ef, mid);
-        void *enc_ptr = mpp_buffer_get_ptr(efb);
-        memcpy(enc_ptr, tight, (size_t)g.canvas_w * g.canvas_h);
-        memcpy((char *)enc_ptr + (size_t)ehs * evs,
-               (char *)tight + (size_t)g.canvas_w * g.canvas_h,
-               (size_t)g.canvas_w * g.canvas_h / 2);
-        {
-            MppPacket enc_pkt = NULL;
-            mpp_packet_init_with_buffer(&enc_pkt, enc_out_buf);
-            mpp_packet_set_length(enc_pkt, 0);
-            MppMeta fmeta = mpp_frame_get_meta(ef);
-            if (fmeta)
-                mpp_meta_set_packet(fmeta, KEY_OUTPUT_PACKET, enc_pkt);
-            mpp_packet_deinit(&enc_pkt);
-        }
-        ret = enc_mpi->encode_put_frame(enc_ctx, ef);
-        if (ret) { fprintf(stderr, "encode_put_frame failed %d\n", ret); }
-        int64_t t_put = now_us() - t_stage; t_stage = now_us();
-
-        /* drain */
-        for (;;) {
-            MppPacket enc_pkt = NULL;
-            ret = enc_mpi->encode_get_packet(enc_ctx, &enc_pkt);
-            if (ret == MPP_ERR_TIMEOUT || !enc_pkt)
-                break;
-            if (ret)
-                break;
-            void *ptr = mpp_packet_get_pos(enc_pkt);
-            size_t plen = mpp_packet_get_length(enc_pkt);
-            if (ptr && plen) {
-                static const RK_U8 sc[4] = { 0, 0, 0, 1 };
-                if (plen < 4 || memcmp(ptr, sc, 4) != 0)
-                    fwrite(sc, 1, 4, fp_out);
-                fwrite(ptr, 1, plen, fp_out);
-                if (fp_pts) {
-                    RK_S64 pkt_pts = mpp_packet_get_pts(enc_pkt);
-                    if (pkt_pts <= 0)
-                        pkt_pts = mid;
-                    fprintf(fp_pts, "%lld\n", (long long)pkt_pts);
-                }
+        if (nogpu) {
+            /* diagnostic: straight to the worker as a grey frame */
+            pthread_mutex_lock(&w.q->mu);
+            w.q->items[w.q->tail % 16] = (work_item){ -2, mid, enc_next };
+            w.q->tail++; w.q->count++;
+            pthread_cond_signal(&w.q->cv);
+            pthread_mutex_unlock(&w.q->mu);
+            enc_next = (enc_next + 1) % ENC_RING;
+        } else {
+            gpu_slot_t *s = &g.slots[g.k];
+            int k = g.k;
+            /* GPU job for frame i-3 is done → its packed SSBO is readable */
+            CHECK(vkWaitForFences(g.dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
+            CHECK(vkResetFences(g.dev, 1, &s->fence));
+            {
+                VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                           .memory = s->ssbo_mem, .offset = 0, .size = g.ssbo_size };
+                vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
             }
-            mpp_packet_deinit(&enc_pkt);
+            /* hand the previous result to the worker */
+            pthread_mutex_lock(&w.q->mu);
+            w.q->items[w.q->tail % 16] = (work_item){ k, pend_pts[k], pend_enc[k] };
+            w.q->tail++; w.q->count++;
+            pthread_cond_signal(&w.q->cv);
+            pthread_mutex_unlock(&w.q->mu);
+            /* the worker must finish repacking slot k's SSBO before the GPU
+             * overwrites it with this frame's job (usually already done) */
+            pthread_mutex_lock(&w.ack_mu);
+            while (!w.ack_done[k])
+                pthread_cond_wait(&w.ack_cv, &w.ack_mu);
+            w.ack_done[k] = 0;
+            pthread_mutex_unlock(&w.ack_mu);
+            /* copy this frame's pair into staging + submit */
+            size_t nv12 = (size_t)g.src_w * g.src_h * 3 / 2;
+            memcpy((char *)s->staging_map + s->stage_off[0], y0_ptr, nv12);
+            memcpy((char *)s->staging_map + s->stage_off[2], y1_ptr, nv12);
+            {
+                VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                           .memory = s->staging_mem, .offset = 0, .size = g.stage_size };
+                vkFlushMappedMemoryRanges(g.dev, 1, &mr);
+            }
+            VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                .commandBufferCount = 1, .pCommandBuffers = &s->cb };
+            CHECK(vkQueueSubmit(g.queue, 1, &si, s->fence));
+            pend_pts[k] = mid;
+            pend_enc[k] = enc_next;
+            enc_next = (enc_next + 1) % ENC_RING;
+            g.k = (g.k + 1) % RING_SLOTS;
         }
         ring_release(&cams[0].ring, f0_idx);
         out_count++;
         if (out_count % 10 == 0)
-            fprintf(stderr, "stitched %d frames (gpu %.1fms = wait0 %.1f + cpy %.1f + sub %.1f + wait1 %.1f + pack %.1f; put %.1fms)\n",
-                    out_count, t_gpu / 1000.0,
-                    g_times[0] / 1000.0, g_times[1] / 1000.0, g_times[2] / 1000.0,
-                    g_times[3] / 1000.0, g_times[4] / 1000.0, t_put / 1000.0);
+            fprintf(stderr, "submitted %d frames (main %.1fms; worker put %.1fms, encoded %d)\n",
+                    out_count, (now_us() - t_stage) / 1000.0,
+                    w.t_put_us / 1000.0, w.enc_count);
     }
 
-    /* ---- stop + EOS drain ---- */
+    /* ---- stop + EOS (via the worker, after all queued frames) ---- */
     g_running = 0;
     for (int i = 0; i < 2; i++) {
         pthread_cond_signal(&cams[i].ring.cv_free);
         pthread_cond_signal(&cams[i].ring.cv_ready);
     }
-    {
-        MppFrame ef = enc_in[enc_idx];
-        enc_idx = (enc_idx + 1) % ENC_RING;
-        mpp_frame_set_eos(ef, 1);
-        {
-            MppPacket enc_pkt = NULL;
-            mpp_packet_init_with_buffer(&enc_pkt, enc_out_buf);
-            mpp_packet_set_length(enc_pkt, 0);
-            MppMeta fmeta = mpp_frame_get_meta(ef);
-            if (fmeta)
-                mpp_meta_set_packet(fmeta, KEY_OUTPUT_PACKET, enc_pkt);
-            mpp_packet_deinit(&enc_pkt);
-        }
-        enc_mpi->encode_put_frame(enc_ctx, ef);
-        for (;;) {
-            MppPacket enc_pkt = NULL;
-            ret = enc_mpi->encode_get_packet(enc_ctx, &enc_pkt);
-            if (ret == MPP_ERR_TIMEOUT || !enc_pkt)
-                break;
-            if (ret)
-                break;
-            void *ptr = mpp_packet_get_pos(enc_pkt);
-            size_t plen = mpp_packet_get_length(enc_pkt);
-            if (ptr && plen) {
-                static const RK_U8 sc[4] = { 0, 0, 0, 1 };
-                if (plen < 4 || memcmp(ptr, sc, 4) != 0)
-                    fwrite(sc, 1, 4, fp_out);
-                fwrite(ptr, 1, plen, fp_out);
-                if (fp_pts) {
-                    RK_S64 pkt_pts = mpp_packet_get_pts(enc_pkt);
-                    if (pkt_pts > 0)
-                        fprintf(fp_pts, "%lld\n", (long long)pkt_pts);
-                }
-            }
-            mpp_packet_deinit(&enc_pkt);
-        }
-    }
+    pthread_mutex_lock(&w.q->mu);
+    w.q->items[w.q->tail % 16] = (work_item){ -1, 0, 0 };
+    w.q->tail++; w.q->count++;
+    w.q->stop = 1;
+    pthread_cond_signal(&w.q->cv);
+    pthread_mutex_unlock(&w.q->mu);
+    pthread_join(wthread, NULL);
     for (int i = 0; i < 2; i++)
         pthread_join(cams[i].thread, NULL);
     if (fp_pts)
         fclose(fp_pts);
     fclose(fp_out);
-    fprintf(stderr, "stitched %d frames (start-trimmed %d, dup %d, skip %d)\n",
-            out_count, skipped_start, dup_count, skip_count);
+    fprintf(stderr, "submitted %d frames, encoded %d (start-trimmed %d, dup %d, skip %d)\n",
+            out_count, w.enc_count, skipped_start, dup_count, skip_count);
     return 0;
 }
