@@ -19,7 +19,6 @@ from .config import (
     PREVIEW_WIDTH, PREVIEW_HEIGHT, CAPTURES_DIR, DB_PATH, ROOT_DIR, PLATFORM,
 )
 from .capture import (camera_device, camera_present, set_auto_exposure,
-                      set_manual_exposure,
                       start_audio_capture, stop_audio_procs)
 from .db import RecordingDB
 from .engine import make_preview, make_recorder
@@ -537,12 +536,9 @@ class MainWindow(Gtk.ApplicationWindow):
             if proc:
                 self._audio_procs.append(proc)
 
-        # Manual exposure AFTER the streams open (the recorder sets it itself
-        # too; re-assert here in case the open reset it). Auto-exposure can
-        # settle at ~50ms and cap the sensor at ~20 fps — the recordings then
-        # run 1.5x the requested time and drift apart.
-        for cam_key in ("cam0", "cam1"):
-            set_manual_exposure(cam_key)
+        # Exposure is owned by the recorder: auto-settle-then-lock (or a
+        # fixed manual value when EXPOSURE_TIME > 0). The UI must NOT touch
+        # it here — a manual set would override the recorder's auto phase.
 
         self._recording = True
         self._controls.set_recording(True)

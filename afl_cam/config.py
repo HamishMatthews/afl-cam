@@ -88,9 +88,12 @@ NATIVE_CODEC = "H264"
 NATIVE_CONTAINER = "mp4"
 NATIVE_BITRATE = 20_000_000  # CBR target for rkvenc
 
-# Manual exposure used by the MPP recorder (the cameras' auto-exposure can
-# settle at ~50 ms and cap the sensor at ~20 fps; 100 = 10 ms exposure)
-EXPOSURE_TIME = 100
+# Exposure for the MPP recorder: 0 = auto-settle-then-lock (the recorder
+# matches the auto exposure's brightness with a locked manual value after
+# ~2s — works day/night/indoor), or a fixed value in 100us units
+# (daytime: 100 = 10ms). The cameras' auto-exposure can settle at ~50ms
+# and cap the sensor at ~20 fps; the lock keeps the rate consistent.
+EXPOSURE_TIME = 0
 
 # Default recording duration (0 = manual stop)
 DEFAULT_DURATION = 0

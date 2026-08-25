@@ -45,6 +45,44 @@ static int64_t now_us(void)
     return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
+static void set_exposure(int fd, int mode, RK_S32 value)
+{
+    struct v4l2_control ctrl;
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id = V4L2_CID_EXPOSURE_AUTO;
+    ctrl.value = mode;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+        fprintf(stderr, "set exposure mode failed: %s\n", strerror(errno));
+    if (mode == V4L2_EXPOSURE_MANUAL) {
+        ctrl.id = V4L2_CID_EXPOSURE_ABSOLUTE;
+        ctrl.value = value;
+        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+            fprintf(stderr, "set exposure time failed: %s\n", strerror(errno));
+    }
+}
+
+/* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
+ * for the auto-settle-then-lock exposure loop. */
+static double frame_luma(MppFrame frame)
+{
+    MppBuffer buf = mpp_frame_get_buffer(frame);
+    if (!buf)
+        return -1.0;
+    RK_U8 *y = (RK_U8 *)mpp_buffer_get_ptr(buf);
+    RK_U32 hstride = mpp_frame_get_hor_stride(frame);
+    RK_U32 vstride = mpp_frame_get_ver_stride(frame);
+    RK_U32 w = mpp_frame_get_width(frame);
+    RK_U32 h = mpp_frame_get_height(frame);
+    RK_U64 sum = 0;
+    RK_U32 n = 0;
+    for (RK_U32 yy = 0; yy < h; yy += 8)
+        for (RK_U32 xx = 0; xx < w; xx += 8) {
+            sum += y[yy * vstride + xx];
+            n++;
+        }
+    return n ? (double)sum / n : -1.0;
+}
+
 int main(int argc, char **argv)
 {
     const char *dev      = (argc > 1) ? argv[1] : "/dev/video0";
@@ -53,7 +91,7 @@ int main(int argc, char **argv)
     RK_U32 width          = (argc > 4) ? atoi(argv[4]) : 3840;
     RK_U32 height         = (argc > 5) ? atoi(argv[5]) : 2160;
     RK_U32 fps            = (argc > 6) ? atoi(argv[6]) : 30;
-    RK_S32 exposure       = (argc > 7) ? atoi(argv[7]) : 100;   /* units of 100us */
+    RK_S32 exposure       = (argc > 7) ? atoi(argv[7]) : 0;     /* 0 = auto-lock, else 100us units */
 
     int fd = -1, ret = 0;
     int stream_on = 0;
@@ -120,22 +158,18 @@ int main(int argc, char **argv)
     parm.parm.capture.timeperframe.denominator = fps;
     ioctl(fd, VIDIOC_S_PARM, &parm); /* best effort */
 
-    /* Manual exposure: auto-exposure can settle at ~50ms, capping the sensor
-     * at ~20 fps and making the two recordings drift apart in time. A fixed
-     * short exposure (daytime use) keeps both cameras at the requested rate.
-     * Set AFTER S_FMT (stream open can reset controls) and BEFORE STREAMON. */
-    {
-        struct v4l2_control ctrl;
-        memset(&ctrl, 0, sizeof(ctrl));
-        ctrl.id = V4L2_CID_EXPOSURE_AUTO;   /* 0x009a0901 */
-        ctrl.value = V4L2_EXPOSURE_MANUAL;  /* 1 */
-        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
-            fprintf(stderr, "set exposure manual failed: %s\n", strerror(errno));
-        ctrl.id = V4L2_CID_EXPOSURE_ABSOLUTE; /* 0x009a0902 */
-        ctrl.value = exposure;
-        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
-            fprintf(stderr, "set exposure time failed: %s\n", strerror(errno));
-        fprintf(stderr, "exposure: manual, %d (%dms)\n", exposure, exposure / 10);
+    /* Exposure: 0 = auto-settle-then-lock (works day/night/indoor — the
+     * camera doesn't report its auto-chosen value, so the lock matches
+     * brightness via a short closed loop), or a fixed manual value in 100us
+     * units (daytime: 100 = 10ms). Auto mode can settle at ~50ms and cap
+     * the sensor at ~20 fps; locking keeps the rate consistent. Set AFTER
+     * S_FMT (stream open can reset controls) and BEFORE STREAMON. */
+    if (exposure > 0) {
+        set_exposure(fd, V4L2_EXPOSURE_MANUAL, exposure);
+        fprintf(stderr, "exposure: fixed manual, %d (%dms)\n", exposure, exposure / 10);
+    } else {
+        set_exposure(fd, V4L2_EXPOSURE_AUTO, 0);
+        fprintf(stderr, "exposure: auto settle, then lock\n");
     }
 
     struct v4l2_requestbuffers req;
@@ -319,6 +353,14 @@ int main(int argc, char **argv)
     fprintf(stderr, "recording %u frames to %s\n", frames, out_path);
     t_start = now_us();
 
+    /* auto-settle-then-lock exposure state (exposure <= 0) */
+    int lock_pending = (exposure <= 0);
+    int lock_phase = 0;          /* 0 = auto settle, 1 = manual refine */
+    double target_luma = 0.0, luma_acc = 0.0;
+    int luma_n = 0;
+    RK_S32 lock_exp = 200;       /* manual starting guess (20ms) */
+    int refine_left = 0, refine_rounds = 0;
+
     /* reusable encoder output packet buffer (as in mpi_enc_test) */
     MppBuffer enc_out_buf = NULL;
     ret = mpp_buffer_get(enc_pkt_grp, &enc_out_buf, 4 * 1024 * 1024);
@@ -399,6 +441,47 @@ int main(int argc, char **argv)
             fprintf(stderr, "decoded frame %d has errinfo\n", count);
             mpp_frame_deinit(&dec_frame);
             goto FRAME_DONE;
+        }
+
+        /* auto-settle-then-lock: match the auto exposure's brightness with a
+         * manual value so the recording stays consistent (and fast) after
+         * the first couple of seconds */
+        if (lock_pending) {
+            double l = frame_luma(dec_frame);
+            if (l >= 0) {
+                if (lock_phase == 0) {
+                    if (count >= 30) { luma_acc += l; luma_n++; }
+                    if (count >= 59) {
+                        target_luma = luma_n ? luma_acc / luma_n : 64.0;
+                        set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
+                        lock_phase = 1;
+                        refine_left = 15;
+                        luma_acc = 0.0; luma_n = 0;
+                        fprintf(stderr, "exposure: auto settled at luma %.0f, locking...\n",
+                                target_luma);
+                    }
+                } else {
+                    luma_acc += l; luma_n++;
+                    if (--refine_left == 0) {
+                        double meas = luma_n ? luma_acc / luma_n : target_luma;
+                        double ratio = meas > 1.0 ? target_luma / meas : 1.0;
+                        if (ratio < 0.5) ratio = 0.5;
+                        if (ratio > 2.0) ratio = 2.0;
+                        lock_exp = (RK_S32)(lock_exp * ratio + 0.5);
+                        if (lock_exp < 3) lock_exp = 3;
+                        if (lock_exp > 2047) lock_exp = 2047;
+                        set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
+                        luma_acc = 0.0; luma_n = 0;
+                        if (++refine_rounds >= 3) {
+                            lock_pending = 0;
+                            fprintf(stderr, "exposure: locked at %d (%dms)\n",
+                                    lock_exp, lock_exp / 10);
+                        } else {
+                            refine_left = 15;
+                        }
+                    }
+                }
+            }
         }
 
         /* forward directly to the encoder: NV12 in, no conversion */
