@@ -360,7 +360,10 @@ int main(int argc, char **argv)
     int lock_phase = 0;          /* 0 = auto settle, 1 = manual refine */
     double target_luma = 0.0, luma_acc = 0.0;
     int luma_n = 0;
-    RK_S32 lock_exp = 200;       /* manual starting guess (20ms) */
+    int64_t prev_pts = 0;
+    int64_t dt_sum = 0;
+    int dt_n = 0;
+    RK_S32 lock_exp = 166;       /* camera default; replaced by dt estimate */
     int refine_left = 0, refine_rounds = 0;
 
     /* reusable encoder output packet buffer (as in mpi_enc_test) */
@@ -446,38 +449,50 @@ int main(int argc, char **argv)
         }
 
         /* auto-settle-then-lock: match the auto exposure's brightness with a
-         * manual value so the recording stays consistent (and fast) after
-         * the first couple of seconds */
+         * manual value so the recording stays consistent after the first
+         * seconds. The initial manual guess comes from the auto phase's
+         * mean frame interval (a 50ms exposure delivers exactly 20fps, so
+         * dt IS the exposure), then luma refinement corrects it. */
         if (lock_pending) {
+            if (prev_pts > 0 && pts_us > prev_pts) {
+                dt_sum += pts_us - prev_pts;
+                dt_n++;
+            }
+            prev_pts = pts_us;
             double l = frame_luma(dec_frame);
             if (l >= 0) {
                 if (lock_phase == 0) {
                     if (count >= 60) { luma_acc += l; luma_n++; }
                     if (count >= 119) {
                         target_luma = luma_n ? luma_acc / luma_n : 64.0;
+                        if (dt_n > 0) {
+                            lock_exp = (RK_S32)((dt_sum / dt_n) / 100);
+                            if (lock_exp < 30) lock_exp = 30;
+                            if (lock_exp > 600) lock_exp = 600;
+                        }
                         set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
                         lock_phase = 1;
                         refine_left = 30;
                         luma_acc = 0.0; luma_n = 0;
-                        fprintf(stderr, "exposure: auto settled at luma %.0f, locking...\n",
-                                target_luma);
+                        fprintf(stderr, "exposure: auto settled at luma %.0f "
+                                "(dt %.1fms) -> manual %d (%dms), refining...\n",
+                                target_luma, dt_n ? (dt_sum / dt_n) / 1000.0 : 0.0,
+                                lock_exp, lock_exp / 10);
                     }
                 } else {
                     luma_acc += l; luma_n++;
                     if (--refine_left == 0) {
                         double meas = luma_n ? luma_acc / luma_n : target_luma;
                         double ratio = meas > 1.0 ? target_luma / meas : 1.0;
-                        /* gentle steps + a hard ceiling: long exposures cap
-                         * the sensor fps (50ms -> 20fps, 160ms -> 6fps) —
-                         * never chase brightness at the cost of frame rate */
-                        if (ratio < 0.75) ratio = 0.75;
-                        if (ratio > 1.33) ratio = 1.33;
+                        if (ratio < 0.8) ratio = 0.8;
+                        if (ratio > 1.25) ratio = 1.25;
                         lock_exp = (RK_S32)(lock_exp * ratio + 0.5);
                         if (lock_exp < 30) lock_exp = 30;    /* 3ms */
-                        if (lock_exp > 330) lock_exp = 330;  /* 33ms = 30fps */
+                        if (lock_exp > 600) lock_exp = 600;  /* 60ms */
                         set_exposure(fd, V4L2_EXPOSURE_MANUAL, lock_exp);
                         luma_acc = 0.0; luma_n = 0;
-                        if (++refine_rounds >= 5) {
+                        int converged = (ratio > 0.9 && ratio < 1.11);
+                        if (++refine_rounds >= 5 || converged) {
                             lock_pending = 0;
                             fprintf(stderr, "exposure: locked at %d (%dms)\n",
                                     lock_exp, lock_exp / 10);
