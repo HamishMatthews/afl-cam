@@ -927,10 +927,15 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
         offset = _find_translation(f0, f1, Stitcher()._enhance)
         if offset is not None:
             overlap_pct = (f0.shape[1] - offset[0]) / f0.shape[1] * 100
+            if overlap_pct < 20:
+                raise StitchError(
+                    f"Calibration failed - camera overlap is only {overlap_pct:.0f}%. "
+                    "Aim the cameras so they overlap by ~25-30% "
+                    "(run 'afl-cam check-aim' to see the current value).")
             raise StitchError(
-                f"Calibration failed - camera overlap is only {overlap_pct:.0f}%. "
-                "Aim the cameras so they overlap by ~25-30% "
-                "(run 'afl-cam check-aim' to see the current value).")
+                f"Calibration failed - overlap is fine ({overlap_pct:.0f}%) but the "
+                "scene has too few matchable features (dark / low texture?). "
+                "For night recordings raise EXPOSURE_TIME in afl_cam/config.py.")
         raise StitchError(
             "Calibration failed - the scene has too few matchable features. "
             "Aim the cameras at a textured scene with good lighting and "
