@@ -60,8 +60,10 @@ def mux_with_pts_rate(raw: Path, pts_path: Path, out: Path,
     pts = load_pts(pts_path)
     fps = measured_fps(pts, fallback_fps) if pts is not None else fallback_fps
     result = subprocess.run(
+        # NOTE: -r, not -framerate — ffmpeg 8's raw h264 demuxer ignores
+        # -framerate and stamps 30 fps regardless
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "h264", "-framerate", f"{fps:.4f}", "-i", str(raw),
+         "-f", "h264", "-r", f"{fps:.4f}", "-i", str(raw),
          "-c", "copy", str(out)],
         capture_output=True, text=True, timeout=60)
     if result.returncode == 0 and out.exists() and out.stat().st_size > 0:

@@ -147,6 +147,8 @@ typedef struct {
     VkDeviceSize stage_off[4];
     VkBuffer ssbo;                  /* padded NV12 (one byte per uint) */
     VkDeviceMemory ssbo_mem;
+    void *ssbo_map;                 /* persistent mapping (map/unmap per frame
+                                     * is expensive on kbase) */
     VkCommandBuffer cb;
     VkFence fence;
     VkDescriptorSet dset;
@@ -394,8 +396,11 @@ static void gpu_init(gpu_t *g, const char *spv_path,
         VkBufferCreateInfo obci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                     .size = g->ssbo_size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
         CHECK(vkCreateBuffer(g->dev, &obci, NULL, &s->ssbo));
+        /* HOST_CACHED memory type: the padded SSBO readback is ~34MB/frame
+         * and kbase's non-cached host reads run at only ~270MB/s */
         s->ssbo_mem = alloc_bind_buffer(g->dev, &g->mprops, s->ssbo,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        CHECK(vkMapMemory(g->dev, s->ssbo_mem, 0, g->ssbo_size, 0, &s->ssbo_map));
 
         VkCommandBufferAllocateInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                             .commandPool = pool,
@@ -513,31 +518,43 @@ static void gpu_init(gpu_t *g, const char *spv_path,
 
 /* Stitch one frame pair (tight NV12 in) → tight NV12 out (repacked).
  * Blocking: waits the slot's fence before reuse and after submission. */
+static int64_t g_times[5];   /* wait-before, memcpy, submit, wait-after, repack */
 static void gpu_stitch(gpu_t *g, const void *nv0, const void *nv1, void *tight_out) {
+    int64_t t0 = now_us();
     gpu_slot_t *s = &g->slots[g->k];
     CHECK(vkWaitForFences(g->dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
+    int64_t t1 = now_us();
     CHECK(vkResetFences(g->dev, 1, &s->fence));
     size_t nv12 = (size_t)g->src_w * g->src_h * 3 / 2;
     memcpy((char *)s->staging_map + s->stage_off[0], nv0, nv12);
     memcpy((char *)s->staging_map + s->stage_off[2], nv1, nv12);
+    int64_t t2 = now_us();
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &s->cb };
     CHECK(vkQueueSubmit(g->queue, 1, &si, s->fence));
+    int64_t t3 = now_us();
     g->k = (g->k + 1) % RING_SLOTS;
     CHECK(vkWaitForFences(g->dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
+    int64_t t4 = now_us();
+    /* cached memory: invalidate before the CPU reads the GPU's writes */
+    {
+        VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                   .memory = s->ssbo_mem, .offset = 0, .size = g->ssbo_size };
+        vkInvalidateMappedMemoryRanges(g->dev, 1, &mr);
+    }
+    g_times[0] = t1 - t0; g_times[1] = t2 - t1; g_times[2] = t3 - t2;
+    g_times[3] = t4 - t3;
 
     /* repack: SSBO holds one byte per uint32 in NV12 order — Y plane first,
      * then interleaved UV (cw*ch/2 uints) */
-    void *omap;
-    CHECK(vkMapMemory(g->dev, s->ssbo_mem, 0, g->ssbo_size, 0, &omap));
-    uint32_t *o32 = omap;
+    uint32_t *o32 = s->ssbo_map;
     uint8_t *out = tight_out;
     for (size_t i = 0; i < (size_t)g->canvas_w * g->canvas_h; i++)
         out[i] = (uint8_t)o32[i];
     for (size_t i = 0; i < (size_t)g->canvas_w * g->canvas_h / 2; i++)
         out[(size_t)g->canvas_w * g->canvas_h + i] =
             (uint8_t)o32[(size_t)g->canvas_w * g->canvas_h + i];
-    vkUnmapMemory(g->dev, s->ssbo_mem);
+    g_times[4] = now_us() - t4;
 }
 
 /* ======================= camera capture ring ======================= */
@@ -545,6 +562,9 @@ static void gpu_stitch(gpu_t *g, const void *nv0, const void *nv1, void *tight_o
 typedef struct {
     MppFrame frame;             /* NULL after the consumer deinit'd it */
     MppBuffer buf;
+    void *map_ptr;              /* our own cached mmap of the buffer's fd —
+                                 * MPP's mapping is uncached (~120MB/s), this
+                                 * one reads at >1GB/s */
     int64_t pts_us;
     int state;                  /* 0 FREE, 1 IN_DECODE/HELD, 2 READY */
 } ring_slot_t;
@@ -839,6 +859,13 @@ static void *capture_thread(void *arg) {
                 RK_S32 r = mpp_buffer_get(c->frm_grp, &slot->buf, hs * vs * 2);
                 if (r) { fprintf(stderr, "%s: frm buffer get failed %d\n", c->dev, r);
                          cma_print("frm get fail"); break; }
+                int sfd = mpp_buffer_get_fd(slot->buf);
+                if (sfd >= 0) {
+                    slot->map_ptr = mmap(NULL, hs * vs * 2, PROT_READ | PROT_WRITE,
+                                         MAP_SHARED, sfd, 0);
+                    if (slot->map_ptr == MAP_FAILED)
+                        slot->map_ptr = NULL;
+                }
             }
             mpp_frame_init(&slot->frame);
             mpp_frame_set_width(slot->frame, c->width);
@@ -1194,8 +1221,17 @@ int main(int argc, char **argv) {
 
         /* stitch */
         int64_t t_stage = now_us();
-        void *y0_ptr = mpp_buffer_get_ptr(cams[0].ring.slots[f0_idx].buf);
-        void *y1_ptr = mpp_buffer_get_ptr(cams[1].ring.slots[pair_idx].buf);
+        /* our cached mmap of the decoder buffers (MPP's own mapping is
+         * uncached — the 24.9MB staging copy would take ~200ms) */
+        void *y0_ptr = cams[0].ring.slots[f0_idx].map_ptr ?
+                       cams[0].ring.slots[f0_idx].map_ptr :
+                       mpp_buffer_get_ptr(cams[0].ring.slots[f0_idx].buf);
+        void *y1_ptr = cams[1].ring.slots[pair_idx].map_ptr ?
+                       cams[1].ring.slots[pair_idx].map_ptr :
+                       mpp_buffer_get_ptr(cams[1].ring.slots[pair_idx].buf);
+        /* DMA-written memory via a cached alias: invalidate before reads */
+        mpp_buffer_sync_ro_begin(cams[0].ring.slots[f0_idx].buf);
+        mpp_buffer_sync_ro_begin(cams[1].ring.slots[pair_idx].buf);
         if (!nogpu)
             gpu_stitch(&g, y0_ptr, y1_ptr, tight);
         else
@@ -1253,9 +1289,10 @@ int main(int argc, char **argv) {
         ring_release(&cams[0].ring, f0_idx);
         out_count++;
         if (out_count % 10 == 0)
-            fprintf(stderr, "stitched %d frames (gpu %.1fms put %.1fms drain %.1fms)\n",
-                    out_count, t_gpu / 1000.0, t_put / 1000.0,
-                    (now_us() - t_stage) / 1000.0);
+            fprintf(stderr, "stitched %d frames (gpu %.1fms = wait0 %.1f + cpy %.1f + sub %.1f + wait1 %.1f + pack %.1f; put %.1fms)\n",
+                    out_count, t_gpu / 1000.0,
+                    g_times[0] / 1000.0, g_times[1] / 1000.0, g_times[2] / 1000.0,
+                    g_times[3] / 1000.0, g_times[4] / 1000.0, t_put / 1000.0);
     }
 
     /* ---- stop + EOS drain ---- */
