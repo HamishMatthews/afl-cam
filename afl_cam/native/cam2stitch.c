@@ -228,7 +228,8 @@ static void create_plane(VkDevice dev, VkPhysicalDeviceMemoryProperties *mprops,
 }
 
 static void gpu_init(gpu_t *g, const char *spv_path,
-                     void *params_data, void *w0d, void *w1d) {
+                     void *params_data, void *w0d, void *w1d,
+                     void *m0d, void *m1d) {
     size_t len;
     float *pf = params_data;
     g->canvas_w = (uint32_t)pf[0]; g->canvas_h = (uint32_t)pf[1];
@@ -291,9 +292,10 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     VkSampler linear;
     CHECK(vkCreateSampler(g->dev, &sci, NULL, &linear));
 
-    /* ---- descriptor layout: 4 frame planes + 2 weights + ssbo + params ---- */
+    /* ---- descriptor layout: 4 frame planes + 2 weights + 2 warp maps
+     * + ssbo + params ---- */
     VkDescriptorPoolSize dpss[2] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 * RING_SLOTS + 2 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 * RING_SLOTS + 2 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * RING_SLOTS + 1 },
     };
     VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -301,16 +303,16 @@ static void gpu_init(gpu_t *g, const char *spv_path,
                                         .poolSizeCount = 2, .pPoolSizes = dpss };
     VkDescriptorPool dpool;
     CHECK(vkCreateDescriptorPool(g->dev, &dpci, NULL, &dpool));
-    VkDescriptorSetLayoutBinding binds[8] = {0};
-    for (int i = 0; i < 6; i++)
+    VkDescriptorSetLayoutBinding binds[10] = {0};
+    for (int i = 0; i < 8; i++)
         binds[i] = (VkDescriptorSetLayoutBinding){
             i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
-    binds[6] = (VkDescriptorSetLayoutBinding){
-        6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
-    binds[7] = (VkDescriptorSetLayoutBinding){
-        7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+    binds[8] = (VkDescriptorSetLayoutBinding){
+        8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+    binds[9] = (VkDescriptorSetLayoutBinding){
+        9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
     VkDescriptorSetLayoutCreateInfo dsci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                             .bindingCount = 8, .pBindings = binds };
+                                             .bindingCount = 10, .pBindings = binds };
     VkDescriptorSetLayout dsl;
     CHECK(vkCreateDescriptorSetLayout(g->dev, &dsci, NULL, &dsl));
 
@@ -331,7 +333,7 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     VkPipeline pipeline;
     CHECK(vkCreateComputePipelines(g->dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipeline));
 
-    /* ---- static weights (images + staging) + params SSBO ---- */
+    /* ---- static weights + warp maps (images + staging) + params SSBO ---- */
     plane_t wplanes[2];
     create_plane(g->dev, &g->mprops, &wplanes[0], g->canvas_w, g->canvas_h, VK_FORMAT_R8G8B8A8_UNORM);
     create_plane(g->dev, &g->mprops, &wplanes[1], g->canvas_w, g->canvas_h, VK_FORMAT_R8G8B8A8_UNORM);
@@ -352,6 +354,33 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     CHECK(vkMapMemory(g->dev, wst1m, 0, wst_bci.size, 0, &wmap));
     memcpy(wmap, w1d, wst_bci.size);
     vkUnmapMemory(g->dev, wst1m);
+
+    /* warp maps: ROI-sized R32G32F (s,t) textures, dims from params mapwh */
+    plane_t mplanes[2];
+    uint32_t map_w[2], map_h[2];
+    for (int c = 0; c < 2; c++) {
+        int base = 8 + c * 28;
+        map_w[c] = (uint32_t)pf[base + 13];
+        map_h[c] = (uint32_t)pf[base + 14];
+        if (!map_w[c] || !map_h[c]) { fprintf(stderr, "bad map dims cam%d\n", c); exit(1); }
+        create_plane(g->dev, &g->mprops, &mplanes[c], map_w[c], map_h[c],
+                     VK_FORMAT_R32G32_SFLOAT);
+    }
+    VkBuffer mst[2];
+    VkDeviceMemory mstm[2];
+    const void *md[2] = { m0d, m1d };
+    for (int c = 0; c < 2; c++) {
+        VkBufferCreateInfo mbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                    .size = (VkDeviceSize)map_w[c] * map_h[c] * 8,
+                                    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
+        CHECK(vkCreateBuffer(g->dev, &mbci, NULL, &mst[c]));
+        mstm[c] = alloc_bind_buffer(g->dev, &g->mprops, mst[c],
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        void *mmap;
+        CHECK(vkMapMemory(g->dev, mstm[c], 0, mbci.size, 0, &mmap));
+        memcpy(mmap, md[c], mbci.size);
+        vkUnmapMemory(g->dev, mstm[c]);
+    }
 
     VkBufferCreateInfo pbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                 .size = 64 * sizeof(float),
@@ -375,6 +404,56 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     VkBufferImageCopy wc = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                              .imageExtent = { g->canvas_w, g->canvas_h, 1 } };
 
+    /* one-time setup cb: weight + map uploads run ONCE, not per frame.
+     * (Separate cb, recorded and submitted once — the libmali quirk was
+     * re-recording a cb discarding its earlier content.) */
+    {
+        VkCommandBufferAllocateInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                            .commandPool = pool,
+                                            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                            .commandBufferCount = 1 };
+        VkCommandBuffer setup_cb;
+        CHECK(vkAllocateCommandBuffers(g->dev, &cbi, &setup_cb));
+        CHECK(vkBeginCommandBuffer(setup_cb, &bi));
+        VkImageMemoryBarrier wb4[4];
+        VkImage images4[4] = { wplanes[0].img, wplanes[1].img,
+                               mplanes[0].img, mplanes[1].img };
+        for (int i = 0; i < 4; i++)
+            wb4[i] = (VkImageMemoryBarrier){
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .image = images4[i], .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        vkCmdPipelineBarrier(setup_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 4, wb4);
+        vkCmdCopyBufferToImage(setup_cb, wst0, wplanes[0].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &wc);
+        vkCmdCopyBufferToImage(setup_cb, wst1, wplanes[1].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &wc);
+        VkBufferImageCopy mc0 = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                  .imageExtent = { map_w[0], map_h[0], 1 } };
+        VkBufferImageCopy mc1 = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                  .imageExtent = { map_w[1], map_h[1], 1 } };
+        vkCmdCopyBufferToImage(setup_cb, mst[0], mplanes[0].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &mc0);
+        vkCmdCopyBufferToImage(setup_cb, mst[1], mplanes[1].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &mc1);
+        for (int i = 0; i < 4; i++) {
+            wb4[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            wb4[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            wb4[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            wb4[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        vkCmdPipelineBarrier(setup_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, NULL, 0, NULL, 4, wb4);
+        CHECK(vkEndCommandBuffer(setup_cb));
+        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                                  .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+        VkFence setup_fence;
+        CHECK(vkCreateFence(g->dev, &fci, NULL, &setup_fence));
+        CHECK(vkResetFences(g->dev, 1, &setup_fence));
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .commandBufferCount = 1, .pCommandBuffers = &setup_cb };
+        CHECK(vkQueueSubmit(g->queue, 1, &si, setup_fence));
+        CHECK(vkWaitForFences(g->dev, 1, &setup_fence, VK_TRUE, UINT64_MAX));
+    }
+
     for (int k = 0; k < RING_SLOTS; k++) {
         gpu_slot_t *s = &g->slots[k];
         create_plane(g->dev, &g->mprops, &s->planes[0], g->src_w, g->src_h, VK_FORMAT_R8_UNORM);
@@ -385,8 +464,11 @@ static void gpu_init(gpu_t *g, const char *spv_path,
         VkBufferCreateInfo sbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                     .size = g->stage_size, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
         CHECK(vkCreateBuffer(g->dev, &sbci, NULL, &s->staging));
+        /* HOST_CACHED: uncached writes to the staging buffer run at ~1.1GB/s
+         * (23 ms for the 24.8 MB frame pair) — cached writes + a per-frame
+         * flush cut that to a few ms */
         s->staging_mem = alloc_bind_buffer(g->dev, &g->mprops, s->staging,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
         CHECK(vkMapMemory(g->dev, s->staging_mem, 0, g->stage_size, 0, &s->staging_map));
         s->stage_off[0] = 0;
         s->stage_off[1] = (VkDeviceSize)g->src_w * g->src_h;
@@ -417,8 +499,9 @@ static void gpu_init(gpu_t *g, const char *spv_path,
                                              .pSetLayouts = &dsl };
         CHECK(vkAllocateDescriptorSets(g->dev, &dsai, &s->dset));
 
-        VkSampler smps[6] = { linear, linear, linear, linear, nearest, nearest };
-        VkDescriptorImageInfo dii[6];
+        VkSampler smps[8] = { linear, linear, linear, linear, nearest, nearest,
+                              nearest, nearest };
+        VkDescriptorImageInfo dii[8];
         for (int i = 0; i < 4; i++)
             dii[i] = (VkDescriptorImageInfo){ smps[i], s->planes[i].iv,
                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -426,46 +509,32 @@ static void gpu_init(gpu_t *g, const char *spv_path,
                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         dii[5] = (VkDescriptorImageInfo){ smps[5], wplanes[1].iv,
                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        dii[6] = (VkDescriptorImageInfo){ smps[6], mplanes[0].iv,
+                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        dii[7] = (VkDescriptorImageInfo){ smps[7], mplanes[1].iv,
+                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorBufferInfo obi = { s->ssbo, 0, g->ssbo_size };
         VkDescriptorBufferInfo pbi = { pbuf, 0, pbci.size };
-        VkWriteDescriptorSet wds[8] = {0};
-        for (int i = 0; i < 6; i++)
+        VkWriteDescriptorSet wds[10] = {0};
+        for (int i = 0; i < 8; i++)
             wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                              .dstSet = s->dset, .dstBinding = i, .descriptorCount = 1,
                                              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                              .pImageInfo = &dii[i] };
-        wds[6] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                         .dstSet = s->dset, .dstBinding = 6, .descriptorCount = 1,
+        wds[8] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                         .dstSet = s->dset, .dstBinding = 8, .descriptorCount = 1,
                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                          .pBufferInfo = &obi };
-        wds[7] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                         .dstSet = s->dset, .dstBinding = 7, .descriptorCount = 1,
+        wds[9] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                         .dstSet = s->dset, .dstBinding = 9, .descriptorCount = 1,
                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                          .pBufferInfo = &pbi };
-        vkUpdateDescriptorSets(g->dev, 8, wds, 0, NULL);
+        vkUpdateDescriptorSets(g->dev, 10, wds, 0, NULL);
 
-        /* ---- pre-record the slot cb (never re-recorded; SELF-CONTAINED:
-         * weight uploads + initial transitions + frame upload + dispatch) ---- */
+        /* ---- pre-record the slot cb (never re-recorded): frame plane
+         * transitions + frame upload + dispatch. Weights/maps are uploaded
+         * once by the setup cb. ---- */
         CHECK(vkBeginCommandBuffer(s->cb, &bi));
-        VkImageMemoryBarrier wb[2];
-        for (int i = 0; i < 2; i++)
-            wb[i] = (VkImageMemoryBarrier){
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                .image = wplanes[i].img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-        vkCmdPipelineBarrier(s->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             0, 0, NULL, 0, NULL, 2, wb);
-        vkCmdCopyBufferToImage(s->cb, wst0, wplanes[0].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &wc);
-        vkCmdCopyBufferToImage(s->cb, wst1, wplanes[1].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &wc);
-        for (int i = 0; i < 2; i++) {
-            wb[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            wb[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            wb[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            wb[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        }
-        vkCmdPipelineBarrier(s->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 0, NULL, 0, NULL, 2, wb);
         for (int i = 0; i < 4; i++) {
             VkImageMemoryBarrier fb = {
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -528,6 +597,12 @@ static void gpu_stitch(gpu_t *g, const void *nv0, const void *nv1, void *tight_o
     size_t nv12 = (size_t)g->src_w * g->src_h * 3 / 2;
     memcpy((char *)s->staging_map + s->stage_off[0], nv0, nv12);
     memcpy((char *)s->staging_map + s->stage_off[2], nv1, nv12);
+    /* cached staging: write back before the GPU transfer reads it */
+    {
+        VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                   .memory = s->staging_mem, .offset = 0, .size = g->stage_size };
+        vkFlushMappedMemoryRanges(g->dev, 1, &mr);
+    }
     int64_t t2 = now_us();
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &s->cb };
@@ -952,18 +1027,26 @@ static int run_src_mode(const char *dir, const char *in0, const char *in1,
     if (len != 64 * sizeof(float)) { fprintf(stderr, "params.bin size mismatch\n"); return 1; }
     void *w0d = read_file((snprintf(path, sizeof path, "%s/w0.bin", dir), path), &len);
     void *w1d = read_file((snprintf(path, sizeof path, "%s/w1.bin", dir), path), &len);
+    void *m0d = read_file((snprintf(path, sizeof path, "%s/map0.bin", dir), path), &len);
+    void *m1d = read_file((snprintf(path, sizeof path, "%s/map1.bin", dir), path), &len);
     void *nv0 = read_file(in0, &len);
     void *nv1 = read_file(in1, &len);
 
     gpu_t g = {0};
-    gpu_init(&g, spv_path, params_data, w0d, w1d);
+    gpu_init(&g, spv_path, params_data, w0d, w1d, m0d, m1d);
     void *tight = malloc(g.tight_size);
     int64_t t0 = now_us();
-    for (int i = 0; i < n_iters; i++)
+    double acc[5] = {0};
+    for (int i = 0; i < n_iters; i++) {
         gpu_stitch(&g, nv0, nv1, tight);
+        for (int j = 0; j < 5; j++) acc[j] += g_times[j];
+    }
     int64_t elapsed = now_us() - t0;
     printf("%d frames in %.1f ms (%.2f ms/frame)\n", n_iters, elapsed / 1000.0,
            n_iters ? elapsed / 1000.0 / n_iters : 0.0);
+    printf("stage avg us: wait_before %.1f copy %.1f submit %.1f gpu_wait %.1f pack %.1f\n",
+           acc[0] / n_iters / 1000.0, acc[1] / n_iters / 1000.0, acc[2] / n_iters / 1000.0,
+           acc[3] / n_iters / 1000.0, acc[4] / n_iters / 1000.0);
     FILE *out = fopen(out_path, "wb");
     if (!out) { perror(out_path); return 1; }
     fwrite(tight, 1, g.tight_size, out);
@@ -995,8 +1078,10 @@ int main(int argc, char **argv) {
         if (len != 64 * sizeof(float)) { fprintf(stderr, "params.bin size mismatch\n"); return 1; }
         void *w0d = read_file((snprintf(path, sizeof path, "%s/w0.bin", pdir), path), &len);
         void *w1d = read_file((snprintf(path, sizeof path, "%s/w1.bin", pdir), path), &len);
+        void *m0d = read_file((snprintf(path, sizeof path, "%s/map0.bin", pdir), path), &len);
+        void *m1d = read_file((snprintf(path, sizeof path, "%s/map1.bin", pdir), path), &len);
         gpu_t g = {0};
-        gpu_init(&g, spv, pd, w0d, w1d);
+        gpu_init(&g, spv, pd, w0d, w1d, m0d, m1d);
         printf("OK\n");
         return 0;
     }
@@ -1028,6 +1113,8 @@ int main(int argc, char **argv) {
     if (len != 64 * sizeof(float)) { fprintf(stderr, "params.bin size mismatch\n"); return 1; }
     void *w0d = read_file((snprintf(path, sizeof path, "%s/w0.bin", params_dir), path), &len);
     void *w1d = read_file((snprintf(path, sizeof path, "%s/w1.bin", params_dir), path), &len);
+    void *m0d = read_file((snprintf(path, sizeof path, "%s/map0.bin", params_dir), path), &len);
+    void *m1d = read_file((snprintf(path, sizeof path, "%s/map1.bin", params_dir), path), &len);
 
     /* ---- GPU init BEFORE the cameras: fail fast if Vulkan is broken ---- */
     gpu_t g = {0};
@@ -1040,7 +1127,7 @@ int main(int argc, char **argv) {
         g.tight_size = (size_t)g.canvas_w * g.canvas_h * 3 / 2;
         fprintf(stderr, "CAM2STITCH_NOGPU: skipping GPU init (diagnostic)\n");
     } else {
-        gpu_init(&g, spv_path, params_data, w0d, w1d);
+        gpu_init(&g, spv_path, params_data, w0d, w1d, m0d, m1d);
     }
     void *tight = malloc(g.tight_size);
     if (!tight) { fprintf(stderr, "tight alloc failed\n"); return 1; }

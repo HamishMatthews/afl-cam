@@ -122,8 +122,9 @@ def main() -> None:
     roi1 = (off1[1], off1[1] + m1[0].shape[0], off1[0], off1[0] + m1[0].shape[1])
     # Canvas dims derive from the rounded rois (not ceil of the native span)
     # so every camera map fits exactly at any scale. Even dims required for
-    # NV12 2x2 chroma blocks in the GPU path.
-    out_w = (max(roi0[3], roi1[3]) + 1) // 2 * 2
+    # NV12 2x2 chroma blocks in the GPU path; width must also be % 4 == 0
+    # for the SSBO byte-packing path in cam2stitch.
+    out_w = (max(roi0[3], roi1[3]) + 3) // 4 * 4
     out_h = (max(roi0[1], roi1[1]) + 1) // 2 * 2
 
     mask0 = (m0[0] >= 0).astype(np.uint8) * 255
@@ -166,6 +167,12 @@ def main() -> None:
 
     np.repeat(w0[:, :, None].astype(np.uint8), 4, axis=2).tofile(out_dir / "w0.bin")
     np.repeat(w1[:, :, None].astype(np.uint8), 4, axis=2).tofile(out_dir / "w1.bin")
+    # Warp maps for the GPU map-texture path (stitch_nv12.comp fetches these
+    # with texelFetch instead of running the analytic warp per pixel): the
+    # exact (s,t) source coords cv2.remap consumes, at the ROI shape the
+    # shader indexes via params off/mapwh. Invalid = -1 (matches the guard).
+    np.stack([m0[0], m0[1]], axis=-1).astype(np.float32).tofile(out_dir / "map0.bin")
+    np.stack([m1[0], m1[1]], axis=-1).astype(np.float32).tofile(out_dir / "map1.bin")
     cv2.cvtColor(f0, cv2.COLOR_BGR2RGB).tofile(out_dir / "cam0.rgb")
     cv2.cvtColor(f1, cv2.COLOR_BGR2RGB).tofile(out_dir / "cam1.rgb")
 
