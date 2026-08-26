@@ -106,8 +106,12 @@ LIVE_STITCH = os.environ.get("AFL_CAM_LIVE_STITCH", "1") == "1"
 STITCH_RECORDER_SRC = ROOT_DIR / "afl_cam" / "native" / "cam2stitch.c"
 STITCH_RECORDER_BIN = ROOT_DIR / "afl_cam" / "native" / "cam2stitch"
 STITCH_SHADER = ROOT_DIR / "afl_cam" / "native" / "stitch_nv12.spv"
-STITCH_PARAMS_DIR = ROOT_DIR / "calibration" / "stitch_live"
-STITCH_CANVAS_WIDTH = 3840
+# Native full-resolution canvas (5304x2084 for the current rig aim — the
+# combined per-camera resolution the user asked for; verified live at 30fps
+# pipeline capacity, d9c220b). Regenerate via:
+#   scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> calibration/stitch_live_full
+STITCH_PARAMS_DIR = ROOT_DIR / "calibration" / "stitch_live_full"
+STITCH_CANVAS_WIDTH = 5304
 
 # libmali Vulkan env for the cam2stitch subprocess (spawned processes do not
 # inherit the interactive shell's env; the ICD lives in a non-standard dir)

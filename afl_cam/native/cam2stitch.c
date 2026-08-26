@@ -727,7 +727,11 @@ static void repack_ssbo_to(gpu_t *g, int slot, void *enc_ptr,
 
 static void worker_put_frame(worker_ctx_t *w, MppFrame ef, MppBuffer out_buf) {
     MppPacket enc_pkt = NULL;
-    mpp_packet_init_with_buffer(&enc_pkt, out_buf);
+    MPP_RET pr = mpp_packet_init_with_buffer(&enc_pkt, out_buf);
+    if (pr || !enc_pkt) {
+        fprintf(stderr, "mpp_packet_init_with_buffer failed %d — dropping frame\n", pr);
+        return;
+    }
     mpp_packet_set_length(enc_pkt, 0);
     MppMeta fmeta = mpp_frame_get_meta(ef);
     if (fmeta)
@@ -751,14 +755,31 @@ static int worker_drain(worker_ctx_t *w, int64_t fallback_pts) {
         void *ptr = mpp_packet_get_pos(enc_pkt);
         size_t plen = mpp_packet_get_length(enc_pkt);
         if (ptr && plen) {
-            if (plen < 4 || memcmp(ptr, sc, 4) != 0)
-                fwrite(sc, 1, 4, w->fp_out);
-            fwrite(ptr, 1, plen, w->fp_out);
-            if (w->fp_pts) {
-                RK_S64 pkt_pts = mpp_packet_get_pts(enc_pkt);
-                if (pkt_pts <= 0)
-                    pkt_pts = fallback_pts;
-                fprintf(w->fp_pts, "%lld\n", (long long)pkt_pts);
+            /* defensive: a phantom packet (never filled by rkvenc) holds
+             * allocator fill bytes (01 02 03 04 ...) — its NAL type is 2/3/4
+             * (data partitions, which rkvenc never emits: the clean
+             * reference stream only has types 1/5/6/7/8/9). Skip it instead
+             * of poisoning the stream. NOTE: rkvenc sometimes includes the
+             * 4-byte start code in the packet and sometimes not — locate
+             * the NAL header accordingly. */
+            const RK_U8 *pb = ptr;
+            int has_sc = plen >= 4 && memcmp(pb, sc, 4) == 0;
+            RK_U8 nal = (has_sc ? pb[4] : pb[0]) & 0x1f;
+            int ok_nal = (nal == 1 || nal == 5 || nal == 6 ||
+                          nal == 7 || nal == 8 || nal == 9);
+            if (ok_nal) {
+                if (plen < 4 || memcmp(ptr, sc, 4) != 0)
+                    fwrite(sc, 1, 4, w->fp_out);
+                fwrite(ptr, 1, plen, w->fp_out);
+                if (w->fp_pts) {
+                    RK_S64 pkt_pts = mpp_packet_get_pts(enc_pkt);
+                    if (pkt_pts <= 0)
+                        pkt_pts = fallback_pts;
+                    fprintf(w->fp_pts, "%lld\n", (long long)pkt_pts);
+                }
+            } else {
+                fprintf(stderr, "worker: dropping bad packet (nal %u, %zu bytes)\n",
+                        nal, plen);
             }
         }
         mpp_packet_deinit(&enc_pkt);
@@ -784,32 +805,23 @@ static void *encode_worker(void *arg) {
         w->q->count--;
         pthread_mutex_unlock(&w->q->mu);
 
-        if (it.slot == -1) {
-            /* EOS flush */
-            MppFrame ef = w->enc_in[0];
-            mpp_frame_set_eos(ef, 1);
-            worker_put_frame(w, ef, w->enc_out_buf[0]);
-            worker_drain(w, 0);
-            break;
-        }
-        if (it.pts < 0)
-            continue;   /* startup padding item — nothing to encode */
+        if (it.slot == -1)
+            break;      /* EOS handled on the main thread */
 
-        /* enc-frame reuse safety: this item is put frame #seq; enc_in[
-         * seq % ENC_RING] was last used by put frame #seq-4, whose packet is
-         * the (seq-3)-th — block until it has drained (packets arrive in
-         * frame order, so a short catch-up drain suffices) */
-        int seq = w->put_total;
-        int need = seq - 3;
-        while (w->drained_total < need) {
-            if (worker_drain(w, it.pts) <= 0)
-                usleep(2000);
+        if (it.pts < 0) {
+            /* startup padding item — nothing to repack, release the ack */
+            pthread_mutex_lock(&w->ack_mu);
+            w->ack_done[it.slot] = 1;
+            pthread_cond_broadcast(&w->ack_cv);
+            pthread_mutex_unlock(&w->ack_mu);
+            continue;
         }
 
-        MppFrame ef = w->enc_in[it.enc_idx];
-        mpp_frame_set_pts(ef, it.pts);
-        w->put_total++;
-        void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[it.enc_idx]);
+        /* repack the finished slot's SSBO straight into the encoder input.
+         * The ENCODER (put/drain) runs on the MAIN thread — the old sync
+         * design was clean for hours, while encoder calls from this worker
+         * thread produced intermittent phantom/corrupt packets. */
+        void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[0]);
         if (it.slot == -2) {
             /* CAM2STITCH_NOGPU diagnostic: grey frame */
             memset(enc_ptr, 128, (size_t)w->ehs * w->evs);
@@ -817,15 +829,11 @@ static void *encode_worker(void *arg) {
                    (size_t)w->ehs * w->evs / 2);
         } else {
             repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
-            pthread_mutex_lock(&w->ack_mu);
-            w->ack_done[it.slot] = 1;
-            pthread_cond_broadcast(&w->ack_cv);
-            pthread_mutex_unlock(&w->ack_mu);
         }
-        int64_t t0 = now_us();
-        worker_put_frame(w, ef, w->enc_out_buf[it.enc_idx]);
-        worker_drain(w, it.pts);
-        w->t_put_us = now_us() - t0;
+        pthread_mutex_lock(&w->ack_mu);
+        w->ack_done[it.slot] = 1;
+        pthread_cond_broadcast(&w->ack_cv);
+        pthread_mutex_unlock(&w->ack_mu);
     }
     return NULL;
 }
@@ -1386,7 +1394,7 @@ int main(int argc, char **argv) {
     if (ret) { fprintf(stderr, "enc set cfg failed %d\n", ret); return 1; }
     cma_print("after SET_CFG");
 
-    const int ENC_RING = 4;
+    const int ENC_RING = 1;
     MppBufferGroup enc_pkt_grp = NULL;
     ret = mpp_buffer_group_get_internal(&enc_pkt_grp, MPP_BUFFER_TYPE_DRM);
     /* 8 buffers: 4 for the rotating output packets + headroom so
@@ -1501,11 +1509,9 @@ int main(int argc, char **argv) {
     pthread_t wthread;
     pthread_create(&wthread, NULL, encode_worker, &w);
 
-    /* per-GPU-slot pending frame info (pts/enc idx assigned at submit time,
-     * pushed to the worker when the slot's result comes back 3 frames later) */
+    /* per-GPU-slot pending frame info (pts assigned at submit time, pushed
+     * to the worker when the slot's result comes back 3 frames later) */
     int64_t pend_pts[3] = { -1, -1, -1 };
-    int pend_enc[3] = { -1, -1, -1 };
-    int enc_next = 0;
 
     /* wait for cam1's first frame to learn the start trim */
     cur1_idx = ring_take(&cams[1].ring, &cur1, &cur1_pts);
@@ -1573,11 +1579,18 @@ int main(int argc, char **argv) {
         if (nogpu) {
             /* diagnostic: straight to the worker as a grey frame */
             pthread_mutex_lock(&w.q->mu);
-            w.q->items[w.q->tail % 16] = (work_item){ -2, mid, enc_next };
+            w.q->items[w.q->tail % 16] = (work_item){ 0, mid, 0 };
             w.q->tail++; w.q->count++;
             pthread_cond_signal(&w.q->cv);
             pthread_mutex_unlock(&w.q->mu);
-            enc_next = (enc_next + 1) % ENC_RING;
+            pthread_mutex_lock(&w.ack_mu);
+            while (!w.ack_done[0])
+                pthread_cond_wait(&w.ack_cv, &w.ack_mu);
+            w.ack_done[0] = 0;
+            pthread_mutex_unlock(&w.ack_mu);
+            mpp_frame_set_pts(enc_in[0], mid);
+            worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
+            worker_drain(&w, mid);
         } else {
             gpu_slot_t *s = &g.slots[g.k];
             int k = g.k;
@@ -1589,9 +1602,11 @@ int main(int argc, char **argv) {
                                            .memory = s->ssbo_mem, .offset = 0, .size = g.ssbo_size };
                 vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
             }
-            /* hand the previous result to the worker */
+            /* the slot's previous result (frame i-3) — hand it to the
+             * worker for repack, then wait before the GPU overwrites it */
+            int64_t put_pts = pend_pts[k];
             pthread_mutex_lock(&w.q->mu);
-            w.q->items[w.q->tail % 16] = (work_item){ k, pend_pts[k], pend_enc[k] };
+            w.q->items[w.q->tail % 16] = (work_item){ k, put_pts, 0 };
             w.q->tail++; w.q->count++;
             pthread_cond_signal(&w.q->cv);
             pthread_mutex_unlock(&w.q->mu);
@@ -1615,31 +1630,40 @@ int main(int argc, char **argv) {
                                 .commandBufferCount = 1, .pCommandBuffers = &s->cb };
             CHECK(vkQueueSubmit(g.queue, 1, &si, s->fence));
             pend_pts[k] = mid;
-            pend_enc[k] = enc_next;
-            enc_next = (enc_next + 1) % ENC_RING;
             g.k = (g.k + 1) % RING_SLOTS;
+            /* encode frame i-3 (repacked by the worker into enc_in[0]) on
+             * the MAIN thread — the proven-clean sync path. The drain
+             * returns immediately: the encoder finished ~30ms ago. */
+            if (put_pts >= 0) {
+                mpp_frame_set_pts(enc_in[0], put_pts);
+                worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
+                worker_drain(&w, put_pts);
+            }
         }
         ring_release(&cams[0].ring, f0_idx);
         out_count++;
         if (out_count % 10 == 0)
-            fprintf(stderr, "submitted %d frames (main %.1fms; worker put %.1fms, encoded %d)\n",
-                    out_count, (now_us() - t_stage) / 1000.0,
-                    w.t_put_us / 1000.0, w.enc_count);
+            fprintf(stderr, "submitted %d frames (main %.1fms, encoded %d)\n",
+                    out_count, (now_us() - t_stage) / 1000.0, w.enc_count);
     }
 
-    /* ---- stop + EOS (via the worker, after all queued frames) ---- */
+    /* ---- stop + EOS (main thread — the old proven-clean path) ---- */
     g_running = 0;
     for (int i = 0; i < 2; i++) {
         pthread_cond_signal(&cams[i].ring.cv_free);
         pthread_cond_signal(&cams[i].ring.cv_ready);
     }
     pthread_mutex_lock(&w.q->mu);
-    w.q->items[w.q->tail % 16] = (work_item){ -1, 0, 0 };
-    w.q->tail++; w.q->count++;
     w.q->stop = 1;
     pthread_cond_signal(&w.q->cv);
     pthread_mutex_unlock(&w.q->mu);
     pthread_join(wthread, NULL);
+    {
+        MppFrame ef = enc_in[0];
+        mpp_frame_set_eos(ef, 1);
+        worker_put_frame(&w, ef, enc_out_buf[0]);
+        worker_drain(&w, 0);
+    }
     for (int i = 0; i < 2; i++)
         pthread_join(cams[i].thread, NULL);
     if (fp_pts)
