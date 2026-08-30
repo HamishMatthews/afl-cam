@@ -112,6 +112,11 @@ STITCH_SHADER = ROOT_DIR / "afl_cam" / "native" / "stitch_nv12.spv"
 #   scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> calibration/stitch_live_full
 STITCH_PARAMS_DIR = ROOT_DIR / "calibration" / "stitch_live_full"
 STITCH_CANVAS_WIDTH = 5304
+# Re-align workflow (UI button): captures two stills and regenerates the
+# frozen stitch params. Needs the OpenCV 5 venv (the project venv is py3.14
+# with no wheels for the bundle API).
+ALIGN_PYTHON = "/home/hamish/venvs/cv2-new/bin/python3"
+ALIGN_SCRIPT = ROOT_DIR / "scripts" / "recapture_alignment.py"
 
 # libmali Vulkan env for the cam2stitch subprocess (spawned processes do not
 # inherit the interactive shell's env; the ICD lives in a non-standard dir)

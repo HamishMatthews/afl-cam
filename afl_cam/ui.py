@@ -48,7 +48,9 @@ class PreviewPanel(Gtk.Frame):
         box.set_margin_bottom(4)
 
         self._drawing = Gtk.DrawingArea()
-        self._drawing.set_size_request(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+        # small minimum: the draw handler letterboxes to any allocation, so
+        # the window can shrink for small screens (5" panels)
+        self._drawing.set_size_request(120, 68)
         self._drawing.connect("draw", self._on_draw)
         box.pack_start(self._drawing, True, True, 0)
 
@@ -131,72 +133,68 @@ class PreviewPanel(Gtk.Frame):
 # Control bar — resolution, duration, record/stop, swap
 
 class ControlBar(Gtk.Box):
-    """Recording controls."""
+    """Recording controls — two rows so the bar fits narrow screens."""
 
     def __init__(self):
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.set_margin_start(8)
         self.set_margin_end(8)
-        self.set_margin_top(6)
-        self.set_margin_bottom(6)
+        self.set_margin_top(4)
+        self.set_margin_bottom(4)
 
-        # Swap button
+        row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.pack_start(row1, False, False, 0)
+        self.pack_start(row2, False, False, 0)
+
+        # Row 1: Swap | Resolution | Mode | Duration +/-
         self.swap_btn = Gtk.Button(label="Swap")
         self.swap_btn.set_tooltip_text("Rotate left/right camera previews")
-        self.pack_start(self.swap_btn, False, False, 0)
+        row1.pack_start(self.swap_btn, False, False, 0)
 
-        sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        self.pack_start(sep, False, False, 0)
-
-        # Resolution dropdown
-        self.pack_start(Gtk.Label(label="Resolution:"), False, False, 0)
+        row1.pack_start(Gtk.Label(label="Res:"), False, False, 0)
         self.res_combo = Gtk.ComboBoxText()
-        for key, res in RESOLUTIONS.items():
-            self.res_combo.append(key, res["label"])
+        for key in RESOLUTIONS:
+            self.res_combo.append(key, key)
         self.res_combo.set_active_id(DEFAULT_RESOLUTION)
-        self.pack_start(self.res_combo, False, False, 0)
+        self.res_combo.set_tooltip_text(
+            "\n".join(f"{k} = {RESOLUTIONS[k]['label']}" for k in RESOLUTIONS))
+        row1.pack_start(self.res_combo, False, False, 0)
 
         # Record mode: live GPU stitch, or separate cameras + stitch later
-        self.pack_start(Gtk.Label(label="Mode:"), False, False, 0)
+        row1.pack_start(Gtk.Label(label="Mode:"), False, False, 0)
         self.mode_combo = Gtk.ComboBoxText()
-        self.mode_combo.append("live", "Live stitch")
-        self.mode_combo.append("separate", "Separate + stitch")
+        self.mode_combo.append("live", "Live")
+        self.mode_combo.append("separate", "Separate")
         self.mode_combo.set_active_id("live")
         self.mode_combo.set_tooltip_text(
             "Live stitch: one panorama recorded directly on the GPU.\n"
             "Separate + stitch: record both cameras, stitch afterwards.")
-        self.pack_start(self.mode_combo, False, False, 0)
+        row1.pack_start(self.mode_combo, False, False, 0)
 
-        # Duration with manual +/- buttons
-        self.pack_start(Gtk.Label(label="Duration (s):"), False, False, 0)
+        row1.pack_start(Gtk.Label(label="Dur:"), False, False, 0)
         self.dur_entry = Gtk.Entry()
-        self.dur_entry.set_width_chars(5)
+        self.dur_entry.set_width_chars(4)
         self.dur_entry.set_text("0")
-        self.dur_entry.set_tooltip_text("0 = record until stopped manually")
-        self.pack_start(self.dur_entry, False, False, 0)
+        self.dur_entry.set_tooltip_text("Seconds; 0 = record until stopped manually")
+        row1.pack_start(self.dur_entry, False, False, 0)
 
         minus_btn = Gtk.Button(label="-")
         minus_btn.connect("clicked", self._on_dur_adjust, -1)
-        self.pack_start(minus_btn, False, False, 0)
+        row1.pack_start(minus_btn, False, False, 0)
 
         plus_btn = Gtk.Button(label="+")
         plus_btn.connect("clicked", self._on_dur_adjust, 1)
-        self.pack_start(plus_btn, False, False, 0)
+        row1.pack_start(plus_btn, False, False, 0)
 
-        # Separator
-        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        self.pack_start(sep2, False, False, 0)
-
-        # Record / Stop button
+        # Row 2: Record | status
         self.record_btn = Gtk.Button(label="Record")
         self.record_btn.get_style_context().add_class("suggested-action")
-        self.pack_start(self.record_btn, False, False, 0)
+        row2.pack_start(self.record_btn, False, False, 0)
 
-        # Status
-        sep3 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        self.pack_start(sep3, False, False, 0)
         self.status_label = Gtk.Label(label="Ready")
-        self.pack_start(self.status_label, False, False, 0)
+        self.status_label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        row2.pack_start(self.status_label, False, False, 0)
 
     def _on_dur_adjust(self, btn, delta):
         try:
@@ -245,7 +243,7 @@ class RecordingList(Gtk.ScrolledWindow):
     def __init__(self):
         super().__init__()
         self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.set_min_content_height(150)
+        self.set_min_content_height(70)
 
         # date, cam/res, resolution, dur, size, status/stitch, id
         self._store = Gtk.TreeStore(str, str, str, str, str, str, int)
@@ -337,7 +335,9 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def __init__(self, app):
         super().__init__(application=app, title="afl-cam")
-        self.set_default_size(1280, 800)
+        self.set_default_size(960, 600)
+        # allow shrinking onto small screens (5" LCD at display scaling)
+        self.set_size_request(420, 240)
         self.connect("destroy", self._on_destroy)
 
         self._db = RecordingDB(DB_PATH)
@@ -347,6 +347,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._durations: dict[CameraRecorder, float] = {}
         self._recording = False
         self._stitching = False
+        self._realigning = False
         self._session_id: int | None = None
         self._swapped = False
         self._rec_start: float = 0.0
@@ -395,9 +396,14 @@ class MainWindow(Gtk.ApplicationWindow):
         self._controls.record_btn.connect("clicked", self._on_record_toggle)
         main.pack_start(self._controls, False, False, 0)
 
-# Recording list 
+# Recording list (collapsible — small screens can fold it away)
         self._recording_list = RecordingList()
-        main.pack_start(self._recording_list, True, True, 0)
+        rec_expander = Gtk.Expander(label="Recordings")
+        rec_expander.set_expanded(True)
+        rec_v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        rec_v.pack_start(self._recording_list, True, True, 0)
+        rec_expander.add(rec_v)
+        main.pack_start(rec_expander, True, True, 0)
 
         # Play / Delete / Refresh buttons under the list
         list_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -413,6 +419,14 @@ class MainWindow(Gtk.ApplicationWindow):
         self._stitch_btn.connect("clicked", self._on_stitch)
         list_btns.pack_start(self._stitch_btn, False, False, 0)
 
+        self._realign_btn = Gtk.Button(label="Re-align Cameras")
+        self._realign_btn.set_tooltip_text(
+            "Re-freeze the live-stitch alignment: captures one still per "
+            "camera and regenerates the stitch params (run after the rig "
+            "has been moved or re-aimed; takes ~40s)")
+        self._realign_btn.connect("clicked", self._on_realign)
+        list_btns.pack_start(self._realign_btn, False, False, 0)
+
         delete_btn = Gtk.Button(label="Delete Selected")
         delete_btn.connect("clicked", self._on_delete)
         list_btns.pack_start(delete_btn, False, False, 0)
@@ -421,7 +435,7 @@ class MainWindow(Gtk.ApplicationWindow):
         refresh_btn.connect("clicked", lambda b: self._recording_list.refresh())
         list_btns.pack_end(refresh_btn, False, False, 0)
 
-        main.pack_start(list_btns, False, False, 0)
+        rec_v.pack_start(list_btns, False, False, 0)
 
         self.show_all()
 
@@ -853,6 +867,56 @@ class MainWindow(Gtk.ApplicationWindow):
         self._stitch_btn.set_sensitive(not busy)
         self._controls.record_btn.set_sensitive(not busy)
         self._controls.swap_btn.set_sensitive(not busy)
+        self._realign_btn.set_sensitive(not busy)
+
+    def _on_realign(self, _btn):
+        """Re-freeze the live-stitch alignment (stills + params regen)."""
+        if self._recording or self._stitching or self._realigning:
+            return
+        self._realigning = True
+        # the script opens both cameras — previews must yield them
+        self._stop_previews()
+        for panel in (self._left_panel, self._right_panel):
+            panel.set_status("re-aligning…")
+        self._set_buttons_busy(True)
+        self._controls.status_label.set_text(
+            "Re-aligning cameras (~40s) — capturing stills + stitch params…")
+        Thread(target=self._realign_worker, daemon=True).start()
+
+    def _realign_worker(self):
+        """Runs off the GTK main thread: recapture_alignment.py."""
+        import subprocess
+
+        from .config import ALIGN_PYTHON, ALIGN_SCRIPT
+
+        try:
+            result = subprocess.run(
+                [ALIGN_PYTHON, str(ALIGN_SCRIPT)],
+                capture_output=True, text=True, timeout=360,
+                cwd=str(ROOT_DIR),
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.error("re-align failed to run: %s", e)
+            ok, err = False, str(e)
+        else:
+            ok = result.returncode == 0
+            err = result.stderr[-400:] if result.stderr else ""
+            if not ok:
+                log.error("re-align failed: %s", err)
+            else:
+                log.info("live-stitch alignment re-frozen")
+
+        def done():
+            self._realigning = False
+            self._set_buttons_busy(False)
+            self._controls.status_label.set_text(
+                "✓ Alignment updated — next recording uses it"
+                if ok else "Re-align failed — see log")
+            for panel in (self._left_panel, self._right_panel):
+                panel.set_status("")
+            self._start_previews()
+
+        GLib.idle_add(done)
 
 
 
