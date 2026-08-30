@@ -22,6 +22,11 @@ calibration/
 
 # Native MPP recorder (compiled)
 afl_cam/native/cam2h264
+afl_cam/native/cam2stitch
+
+# SQLite sidecars (the running app keeps the DB in WAL mode)
+*.db-shm
+*.db-wal
 
 # Personal Obsidian notes (project overview lives in README.md)
 # Project Overview.md
