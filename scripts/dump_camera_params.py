@@ -14,6 +14,7 @@ parallax: it landed 2.8 deg from the photometric optimum).
 Usage: python3 scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> <out_dir>
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -44,10 +45,15 @@ def main() -> None:
             raise SystemExit("--canvas-width needs a value")
         canvas_width = int(argv[i + 1])
         del argv[i:i + 2]
+    r1_file = None
+    if "--r1" in argv:
+        i = argv.index("--r1")
+        r1_file = Path(argv[i + 1])
+        del argv[i:i + 2]
     if len(argv) != 3:
         raise SystemExit(
             "usage: python3 scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> "
-            "<out_dir> [--canvas-width W]")
+            "<out_dir> [--canvas-width W] [--r1 refined_cams.txt]")
     cam0_path, cam1_path, out_dir = argv[0], argv[1], Path(argv[2])
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -99,6 +105,27 @@ def main() -> None:
         R = np.asarray(cam.R, dtype=np.float64).reshape(3, 3)
         cam_dump.append((K, R))
         print(f"cam{idx}: K=[[{fx:.1f},0,{cx:.1f}],[0,{fy:.1f},{cy:.1f}]]")
+
+    # optional: replace cam1's bundle rotation with a refined one
+    # (scripts/refine_rotation.py output — canvas-space feature fit with the
+    # measured K fixed; the bundle's R is degenerate on feature-poor scenes)
+    if r1_file is not None:
+        rows = {}
+        for line in open(r1_file):
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                rows.setdefault(parts[0], []).append([float(v) for v in parts[1:]])
+            except ValueError:
+                continue
+        if "R1" not in rows:
+            raise SystemExit(f"{r1_file} has no R1 rows")
+        R_ref = np.array(rows["R1"], dtype=np.float64)
+        cam_dump[1] = (cam_dump[1][0], R_ref)
+        cameras[1].R = R_ref.ravel()
+        print("cam1: using REFINED R from "
+              f"{r1_file} (yaw {np.degrees(np.arctan2(R_ref[0, 2], R_ref[0, 0])):.2f} deg)")
 
     # spherical geometry, plain math (same formulas the GPU shader will use)
     w_scale = float(np.median([cam.focal for cam in cameras])) / work_scale
@@ -153,28 +180,45 @@ def main() -> None:
     # Distortion is zeroed (see module docstring); the pinhole and raw
     # matrices are then identical, and the shader's forward-distortion solve
     # degenerates to a no-op.
-    with open(out_dir / "cams.txt", "w") as fh:
-        fh.write(f"canvas_w {out_w}\ncanvas_h {out_h}\nsrc_w {src_w}\nsrc_h {src_h}\n")
-        fh.write(f"warp_scale {w_scale}\n")
-        for idx, (K, R) in enumerate(cam_dump):
-            fh.write(f"cam{idx} kscale {k_scale}\n")
-            for name, mtx in (("K", K), ("R", R)):
-                for row in mtx:
-                    fh.write(name + str(idx) + " " + " ".join(f"{v:.12g}" for v in row) + "\n")
-            tl_x, tl_y, _, _ = _spherical_bounds(cameras[idx], work_scale, full_size, w_scale)
-            fh.write(f"cam{idx} tl {tl_x} {tl_y}\n")
-            fh.write(f"cam{idx} dist " + " ".join(f"{v:.6g}" for v in calibs[idx]["dist"]) + "\n")
+    # ALL writes are atomic (tmp + rename): a crash or kill mid-write must
+    # never leave truncated files behind — a truncated map set silently
+    # breaks the next live-stitch recording (2026-09-01: the 18:58 realign
+    # left 0-byte map0/map1/w0/w1 in stitch_live_full).
+    def atomic_write(path, data):
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
 
-    np.repeat(w0[:, :, None].astype(np.uint8), 4, axis=2).tofile(out_dir / "w0.bin")
-    np.repeat(w1[:, :, None].astype(np.uint8), 4, axis=2).tofile(out_dir / "w1.bin")
+    def atomic_text(path, text):
+        atomic_write(path, text.encode())
+
+    lines = [f"canvas_w {out_w}", f"canvas_h {out_h}", f"src_w {src_w}", f"src_h {src_h}",
+             f"warp_scale {w_scale}"]
+    for idx, (K, R) in enumerate(cam_dump):
+        lines.append(f"cam{idx} kscale {k_scale}")
+        for name, mtx in (("K", K), ("R", R)):
+            for row in mtx:
+                lines.append(name + str(idx) + " " + " ".join(f"{v:.12g}" for v in row))
+        tl_x, tl_y, _, _ = _spherical_bounds(cameras[idx], work_scale, full_size, w_scale)
+        lines.append(f"cam{idx} tl {tl_x} {tl_y}")
+        lines.append(f"cam{idx} dist " + " ".join(f"{v:.6g}" for v in calibs[idx]["dist"]))
+    atomic_text(out_dir / "cams.txt", "\n".join(lines) + "\n")
+
+    atomic_write(out_dir / "w0.bin",
+                 np.repeat(w0[:, :, None].astype(np.uint8), 4, axis=2).tobytes())
+    atomic_write(out_dir / "w1.bin",
+                 np.repeat(w1[:, :, None].astype(np.uint8), 4, axis=2).tobytes())
     # Warp maps for the GPU map-texture path (stitch_nv12.comp fetches these
     # with texelFetch instead of running the analytic warp per pixel): the
     # exact (s,t) source coords cv2.remap consumes, at the ROI shape the
     # shader indexes via params off/mapwh. Invalid = -1 (matches the guard).
-    np.stack([m0[0], m0[1]], axis=-1).astype(np.float32).tofile(out_dir / "map0.bin")
-    np.stack([m1[0], m1[1]], axis=-1).astype(np.float32).tofile(out_dir / "map1.bin")
-    cv2.cvtColor(f0, cv2.COLOR_BGR2RGB).tofile(out_dir / "cam0.rgb")
-    cv2.cvtColor(f1, cv2.COLOR_BGR2RGB).tofile(out_dir / "cam1.rgb")
+    atomic_write(out_dir / "map0.bin",
+                 np.stack([m0[0], m0[1]], axis=-1).astype(np.float32).tobytes())
+    atomic_write(out_dir / "map1.bin",
+                 np.stack([m1[0], m1[1]], axis=-1).astype(np.float32).tobytes())
+    atomic_write(out_dir / "cam0.rgb", cv2.cvtColor(f0, cv2.COLOR_BGR2RGB).tobytes())
+    atomic_write(out_dir / "cam1.rgb", cv2.cvtColor(f1, cv2.COLOR_BGR2RGB).tobytes())
 
     # flat GPU params: [0..3] dims, [4] warp_scale, [5..7] pad,
     # cam0 [8..35], cam1 [36..63]
@@ -197,7 +241,7 @@ def main() -> None:
         params[base + 15:base + 19] = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
         params[base + 19:base + 23] = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
         params[base + 23:base + 28] = calibs[bidx]["dist"]
-    params.tofile(out_dir / "params.bin")
+    atomic_write(out_dir / "params.bin", params.tobytes())
     print(f"params.bin: warp_scale={w_scale:.1f}, krinv0={params[8:11]}, "
           f"pin0={params[23:27]}, raw0={params[27:31]}, dist0={params[31:36]}")
 

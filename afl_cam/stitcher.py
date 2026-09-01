@@ -1,9 +1,11 @@
 """Panorama stitching for side-by-side 4K camera pairs."""
 
 import logging
+import os
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
@@ -16,6 +18,46 @@ _PKG_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _PKG_DIR.parent
 _CALIB_DIR = _PROJECT_DIR / "calibration"
 _OUTPUTS_DIR = _PROJECT_DIR / "outputs"
+# Frozen live-stitch alignment (measured K + refined R from the re-align
+# workflow). The rig is static, so the quality path uses these instead of
+# re-bundling per session — the 2-view bundle is degenerate on feature-poor
+# scenes (focal/R entangled) and leaves 10-30px ghosting in the overlap.
+_FROZEN_CAMS = _CALIB_DIR / "stitch_live_full" / "cams.txt"
+_FROZEN_MAP0 = _CALIB_DIR / "stitch_live_full" / "map0.bin"
+
+
+def _load_frozen_cams() -> Optional[List[Any]]:
+    """Frozen camera params for the static rig, or None (re-bundle instead).
+
+    Gated on the maps being non-empty: a crashed re-align leaves 0-byte
+    maps (2026-09-01) and the bundle R in that state is garbage. Set
+    AFL_CAM_REBUNDLE=1 to force the per-session bundle.
+    """
+    if os.environ.get("AFL_CAM_REBUNDLE") == "1":
+        return None
+    try:
+        if _FROZEN_MAP0.stat().st_size == 0:
+            return None
+        rows: Dict[str, List[List[float]]] = {}
+        for line in open(_FROZEN_CAMS):
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                rows.setdefault(parts[0], []).append([float(v) for v in parts[1:]])
+            except ValueError:
+                continue
+        K = {i: np.array(rows[f"K{i}"], dtype=np.float64) for i in (0, 1)}
+        R = {i: np.array(rows[f"R{i}"], dtype=np.float64) for i in (0, 1)}
+    except (OSError, KeyError, ValueError):
+        return None
+    cams = []
+    for i in (0, 1):
+        m = K[i]
+        cams.append(types.SimpleNamespace(
+            focal=m[0, 0], ppx=m[0, 2], ppy=m[1, 2],
+            aspect=m[1, 1] / m[0, 0], R=R[i].ravel()))
+    return cams
 
 
 def next_output_dir() -> Path:
@@ -161,6 +203,19 @@ class VideoStitcher:
         """
         left, right = self._stills._undistort_pair(left, right)
         full_w = left.shape[1]
+
+        # Static rig: use the frozen alignment (measured K + refined R) when
+        # it exists. The per-session bundle below is the fallback for a
+        # missing/broken re-align.
+        frozen = _load_frozen_cams()
+        if frozen is not None:
+            log.info("using frozen alignment from %s (rig is static)", _FROZEN_CAMS)
+            if self._build_quality_maps(left, right, frozen, 1.0):
+                ref = self._stitch_quality(left, right)
+                if ref is not None:
+                    self._ref_pano = ref
+                return True
+            log.warning("frozen alignment failed to build maps — re-bundling")
 
         stitcher = None
         cameras = None

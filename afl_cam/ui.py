@@ -880,29 +880,32 @@ class MainWindow(Gtk.ApplicationWindow):
             panel.set_status("re-aligning…")
         self._set_buttons_busy(True)
         self._controls.status_label.set_text(
-            "Re-aligning cameras (~40s) — capturing stills + stitch params…")
+            "Re-aligning cameras (~90s) — capturing stills + stitch params…")
         Thread(target=self._realign_worker, daemon=True).start()
 
     def _realign_worker(self):
         """Runs off the GTK main thread: recapture_alignment.py."""
         import subprocess
 
-        from .config import ALIGN_PYTHON, ALIGN_SCRIPT
+        from .config import ALIGN_PYTHON, ALIGN_SCRIPT, STITCH_CANVAS_WIDTH
 
+        # Output is NOT captured — the script streams its progress to the
+        # terminal the UI was launched from (the user must see the bundle,
+        # refinement and file writes; a swallowed failure is invisible).
         try:
             result = subprocess.run(
-                [ALIGN_PYTHON, str(ALIGN_SCRIPT)],
-                capture_output=True, text=True, timeout=360,
+                [ALIGN_PYTHON, str(ALIGN_SCRIPT),
+                 "--canvas-width", str(STITCH_CANVAS_WIDTH)],
+                timeout=600,
                 cwd=str(ROOT_DIR),
             )
         except (OSError, subprocess.TimeoutExpired) as e:
             log.error("re-align failed to run: %s", e)
-            ok, err = False, str(e)
+            ok = False
         else:
             ok = result.returncode == 0
-            err = result.stderr[-400:] if result.stderr else ""
             if not ok:
-                log.error("re-align failed: %s", err)
+                log.error("re-align failed with exit code %s", result.returncode)
             else:
                 log.info("live-stitch alignment re-frozen")
 

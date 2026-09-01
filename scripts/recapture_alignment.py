@@ -72,6 +72,32 @@ def main() -> int:
         print(result.stdout)
         if result.returncode != 0:
             raise SystemExit(f"params generation failed:\n{result.stderr[-800:]}")
+
+        # Refine the bundle's rotation against the actual scene: the 2-view
+        # bundle is degenerate on feature-poor scenes (focal/R entangled),
+        # leaving a 10-30px canvas misalignment (= the ghosting). The refiner
+        # fits R1 with the measured K fixed, minimizing canvas-space residual
+        # of SIFT matches. Then re-dump with the refined R.
+        REFINE = REPO / "scripts" / "refine_rotation.py"
+        refined = out_dir / "refined_cams.txt"
+        cmd = [CALIB_PYTHON, str(REFINE), str(stills["cam0"]), str(stills["cam1"]),
+               "--cams", str(out_dir / "cams.txt"), "--out", str(refined)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        print(result.stdout)
+        if result.returncode == 0 and refined.exists():
+            cmd = [CALIB_PYTHON, str(DUMP), str(stills["cam0"]), str(stills["cam1"]),
+                   str(out_dir), "--r1", str(refined)]
+            if canvas_width:
+                cmd += ["--canvas-width", str(canvas_width)]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            print(result.stdout)
+            if result.returncode != 0:
+                raise SystemExit(f"re-dump with refined R failed:\n{result.stderr[-800:]}")
+        else:
+            print("WARNING: rotation refinement failed — keeping the bundle "
+                  "alignment (ghosting may persist); stand in the overlap at "
+                  "playing distance for the capture so the refiner has "
+                  "features at the right depth")
     print(f"alignment frozen into {out_dir} — the next recording uses it")
     return 0
 
