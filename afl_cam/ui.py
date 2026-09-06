@@ -104,6 +104,23 @@ class PreviewPanel(Gtk.Frame):
         self._drawing.queue_draw()
         return False  # don't re-call
 
+    def set_jpeg_file(self, path: str):
+        """Load a JPEG snapshot from disk (must run on the GTK thread).
+
+        Recording-time live preview: while the recorders own the camera
+        streams they write raw-JPEG snapshots to <session>/camN_preview.jpg;
+        the UI polls those files and shows them here.
+        """
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+        except Exception as e:
+            log.warning("Failed to load preview snapshot %s: %s", path, e)
+            return
+        with self._lock:
+            self._pixbuf = pixbuf
+            self._got_frame = True
+        self._drawing.queue_draw()
+
     def _on_draw(self, widget, cr):
         with self._lock:
             if self._pixbuf is None:
@@ -368,6 +385,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._swapped = False
         self._rec_start: float = 0.0
         self._timer_id = None
+        self._preview_timer = None
+        self._session_dir: Path | None = None
 
         # State: assigned camera per panel position (left=0, right=1)
         # [0] = cam label for left panel, [1] = cam label for right panel
@@ -649,6 +668,34 @@ class MainWindow(Gtk.ApplicationWindow):
         self._rec_start = time.time()
         self._timer_id = GLib.timeout_add(1000, self._update_recording_timer)
 
+        # Recording-time live preview: the recorders write raw-JPEG
+        # snapshots (<session>/camN_preview.jpg) while they own the
+        # cameras; poll for fresh frames so the panels aren't frozen.
+        self._preview_mtimes = {"cam0": 0.0, "cam1": 0.0}
+        self._preview_live = set()
+        self._preview_timer = GLib.timeout_add(1000, self._poll_recording_previews)
+
+    def _poll_recording_previews(self) -> bool:
+        """1 Hz check for fresh recorder snapshots (GTK thread)."""
+        if not self._recording or self._session_dir is None:
+            return False
+        for cam_key, mtime in list(self._preview_mtimes.items()):
+            path = self._session_dir / f"{cam_key}_preview.jpg"
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if st.st_mtime <= mtime:
+                continue
+            self._preview_mtimes[cam_key] = st.st_mtime
+            panel = (self._left_panel if self._panel_cams[0] == cam_key
+                     else self._right_panel)
+            panel.set_jpeg_file(str(path))
+            if cam_key not in self._preview_live:
+                self._preview_live.add(cam_key)
+                panel.set_status("recording — live preview")
+        return True
+
     def _update_recording_timer(self) -> bool:
         if not self._recording:
             return False  # stop the timer
@@ -693,6 +740,9 @@ class MainWindow(Gtk.ApplicationWindow):
         if self._timer_id:
             GLib.source_remove(self._timer_id)
             self._timer_id = None
+        if self._preview_timer:
+            GLib.source_remove(self._preview_timer)
+            self._preview_timer = None
         self._stop_audio()
         self._controls.set_recording(False)
         self._controls.swap_btn.set_sensitive(True)

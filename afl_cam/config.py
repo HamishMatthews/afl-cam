@@ -99,7 +99,15 @@ NATIVE_RECORDER_SRC = ROOT_DIR / "afl_cam" / "native" / "cam2h264.c"
 NATIVE_RECORDER_BIN = ROOT_DIR / "afl_cam" / "native" / "cam2h264"
 NATIVE_CODEC = "H264"
 NATIVE_CONTAINER = "mp4"
-NATIVE_BITRATE = 20_000_000  # CBR target for rkvenc
+# rkvenc CBR targets (kbps). The 4K30 UVC source MJPEG runs ~125 Mbps, so
+# 20 Mbps starved grass/detail. 45 Mbps per camera and 60 Mbps for the
+# 5304-wide stitched canvas are the quality/file-size sweet spots
+# (~20 GB/hr per camera at 45 Mbps). Tune via env or here.
+NATIVE_BITRATE_KBPS = int(os.environ.get("AFL_CAM_BITRATE_KBPS", "45000"))
+STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "60000"))
+# The native recorders write a raw-JPEG snapshot to <session>/camN_preview.jpg
+# this often; the UI polls those files for a live preview while recording.
+PREVIEW_INTERVAL_SECS = float(os.environ.get("AFL_CAM_PREVIEW_SECS", "2"))
 
 # Exposure for the MPP recorder: 0 = auto-settle-then-lock (the recorder
 # matches the auto exposure's brightness with a locked manual value after

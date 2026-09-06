@@ -21,6 +21,7 @@ from .config import (
     CAMERAS, RESOLUTIONS, DEFAULT_RESOLUTION,
     PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_FPS,
     CAPTURES_DIR, CONTAINER, PLATFORM, EXPOSURE_TIME,
+    NATIVE_BITRATE_KBPS, STITCH_BITRATE_KBPS, PREVIEW_INTERVAL_SECS,
 )
 
 log = logging.getLogger(__name__)
@@ -445,9 +446,12 @@ class CameraRecorderMPP:
             self._start_time = time.time()
             self._running = True
 
+            env = dict(os.environ,
+                       AFL_CAM_BITRATE_KBPS=str(NATIVE_BITRATE_KBPS),
+                       AFL_CAM_PREVIEW_SECS=str(PREVIEW_INTERVAL_SECS))
             with open(log_path, "w") as logf:
                 self._proc = subprocess.Popen(
-                    cmd, stdout=logf, stderr=subprocess.STDOUT)
+                    cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
 
             log.info("Recording started: %s → %s (%dx%d, %.0fs, MPP native)",
                      self.label, output.name, self.width, self.height, duration_sec)
@@ -596,7 +600,9 @@ class StitchRecorderMPP:
             env = dict(os.environ,
                        VK_DRIVER_FILES=VK_ICD_FILENAMES,
                        LD_LIBRARY_PATH=VK_LD_LIBRARY_PATH + ":"
-                       + os.environ.get("LD_LIBRARY_PATH", ""))
+                       + os.environ.get("LD_LIBRARY_PATH", ""),
+                       AFL_CAM_STITCH_BITRATE_KBPS=str(STITCH_BITRATE_KBPS),
+                       AFL_CAM_PREVIEW_SECS=str(PREVIEW_INTERVAL_SECS))
             with open(log_path, "w") as logf:
                 self._proc = subprocess.Popen(
                     cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)

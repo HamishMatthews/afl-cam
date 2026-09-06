@@ -61,6 +61,24 @@ static void set_exposure(int fd, int mode, RK_S32 value)
     }
 }
 
+/* Atomic JPEG snapshot write: the raw UVC MJPEG payload is a complete JPEG —
+ * write it straight to *preview_path* via a temp file + rename so the UI
+ * (which polls the file) never sees a half-written frame. */
+static void write_preview(const char *preview_path, const void *jpeg, size_t size)
+{
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s.tmp", preview_path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f)
+        return;
+    size_t n = fwrite(jpeg, 1, size, f);
+    fclose(f);
+    if (n != size)
+        unlink(tmp);
+    else
+        rename(tmp, preview_path);
+}
+
 /* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
  * for the auto-settle-then-lock exposure loop. */
 static double frame_luma(MppFrame frame)
@@ -93,6 +111,29 @@ int main(int argc, char **argv)
     RK_U32 fps            = (argc > 6) ? atoi(argv[6]) : 30;
     RK_S32 exposure       = (argc > 7) ? atoi(argv[7]) : 0;     /* 0 = auto-lock, else 100us units */
     RK_S32 wall_sec       = (argc > 8) ? atoi(argv[8]) : 0;     /* 0 = unlimited; else stop after this many WALL seconds */
+
+    /* Preview snapshot path: <out>.raw.h264 -> <out>_preview.jpg (raw UVC
+     * MJPEG payloads, written every AFL_CAM_PREVIEW_SECS for the live UI). */
+    char preview_path[1024];
+    snprintf(preview_path, sizeof preview_path, "%s", out_path);
+    {
+        char *dot = strstr(preview_path, ".raw.h264");
+        if (dot)
+            strcpy(dot, "_preview.jpg");
+        else
+            strncat(preview_path, "_preview.jpg",
+                    sizeof preview_path - strlen(preview_path) - 1);
+    }
+    /* Encode bitrate (kbps). The 4K30 UVC source MJPEG runs ~125 Mbps;
+     * 20 Mbps starved grass/detail — 45 Mbps is the default sweet spot.
+     * Tune with AFL_CAM_BITRATE_KBPS. */
+    RK_S32 bps = 45000;
+    if (getenv("AFL_CAM_BITRATE_KBPS"))
+        bps = atoi(getenv("AFL_CAM_BITRATE_KBPS"));
+    int64_t snap_interval_us = 2 * 1000000LL;
+    if (getenv("AFL_CAM_PREVIEW_SECS"))
+        snap_interval_us = (int64_t)(atof(getenv("AFL_CAM_PREVIEW_SECS")) * 1e6);
+    int64_t last_snap_us = -snap_interval_us;
 
     int fd = -1, ret = 0;
     int stream_on = 0;
@@ -280,9 +321,9 @@ int main(int argc, char **argv)
     mpp_enc_cfg_set_s32(enc_cfg, "prep:format", MPP_FMT_YUV420SP);
     mpp_enc_cfg_set_s32(enc_cfg, "codec:type", MPP_VIDEO_CodingAVC);
     mpp_enc_cfg_set_s32(enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
-    mpp_enc_cfg_set_s32(enc_cfg, "rc:bps_target", 20000000);
-    mpp_enc_cfg_set_s32(enc_cfg, "rc:bps_max", 21000000);
-    mpp_enc_cfg_set_s32(enc_cfg, "rc:bps_min", 19000000);
+    mpp_enc_cfg_set_s32(enc_cfg, "rc:bps_target", bps * 1000);
+    mpp_enc_cfg_set_s32(enc_cfg, "rc:bps_max", (RK_S32)(bps * 1050L));
+    mpp_enc_cfg_set_s32(enc_cfg, "rc:bps_min", (RK_S32)(bps * 950L));
     mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_in_flex", 0);
     mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_in_num", fps);
     mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_in_denom", 1);
@@ -398,6 +439,12 @@ int main(int argc, char **argv)
         int64_t pts_us = (int64_t)vbuf.timestamp.tv_sec * 1000000 +
                          vbuf.timestamp.tv_usec;
         size_t jpeg_size = vbuf.bytesused;
+
+        /* live-preview snapshot: raw JPEG payload straight to disk */
+        if (now_us() - last_snap_us >= snap_interval_us) {
+            write_preview(preview_path, v4l2_bufs[vbuf.index].start, jpeg_size);
+            last_snap_us = now_us();
+        }
 
         /* copy MJPEG payload into an MppBuffer for the decoder */
         MppBuffer dec_in_buf = NULL;

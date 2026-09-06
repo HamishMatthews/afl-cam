@@ -90,10 +90,21 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   median (was 13–70 px before the canvas-space refinement). Near-field grass
   (~19 px bottom band) is genuine parallax — physics, not a bug.
 - Re-align button works end-to-end and streams logs; dump writes are atomic.
+- Live preview while recording (2026-09-06): the recorders write raw-JPEG
+  snapshots to `<session>/camN_preview.jpg` every `AFL_CAM_PREVIEW_SECS`
+  (default 2 s, atomic tmp+rename); the UI polls them at 1 Hz and shows them
+  in the preview panels (`recording — live preview` status).
+- Encode bitrate defaults (2026-09-06): 45 Mbps per camera, 60 Mbps for the
+  stitched canvas (was 20/30 — the ~125 Mbps UVC MJPEG source was starved).
+  Tune with `AFL_CAM_BITRATE_KBPS` / `AFL_CAM_STITCH_BITRATE_KBPS` (engine
+  sets these for spawned recorders from `config.py`). CBR scales with actual
+  fps, so dim-light ~20 fps recordings undershoot the target proportionally.
 - Pending: outdoor bright-daylight 30 fps verification; NVMe heatsink;
   gnome-shell burns ~385% CPU (software-rendered desktop — consider a lighter
   session); GPU governor persistence (user decision); the UI's
-  `recordings not saving` report from 2026-09-06 may need reproducing.
+  `recordings not saving` report from 2026-09-06 may need reproducing;
+  iPhone control/preview (board has onboard WiFi 6E AP6611 — the plan is
+  board-as-AP + tiny web server + Safari snapshot polling, see below).
 
 ## More context
 

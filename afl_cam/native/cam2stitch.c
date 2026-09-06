@@ -105,6 +105,24 @@ static void set_exposure(int fd, int mode, RK_S32 value)
     }
 }
 
+/* Atomic JPEG snapshot write: the raw UVC MJPEG payload is a complete JPEG —
+ * write it straight to *preview_path* via a temp file + rename so the UI
+ * (which polls the file) never sees a half-written frame. */
+static void write_preview(const char *preview_path, const void *jpeg, size_t size)
+{
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s.tmp", preview_path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f)
+        return;
+    size_t n = fwrite(jpeg, 1, size, f);
+    fclose(f);
+    if (n != size)
+        unlink(tmp);
+    else
+        rename(tmp, preview_path);
+}
+
 /* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
  * for the auto-settle-then-lock exposure loop (copied from cam2h264.c). */
 static double frame_luma(MppFrame frame)
@@ -961,6 +979,10 @@ typedef struct {
     int64_t dt_sum;
     int dt_n;
     RK_S32 lock_exp;
+    /* recording-time live preview: raw-JPEG snapshot path + pacing */
+    char preview_path[512];
+    int64_t snap_interval_us;
+    int64_t last_snap;
 } cam_t;
 
 static int v4l2_open(cam_t *c) {
@@ -1178,6 +1200,12 @@ static void *capture_thread(void *arg) {
                          vbuf.timestamp.tv_usec;
         size_t jpeg_size = vbuf.bytesused;
 
+        /* live-preview snapshot: raw JPEG payload straight to disk */
+        if (now_us() - c->last_snap >= c->snap_interval_us) {
+            write_preview(c->preview_path, c->bufs[vbuf.index].start, jpeg_size);
+            c->last_snap = now_us();
+        }
+
         MppBuffer dec_in_buf = NULL;
         MppPacket dec_pkt = NULL;
         RK_S32 r = mpp_buffer_get(c->pkt_grp, &dec_in_buf, jpeg_size);
@@ -1348,6 +1376,22 @@ int main(int argc, char **argv) {
         c->width = width; c->height = height; c->fps = fps; c->exposure = exposure;
         c->lock_pending = (exposure <= 0);
         c->lock_exp = 166;
+        /* live preview: <outdir>/cam<i>_preview.jpg every AFL_CAM_PREVIEW_SECS */
+        snprintf(c->preview_path, sizeof c->preview_path, "%s", out_path);
+        {
+            char *slash = strrchr(c->preview_path, '/');
+            if (slash)
+                snprintf(slash + 1, sizeof c->preview_path - (slash + 1 - c->preview_path),
+                         "cam%d_preview.jpg", i);
+            else
+                snprintf(c->preview_path, sizeof c->preview_path,
+                         "cam%d_preview.jpg", i);
+        }
+        c->snap_interval_us = 2 * 1000000LL;
+        if (getenv("AFL_CAM_PREVIEW_SECS"))
+            c->snap_interval_us =
+                (int64_t)(atof(getenv("AFL_CAM_PREVIEW_SECS")) * 1e6);
+        c->last_snap = -c->snap_interval_us;
         pthread_mutex_init(&c->ring.mu, NULL);
         pthread_cond_init(&c->ring.cv_ready, NULL);
         pthread_cond_init(&c->ring.cv_free, NULL);
@@ -1369,12 +1413,18 @@ int main(int argc, char **argv) {
     RK_U32 ehs = MPP_ALIGN(g.canvas_w, 16);
     RK_U32 evs = MPP_ALIGN(g.canvas_h, 16);
     {
+        /* Encode bitrate (kbps). The 5304-wide composite canvas holds 2.3x
+         * a 4K frame's pixels; 30 Mbps starved it. Default 60 Mbps, tune
+         * with AFL_CAM_STITCH_BITRATE_KBPS. */
+        RK_S32 bps = 60000;
+        if (getenv("AFL_CAM_STITCH_BITRATE_KBPS"))
+            bps = atoi(getenv("AFL_CAM_STITCH_BITRATE_KBPS"));
         const char *keys[8] = { "prep:width", "prep:height", "prep:hor_stride",
                                 "prep:ver_stride", "prep:format", "rc:bps_target",
                                 "rc:bps_min", "rc:bps_max" };
         RK_S32 vals[8] = { (RK_S32)g.canvas_w, (RK_S32)g.canvas_h,
                            (RK_S32)ehs, (RK_S32)evs, MPP_FMT_YUV420SP,
-                           30000000, 28500000, 31500000 };
+                           bps * 1000, (RK_S32)(bps * 950L), (RK_S32)(bps * 1050L) };
         for (int i = 0; i < 8; i++)
             mpp_enc_cfg_set_s32(enc_cfg, keys[i], vals[i]);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
