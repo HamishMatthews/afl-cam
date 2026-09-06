@@ -396,14 +396,16 @@ class MainWindow(Gtk.ApplicationWindow):
         self._controls.record_btn.connect("clicked", self._on_record_toggle)
         main.pack_start(self._controls, False, False, 0)
 
-# Recording list (collapsible — small screens can fold it away)
+# Recording list (collapsible — small screens can fold it away). NOT
+        # vertically expanding: extra window space belongs to the previews;
+        # an expanding empty list area is the ~20% dead band at the bottom.
         self._recording_list = RecordingList()
         rec_expander = Gtk.Expander(label="Recordings")
         rec_expander.set_expanded(True)
         rec_v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         rec_v.pack_start(self._recording_list, True, True, 0)
         rec_expander.add(rec_v)
-        main.pack_start(rec_expander, True, True, 0)
+        main.pack_start(rec_expander, False, False, 0)
 
         # Play / Delete / Refresh buttons under the list
         list_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -423,7 +425,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._realign_btn.set_tooltip_text(
             "Re-freeze the live-stitch alignment: captures one still per "
             "camera and regenerates the stitch params (run after the rig "
-            "has been moved or re-aimed; takes ~40s)")
+            "has been moved or re-aimed; takes ~90s)")
         self._realign_btn.connect("clicked", self._on_realign)
         list_btns.pack_start(self._realign_btn, False, False, 0)
 

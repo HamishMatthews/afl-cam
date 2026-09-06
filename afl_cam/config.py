@@ -18,8 +18,12 @@ PLATFORM = sys.platform  # "linux" or "darwin"
 # interface: a main node (streams MJPG) and a metadata node (no formats).
 # Node numbers SHUFFLE ACROSS REBOOTS, so they are resolved at runtime:
 # the USB controller port (xhci.12 = cam0, xhci.11 = cam1 — the rig wiring)
-# plus MJPG support identify each camera's main node. The static map is a
-# fallback for when discovery fails.
+# plus MJPG support identify each camera's main node. The cameras are USB
+# 2.0 devices, so a camera plugged into a USB 2.0 port enumerates on the
+# EHCI companion controller (fc800000.usb) instead of xhci — those are
+# matched by their port path too. Cameras on undocumented ports fill the
+# remaining slots in sorted order; use the Swap button if the sides come
+# out swapped. The static map is a fallback for when discovery fails.
 #   macOS — AVFoundation device indices (find them with 'afl-cam list-devices')
 def _discover_cameras():
     try:
@@ -27,15 +31,24 @@ def _discover_cameras():
         for node in sorted(os.listdir("/sys/class/video4linux")):
             link = os.readlink(f"/sys/class/video4linux/{node}")
             m = re.search(r"xhci-hcd\.(\d+)\.auto", link)
-            if not m or m.group(1) in found:
+            e = re.search(r"fc[0-9a-f]+\.usb/usb\d+/(\d+(?:-\d+)*)/", link)
+            key = m.group(1) if m else ("e" + e.group(1)) if e else None
+            if key is None or key in found:
                 continue
             out = subprocess.run(
                 ["v4l2-ctl", "-d", f"/dev/{node}", "--list-formats"],
                 capture_output=True, text=True, timeout=5).stdout
             if "MJPG" in out:
-                found[m.group(1)] = f"/dev/{node}"
+                found[key] = f"/dev/{node}"
         by_ctl = {"cam0": "12", "cam1": "11"}
-        resolved = {k: found[ctl] for k, ctl in by_ctl.items() if ctl in found}
+        resolved = {}
+        for cam, ctl in by_ctl.items():
+            if ctl in found:
+                resolved[cam] = found.pop(ctl)
+        for cam in sorted(set(by_ctl) - set(resolved)):
+            if found:
+                key = sorted(found)[0]
+                resolved[cam] = found.pop(key)
         if len(resolved) == 2:
             return resolved
     except (OSError, subprocess.SubprocessError):

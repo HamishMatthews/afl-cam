@@ -228,3 +228,31 @@ grep -E "rkvenc|jpegd" /proc/interrupts
 | RKNN python venv | `~/venvs/rknn` (python 3.12 via uv) |
 | cam2h264 recorder | `afl_cam/native/cam2h264.c` (built binary lives alongside) |
 | Test recordings | `afl-cam/outputs/cam-hardware-tests/`, `afl-cam/outputs/raw-cam-tests/` (gitignored) |
+
+## 13. Stability fixes (2026-09-01)
+
+**NVMe black-screen crashes (root disk link drop).** The Samsung 980
+(DRAM-less, hot controller) in the M.2 slot hit 83.85°C (crit 84.85°C) even
+idle — under recording load it thermally resets → PCIe link drop → ext4 I/O
+errors on root (`ext4_find_entry ... inode #2`) → desktop dies → black screen.
+Fixes applied:
+
+```bash
+# /boot/armbianEnv.txt — appended to extraargs
+pcie_aspm=off nvme_core.default_ps_max_latency_us=0
+# one-time root fsck after the crashes: touch /forcefsck then reboot
+```
+
+Remaining: a heatsink/thermal pad on the drive (the pwmfan at ~59% cools the
+SoC only), PSU ≥ 5V/4A, and gnome-shell burns ~385% CPU (software-rendered
+desktop) heating the whole board.
+
+**Stitch ghosting fix (canvas-space rotation refinement).** See README
+"Alignment" — the per-session bundle was degenerate on grass; the frozen
+alignment now uses measured K + `scripts/refine_rotation.py`'s R.
+
+**Camera discovery (2026-09-06).** A camera plugged into a USB 2.0 port
+enumerates on the EHCI companion (`fc800000.usb/usb5/5-1`) instead of
+`xhci-hcd.N.auto` — `config.py::_discover_cameras` now matches both and
+fills undocumented ports in sorted order (use the UI Swap button if sides
+come out swapped).

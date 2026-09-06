@@ -1,166 +1,146 @@
 # afl-cam
 
-Portable dual-camera recording and panoramic stitching for amateur AFL football.
+Dual-4K30 recording + hardware-accelerated panoramic stitching for amateur AFL
+football, built for the **Orange Pi 5 Max (RK3588, Armbian)**.
 
-Two Sony IMX415 4K USB cameras sit side by side on a pole (or in a grandstand) with
-~25–30% overlap. `afl-cam` records both feeds plus their USB microphones, then
-stitches the pair into one wide video with hardware-accelerated encoding.
+Two Sony IMX415 4K USB cameras sit side by side in a rigid frame with a
+~15–25% overlap band in the middle. The app records both feeds plus their USB
+microphones and produces one wide stitched video — **live on the GPU during
+recording** (no post step), or per-camera files stitched afterwards.
 
 ```
-             ┌─────────┐   ┌─────────┐
-             │  cam0   │   │  cam1   │
-             │ (left)  │   │ (right) │
-             └────┬────┘   └────┬────┘
-                  │   ~25-30%   │
-                  │   overlap   │
-                  ▼             ▼
-        outputs/20260817_143012/
-          cam0.avi  cam1.avi
-          cam0.wav  cam1.wav      ← USB mics, for clap sync
-          stitch_video.mp4        ← the stitched result
-          panorama.jpg            ← debug still
+            ┌─────────┐      ┌─────────┐
+            │  cam0   │  ~~  │  cam1   │        (static rig, frozen alignment)
+            │ (left)  │  ~~  │ (right) │
+            └────┬────┘  ~~  └────┬────┘
+                 ▼    overlap     ▼
+        outputs/20260901_190732/
+          cam0.mp4  cam1.mp4          ← per-camera recordings (separate mode)
+          cam0.pts cam1.pts           ← per-frame kernel timestamps (the sync)
+          cam0.wav  cam1.wav          ← USB mics
+          stitch.raw.h264 + .pts      ← live-stitch mode output
+          stitch_video.mp4            ← stitched result
+          panorama.jpg                ← debug still
 ```
 
-## Install
+## How it works (current architecture)
 
-**Requirements:** Python ≥ 3.10, [uv](https://docs.astral.sh/uv/), ffmpeg.
+- **Capture**: native C recorders (`afl_cam/native/`) — V4L2 UVC → hardware
+  MJPEG decode (jpegd) → NV12, no GStreamer in the hot path.
+- **Recording, separate mode**: one `cam2h264` per camera → rkvenc H.264 CBR
+  20M → `.raw.h264` + a `.pts` sidecar, muxed to `.mp4` on completion.
+- **Recording, live mode** (default): `cam2stitch` records BOTH cameras in one
+  process and writes the stitched panorama directly — Vulkan compute on the
+  Mali G610 (map-texture spherical warp + feather blend, NV12 in/out) →
+  rkvenc H.264 CBR 30M at the full **5304×1896** canvas. GPU stages are
+  pipelined with the encoder (~30 fps capacity when light allows).
+- **Sync**: per-frame kernel-monotonic `.pts` timestamps (the xhci completion
+  clock — no clap sync, no genlock). The stitcher pairs frames by nearest
+  timestamp and retimes the mux (`afl_cam/retime.py`).
+- **Alignment**: frozen in `calibration/stitch_live_full/` (measured
+  checkerboard K + a canvas-space-refined inter-camera R). The rig is static;
+  both the live stitch and the post-stitcher use these frozen params. See
+  *Alignment* below.
 
-### Linux (the recording NUC — Ubuntu 22.04+)
+## Install / run
+
+**Requirements:** Python ≥ 3.12, [uv](https://docs.astral.sh/uv/), ffmpeg,
+GTK3 + PyGObject, `v4l2-utils`. Board-level setup (MPP, librga, libmali,
+RKNN, IRQ pinning, NVMe fixes) is documented step-by-step in
+[`orange_pi_5_max_setup.md`](orange_pi_5_max_setup.md).
 
 ```bash
-sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
-    gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-    gstreamer1.0-gtk3 ffmpeg v4l2-utils alsa-utils
-uv venv --system-site-packages   # venv sees the system GTK/GStreamer bindings
-uv sync
-uv run afl-cam ui
+uv sync                       # project venv (py3.14, GTK app + engine)
+uv run afl-cam ui             # the GTK app
 ```
 
-### macOS (M-series MacBook)
+Two Python environments exist on the board:
 
-```bash
-brew install python gtk+3 pygobject3 adwaita-icon-theme ffmpeg
-uv venv --system-site-packages   # venv sees Homebrew's pygobject3
-uv sync
-uv run afl-cam list-devices      # find the AVFoundation indices for your cameras
-uv run afl-cam ui
-```
+| venv | uses |
+|---|---|
+| project `.venv` (py3.14, has `gi`) | the UI, engine, config, retime caller |
+| `/home/hamish/venvs/cv2-new` (OpenCV 5 + PyAV 13) | stitcher, alignment scripts, retime worker |
 
-The GTK app on macOS needs XQuartz (`brew install --cask xquartz`) because
-Homebrew's GTK is built against X11. The CLI (record/stitch/list) needs none of
-the GTK stack.
-
-If the cameras don't map to the default indices (`cam0` = `0`, `cam1` = `1`),
-edit `CAMERAS` / `AUDIO_DEVICES` in `afl_cam/config.py`.
+The GPU recorder needs the libmali Vulkan ICD (spawned processes don't
+inherit shell env — `engine.py` sets it from config):
+`VK_DRIVER_FILES=/opt/libmali-g610/usr/share/vulkan/icd.d/mali.json`,
+`LD_LIBRARY_PATH=/opt/libmali-g610/usr/lib/aarch64-linux-gnu{:/mali}`.
 
 ## Usage
 
+The UI has everything: previews (tap to refresh), **Mode** dropdown
+(Live / Separate), resolution, duration, record, stitch, play, delete,
+**Re-align Cameras**, and a collapsible recordings list. On the 5" screen it
+shrinks to 420×240.
+
 ```bash
-afl-cam ui                     # GTK app: preview, record, stitch, browse sessions
-afl-cam record -d 3600         # record both cameras until Ctrl+C / duration
-afl-cam stitch --session 12    # stitch a recorded session (video + still)
-afl-cam stitch --all           # stitch every unstitched session
-afl-cam stitch-video -d 5      # record a short session and stitch it immediately
-afl-cam check-aim              # live camera-overlap measurement (target 25-30%)
-afl-cam list                   # sessions with stitch status
-afl-cam list-devices           # enumerate cameras and microphones
-afl-cam play 3                 # play a recording (VLC on Linux; QuickTime on macOS)
-afl-cam info 3                 # metadata for a recording
+uv run afl-cam ui               # the app
+afl-cam list                    # sessions with stitch status
+afl-cam stitch --session 12     # stitch a separate-mode session
+afl-cam stitch --all            # stitch every unstitched session
 ```
 
-Recording creates a session: a dated folder under `outputs/` (e.g.
-`outputs/20260817_143012/`) containing `cam0.avi`, `cam1.avi`, `cam0.wav`,
-`cam1.wav`, and a row in `recordings.db` (SQLite). Stitching writes
-`stitch_video.mp4` (+ a debug `panorama.jpg`) into the same folder and marks
-the session `stitched` in the catalog.
+Recordings land in `outputs/<YYYYMMDD_HHMMSS>/` with rows in `recordings.db`
+(SQLite, WAL).
 
-### Clap-based timecode sync
+## Alignment (re-aligning the static rig)
 
-Both cameras' USB microphones are recorded alongside the video. To sync the two
-feeds, clap once **after recording starts** (but not in the first half second —
-startup noise is skipped). The stitch step finds the clap transient in each
-WAV (≈5 ms windows, 12× the noise floor) and aligns the videos to the frame.
+The bundle adjustment that used to run per session is **degenerate on a grass
+field** (focal/R entangled — it once estimated focal 2125 vs the measured
+2237 and left 13–70 px of ghosting in the overlap). Since the rig is static:
 
-## Stitching
+1. **K (intrinsics)** is measured once from a checkerboard
+   (`calibration/cam{0,1}_calib.npz` — distortion deliberately zeroed).
+2. **R (rotation)** is refined in **canvas space** from SIFT matches with the
+   measured K fixed — `scripts/refine_rotation.py` (RANSAC over 2-point
+   rotation hypotheses + LM on inliers). This is what kills the ghosting.
 
-One method, no fallbacks: every recording is calibrated fresh. The first frames
-are run through OpenCV's spherical stitcher (CLAHE contrast enhancement, seeded
-RNG for determinism), producing per-camera remap maps, then every frame pair is
-warped and blended with a zoned alpha ramp.
-
-- Calibration needs **25–30% camera overlap** and a scene with texture. Use
-  `afl-cam check-aim` to verify the aim before a game.
-- If calibration fails, the error tells you the measured overlap — re-aim and
-  re-stitch (`afl-cam stitch --session N --retry`).
-- Encoding: Intel VAAPI H.264 on Linux, Apple VideoToolbox H.264 on macOS.
-
-## Platform matrix
-
-| Feature            | Linux (NUC)                     | macOS (M-series)                |
-|--------------------|---------------------------------|---------------------------------|
-| Capture (record)   | GStreamer v4l2src → MJPEG AVI   | OpenCV AVFoundation → MJPEG AVI |
-| Preview            | GStreamer pipeline              | OpenCV (RGB frames)             |
-| Camera mics        | ALSA `arecord` (`hw:1,0/2,0`)   | ffmpeg AVFoundation             |
-| Exposure control   | `v4l2-ctl auto_exposure=3`      | camera default (auto)           |
-| Stitch + encode    | VAAPI                           | VideoToolbox                    |
-| In-app playback    | GStreamer playbin + gtksink     | QuickTime via `open`            |
-| CLI preview        | yes (`afl-cam preview`)         | no (use the GTK app)            |
-
-## Troubleshooting
-
-- **Recordings are almost black** — the cameras must be in aperture-priority
-  exposure (mode 3). `afl-cam` sets this *after* opening the stream; opening a
-  4K stream can reset it, and mode 1 (Manual) records near-black frames.
-- **"Calibration failed — camera overlap is only N%"** — aim the cameras more
-  toward each other until `afl-cam check-aim` reports 25–30%, then re-stitch.
-- **Cameras busy / frame capture fails** — only one stream per camera at a
-  time; close the app before using `check-aim`.
-- **Stitch status stuck on `stitching`** — a previous stitch crashed; re-run
-  `afl-cam stitch --session N` (or `--retry` with `--all`).
-
-## For Claude Code sessions
-
-If you open another Claude Code session in this repo, point it here.
-
-### Project layout
+The **Re-align Cameras** button runs the whole chain (output streams to the
+terminal you launched the UI from):
 
 ```
-afl_cam/
-  cli.py        # CLI (record, stitch, list, check-aim, ui, …)
-  ui.py         # GTK3 app: previews, record, session catalog, stitch button
-  engine.py     # camera backends: GStreamer (Linux), OpenCV/AVFoundation (macOS)
-  capture.py    # all OS capture tooling (V4L2/ALSA vs AVFoundation) lives here
-  stitcher.py   # still + video stitching, clap sync, ffmpeg encoders
-  db.py         # SQLite: sessions + recordings, idempotent migration
-  sessions.py   # session folder naming/safety
-  config.py     # devices, resolutions, DB path
-outputs/        # per-session folders (gitignored)
-recordings.db   # SQLite catalog (gitignored)
+scripts/recapture_alignment.py          capture one settled still per camera
+  └─ scripts/dump_camera_params.py      bundle → maps/weights/params (+atomic writes)
+  └─ scripts/refine_rotation.py         canvas-space R refinement
+  └─ scripts/dump_camera_params.py --r1 refined_cams.txt   final freeze
 ```
 
-### Design invariants (do not reintroduce old complexity)
+Tip: stand in the overlap at playing distance during the capture — features
+on you bias the fit plane to where the players run. Verify alignment any
+time with `scripts/measure_alignment.py <cam0.jpg> <cam1.jpg>` (tile
+phase-correlation with a blur pre-filter; ~0.5 px median mid-band = good).
 
-- **One method, no fallbacks.** The stitcher calibrates fresh on every
-  recording — there is deliberately no saved calibration, no fast path, no
-  ECC refine, no NCC pyramid alternative. If calibration fails, fix the aim
-  (25–30% overlap) and re-stitch.
-- **RNG determinism matters.** OpenCV's stitcher uses the global RNG; the
-  pipeline seeds `cv2.setRNGSeed(0)` / `(42)` before `estimateTransform`
-  runs, or small still panoramas come out tiny/garbage.
-- **The spherical maps are an exact reproduction** of OpenCV's
-  `SphericalProjector` (mapForward/mapBackward, `detectResultRoiByBorder`,
-  median-focal scale, `+tl` grid convention). The video stitch matches the
-  still panorama pixel-for-pixel; when touching map math, compare against a
-  still `Stitcher` output first.
-- **Exposure ordering.** Set `auto_exposure=3` (aperture priority) *after*
-  the stream opens — opening resets it, mode 1 records black frames.
-- **Clap sync.** `_detect_clap` reads WAV headers with the `wave` module
-  (never infer channels from byte counts — that halves the time scale),
-  thresholds at 12× noise with 3 consecutive 5 ms windows, skips 0.25 s.
-- **Performance targets on the NUC:** stitch ≈ 84 ms/frame, VAAPI encode
-  ≈ 55 ms/frame at 3840-wide. A 5 s clip stitches in ~2–5 s of calibration
-  plus ~1 s/frame-pair-of-second of encode.
-- **Keep Linux paths byte-for-byte working** when adding platform code —
-  capture goes through `afl_cam/capture.py`, backends through
-  `make_preview()`/`make_recorder()` in `engine.py`, encoders through
-  `_open_encoder()` in `stitcher.py`. One backend per OS, chosen at import.
+## Scripts
+
+| script | purpose |
+|---|---|
+| `scripts/recapture_alignment.py` | one-command re-alignment (UI button backend) |
+| `scripts/dump_camera_params.py` | stills → `params.bin`, `map0/1.bin`, `w0/1.bin`, `cams.txt` (+ `--r1`, `--canvas-width`) |
+| `scripts/refine_rotation.py` | canvas-space rotation refinement (`--band` selects a depth band) |
+| `scripts/measure_alignment.py` | overlap misalignment in px (the ghosting ruler) |
+| `scripts/verify_nv12.py` | GPU stitch vs exact `cv2.remap` reference (quality parity) |
+| `afl_cam/retime.py` | VFR `.h264` + `.pts` → CFR `.mp4` (run via cv2-new venv) |
+
+## Known issues / gotchas
+
+- **Root NVMe (Samsung 980) overheats and drops the PCIe link → ext4 errors
+  → black screen.** `pcie_aspm=off nvme_core.default_ps_max_latency_us=0` are
+  set in `/boot/armbianEnv.txt`; the drive still needs a heatsink
+  (M.2 slot gets no airflow; check `sensors`-style
+  `cat /sys/class/hwmon/hwmon7/temp1_input` — crit is 84850 m°C).
+- **Camera discovery**: video nodes shuffle across reboots and a camera on a
+  USB 2.0 port enumerates on the EHCI controller — `config.py` resolves both
+  cases at runtime. If the sides come out swapped, use the **Swap** button.
+- **Frame rate** = min(sensor exposure, pipeline). Auto-exposure picks the
+  rate; on a bright field it locks 30 fps. Manual exposure without light
+  records black frames — trust the auto-exposure.
+- **Only one stream per camera at a time** — close the app before running
+  scripts that open the cameras.
+
+## Handover to a fresh Claude session
+
+Read [`CLAUDE.md`](CLAUDE.md) (loaded automatically) — it condenses the
+hard-won invariants. The hardware history lives in
+[`orange_pi_5_max_setup.md`](orange_pi_5_max_setup.md);
+`hardware_stitch_plan.md` / `live_stitch_plan.md` are the original design
+plans (mostly realised; kept for archaeology).
