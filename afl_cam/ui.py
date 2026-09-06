@@ -52,6 +52,11 @@ class PreviewPanel(Gtk.Frame):
         # the window can shrink for small screens (5" panels)
         self._drawing.set_size_request(120, 68)
         self._drawing.connect("draw", self._on_draw)
+        # Keep the drawing 16:9 with its WIDTH: the letterboxing draw
+        # handler means a taller window otherwise just adds empty bands
+        # inside the frames. Height follows the allocated width only, so
+        # vertical window growth never stretches the previews.
+        self._drawing.connect("size-allocate", self._on_alloc)
         box.pack_start(self._drawing, True, True, 0)
 
         # Prominent camera identity header (e.g. "cam0 — /dev/video0")
@@ -65,6 +70,13 @@ class PreviewPanel(Gtk.Frame):
         box.pack_start(self._status_label, False, False, 0)
 
         self.add(box)
+
+    def _on_alloc(self, drawing, alloc):
+        h = int(alloc.width * 9 / 16 + 0.5)
+        if h != alloc.height:
+            # -1 keeps the width minimum at 120 so the window can always
+            # shrink back after being widened
+            drawing.set_size_request(-1, h)
 
     def set_label(self, label: str):
         self._label = label
@@ -388,7 +400,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._right_panel = PreviewPanel("Cam 1")
         preview_box.pack_start(self._left_panel, True, True, 0)
         preview_box.pack_start(self._right_panel, True, True, 0)
-        main.pack_start(preview_box, True, True, 0)
+        # NOT vertically expanding: the previews keep their 16:9 size and
+        # extra window height goes to the recordings list instead
+        main.pack_start(preview_box, False, False, 0)
 
 # Controls 
         self._controls = ControlBar()
@@ -396,16 +410,16 @@ class MainWindow(Gtk.ApplicationWindow):
         self._controls.record_btn.connect("clicked", self._on_record_toggle)
         main.pack_start(self._controls, False, False, 0)
 
-# Recording list (collapsible — small screens can fold it away). NOT
-        # vertically expanding: extra window space belongs to the previews;
-        # an expanding empty list area is the ~20% dead band at the bottom.
+# Recording list (collapsible — small screens can fold it away). This is
+        # the vertically expanding element: extra window height shows more
+        # list rows, never taller previews.
         self._recording_list = RecordingList()
         rec_expander = Gtk.Expander(label="Recordings")
         rec_expander.set_expanded(True)
         rec_v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         rec_v.pack_start(self._recording_list, True, True, 0)
         rec_expander.add(rec_v)
-        main.pack_start(rec_expander, False, False, 0)
+        main.pack_start(rec_expander, True, True, 0)
 
         # Play / Delete / Refresh buttons under the list
         list_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -428,6 +442,12 @@ class MainWindow(Gtk.ApplicationWindow):
             "has been moved or re-aimed; takes ~90s)")
         self._realign_btn.connect("clicked", self._on_realign)
         list_btns.pack_start(self._realign_btn, False, False, 0)
+
+        open_folder_btn = Gtk.Button(label="Open Folder")
+        open_folder_btn.set_tooltip_text(
+            "Open the selected session's folder in the file manager")
+        open_folder_btn.connect("clicked", self._on_open_folder)
+        list_btns.pack_start(open_folder_btn, False, False, 0)
 
         delete_btn = Gtk.Button(label="Delete Selected")
         delete_btn.connect("clicked", self._on_delete)
@@ -688,6 +708,24 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add(500, self._start_previews)
 
 
+
+    def _on_open_folder(self, _btn):
+        """Open the selected session's folder in the desktop file manager."""
+        session_id = self._recording_list.get_selected_session_id()
+        if session_id is None:
+            return
+        folder = self._db.session_folder(session_id)
+        if not folder:
+            return
+        path = Path(folder)
+        if not path.is_absolute():
+            path = ROOT_DIR / path
+        if path.is_dir():
+            if PLATFORM == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _on_play(self, _btn):
         # Only individual recordings can be played; session rows do nothing.
