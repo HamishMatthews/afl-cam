@@ -272,6 +272,10 @@ class RecordingList(Gtk.ScrolledWindow):
             col.set_min_width(60)
             self._tree.append_column(col)
 
+        # Fill the whole scrolled area: without vexpand the tree keeps its
+        # natural row height and the extra window space shows as dead
+        # padding between the rows and the button row below.
+        self._tree.set_vexpand(True)
         self.add(self._tree)
 
     def refresh(self):
