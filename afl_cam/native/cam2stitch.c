@@ -157,8 +157,11 @@ static int snap_init(snap_t *s, int w, int h)
     mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor", 80);
     if (s->mpi->control(s->ctx, MPP_ENC_SET_CFG, cfg)) return -1;
     if (mpp_buffer_group_get_internal(&s->grp, MPP_BUFFER_TYPE_DRM)) return -1;
-    if (mpp_buffer_group_limit_config(s->grp, s->hstride * s->vstride * 2, 4)) return -1;
-    if (mpp_buffer_get(s->grp, &s->in_buf, s->hstride * s->vstride * 3 / 2)) return -1;
+    /* full 2x allocation: the vepu JPEG engine may read the UV plane past
+     * the 1.5x NV12 size — diagnostics proved the standard offset's UV is
+     * never read (2026-09-07) */
+    if (mpp_buffer_group_limit_config(s->grp, 4 * 1024 * 1024, 4)) return -1;
+    if (mpp_buffer_get(s->grp, &s->in_buf, (size_t)s->hstride * s->vstride * 2)) return -1;
     if (mpp_buffer_get(s->grp, &s->out_buf, s->hstride * s->vstride * 2)) return -1;
     mpp_frame_init(&s->in_frame);
     mpp_frame_set_width(s->in_frame, s->w);
@@ -176,6 +179,21 @@ static void snap_write(snap_t *s, const RK_U8 *nv12, RK_U32 sw, RK_U32 sh,
 {
     if (!s->ok || !nv12)
         return;
+    if (getenv("AFL_CAM_SNAP_DEBUG"))
+        fprintf(stderr, "snap: sw=%u sh=%u shstride=%u svstride=%u\n",
+                sw, sh, shstride, svstride);
+    /* fresh frame each snapshot — a reused frame's stale KEY_OUTPUT_PACKET
+     * meta double-releases the output buffer (pool corruption, aliased
+     * packets: "worker: dropping bad packet") */
+    mpp_frame_deinit(&s->in_frame);
+    mpp_frame_init(&s->in_frame);
+    mpp_frame_set_width(s->in_frame, s->w);
+    mpp_frame_set_height(s->in_frame, s->h);
+    mpp_frame_set_hor_stride(s->in_frame, s->hstride);
+    mpp_frame_set_ver_stride(s->in_frame, s->vstride);
+    mpp_frame_set_fmt(s->in_frame, MPP_FMT_YUV420SP);
+    mpp_frame_set_buffer(s->in_frame, s->in_buf);
+
     RK_U8 *dst = (RK_U8 *)mpp_buffer_get_ptr(s->in_buf);
     const RK_U8 *srcUV = nv12 + (size_t)svstride * sh;
 
@@ -212,6 +230,11 @@ static void snap_write(snap_t *s, const RK_U8 *nv12, RK_U32 sw, RK_U32 sh,
             dstUV[(oy * (s->w / 2) + ox) * 2 + 1] = (RK_U8)(accV / ((y1 - y0) * (x1 - x0)));
         }
     }
+    /* DIAGNOSTICS: AFL_CAM_SNAP_GREYALL greys the ENTIRE buffer (finds
+     * where vepu reads the chroma); AFL_CAM_SNAP_TESTRED puts a known
+     * pattern at the standard offset */
+    if (getenv("AFL_CAM_SNAP_GREYALL"))
+        memset(dst, 128, (size_t)s->hstride * s->vstride * 2);
 
     MppPacket enc_pkt = NULL;
     mpp_packet_init_with_buffer(&enc_pkt, s->out_buf);
@@ -222,6 +245,9 @@ static void snap_write(snap_t *s, const RK_U8 *nv12, RK_U32 sw, RK_U32 sh,
             mpp_meta_set_packet(m, KEY_OUTPUT_PACKET, enc_pkt);
     }
     mpp_packet_deinit(&enc_pkt);
+
+    mpp_buffer_sync_begin(s->in_buf);
+    mpp_buffer_sync_end(s->in_buf);
 
     if (s->mpi->encode_put_frame(s->ctx, s->in_frame))
         return;
@@ -234,6 +260,9 @@ static void snap_write(snap_t *s, const RK_U8 *nv12, RK_U32 sw, RK_U32 sh,
         write_preview(path, ptr, len);
     mpp_packet_deinit(&pkt);
 }
+
+
+
 
 /* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
  * for the auto-settle-then-lock exposure loop (copied from cam2h264.c). */
@@ -814,6 +843,7 @@ typedef struct {
     MppBuffer enc_out_buf[4];
     RK_U32 ehs, evs;
     FILE *fp_out, *fp_pts;
+    int use_hevc;               /* packet validator: H.264 whitelist vs HEVC */
     pthread_mutex_t ack_mu;
     pthread_cond_t ack_cv;
     int ack_done[3];
@@ -895,8 +925,22 @@ static int worker_drain(worker_ctx_t *w, int64_t fallback_pts) {
             const RK_U8 *pb = ptr;
             int has_sc = plen >= 4 && memcmp(pb, sc, 4) == 0;
             RK_U8 nal = (has_sc ? pb[4] : pb[0]) & 0x1f;
-            int ok_nal = (nal == 1 || nal == 5 || nal == 6 ||
+            /* HEVC NAL types (& 0x1f) are legitimately 0/1/2/3/7... (VPS=32,
+             * SPS=33, PPS=34, IDR=19-21), so the H.264 whitelist would drop
+             * every keyframe. For HEVC only reject the allocator-fill
+             * phantom (a strict 01 02 03 04 ... byte run with no start
+             * code) — the one signature the H.264 whitelist was guarding
+             * against anyway. */
+            int ok_nal;
+            if (w->use_hevc) {
+                int phantom = !has_sc && plen >= 8 &&
+                              pb[0] == 1 && pb[1] == 2 && pb[2] == 3 && pb[3] == 4 &&
+                              pb[4] == 5 && pb[5] == 6 && pb[6] == 7 && pb[7] == 8;
+                ok_nal = !phantom;
+            } else {
+                ok_nal = (nal == 1 || nal == 5 || nal == 6 ||
                           nal == 7 || nal == 8 || nal == 9);
+            }
             if (ok_nal) {
                 if (plen < 4 || memcmp(ptr, sc, 4) != 0)
                     fwrite(sc, 1, 4, w->fp_out);
@@ -1312,6 +1356,15 @@ static void *capture_thread(void *arg) {
                          vbuf.timestamp.tv_usec;
         size_t jpeg_size = vbuf.bytesused;
 
+        /* live-preview snapshot: raw UVC JPEG payload straight to disk
+         * (full 4K, colors exact — the camera's own JPEG). The jpegenc
+         * downscale path is parked: vepu's 420SP UV offset proved opaque
+         * and RGB888 is rejected (2026-09-07, see snap_write). */
+        if (now_us() - c->last_snap >= c->snap_interval_us) {
+            write_preview(c->preview_path, c->bufs[vbuf.index].start, jpeg_size);
+            c->last_snap = now_us();
+        }
+
         MppBuffer dec_in_buf = NULL;
         MppPacket dec_pkt = NULL;
         RK_S32 r = mpp_buffer_get(c->pkt_grp, &dec_in_buf, jpeg_size);
@@ -1667,6 +1720,7 @@ int main(int argc, char **argv) {
     w.q = &(work_q_t){ .mu = PTHREAD_MUTEX_INITIALIZER };
     w.enc_ctx = enc_ctx;
     w.enc_mpi = enc_mpi;
+    w.use_hevc = use_hevc;
     for (int i = 0; i < ENC_RING; i++) {
         w.enc_in[i] = enc_in[i];
         w.enc_in_buf[i] = enc_in_buf[i];
@@ -1749,21 +1803,7 @@ int main(int argc, char **argv) {
         mpp_buffer_sync_ro_begin(cams[0].ring.slots[f0_idx].buf);
         mpp_buffer_sync_ro_begin(cams[1].ring.slots[pair_idx].buf);
 
-        /* live-preview snapshots from the paired NV12 (main thread, ~1-3 ms
-         * every 0.5 s each) */
-        if (now_us() - cams[0].last_snap >= cams[0].snap_interval_us) {
-            snap_write(&snaps[0], y0_ptr, cams[0].width, cams[0].height,
-                       mpp_frame_get_hor_stride(f0), mpp_frame_get_ver_stride(f0),
-                       cams[0].preview_path);
-            cams[0].last_snap = now_us();
-        }
-        if (now_us() - cams[1].last_snap >= cams[1].snap_interval_us) {
-            MppFrame f1 = cams[1].ring.slots[pair_idx].frame;
-            snap_write(&snaps[1], y1_ptr, cams[1].width, cams[1].height,
-                       mpp_frame_get_hor_stride(f1), mpp_frame_get_ver_stride(f1),
-                       cams[1].preview_path);
-            cams[1].last_snap = now_us();
-        }
+        /* (snapshots handled in the capture threads — raw UVC payloads) */
 
         if (nogpu) {
             /* diagnostic: straight to the worker as a grey frame */

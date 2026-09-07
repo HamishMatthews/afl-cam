@@ -109,10 +109,12 @@ NATIVE_CONTAINER = "mp4"
 ENCODE_CODEC = os.environ.get("AFL_CAM_CODEC", "hevc")   # "hevc" | "h264"
 NATIVE_BITRATE_KBPS = int(os.environ.get("AFL_CAM_BITRATE_KBPS", "60000"))
 STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "80000"))
-# The native recorders downscale decoded NV12 and MPP-jpegenc it to
+# The native recorders write the raw UVC JPEG payload to
 # <session>/camN_preview.jpg this often; the UI (and the field-remote web
-# page) poll those files for a live preview while recording.
-PREVIEW_INTERVAL_SECS = float(os.environ.get("AFL_CAM_PREVIEW_SECS", "0.2"))
+# page) poll those files for a live preview while recording. 1 fps: the
+# payloads are full 4K (~600 KB) — a downscaled jpegenc variant is parked
+# in the C (vepu UV offset issue, 2026-09-07).
+PREVIEW_INTERVAL_SECS = float(os.environ.get("AFL_CAM_PREVIEW_SECS", "1.0"))
 PREVIEW_SNAP_WIDTH = int(os.environ.get("AFL_CAM_PREVIEW_WIDTH", "960"))
 PREVIEW_SNAP_HEIGHT = int(os.environ.get("AFL_CAM_PREVIEW_HEIGHT", "540"))
 

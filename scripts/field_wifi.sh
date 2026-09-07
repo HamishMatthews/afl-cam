@@ -28,7 +28,12 @@ NM="nmcli"
 
 AP_PROFILE="afl-cam-ap"
 HOTSPOT_PROFILE="afl-cam-hotspot"
-HOTSPOT_SSID="${HOTSPOT_SSID:-iPhone}"
+# NOTE: defaults set via [ -n ] tests below, not ${VAR:-word} — the
+# apostrophe in the SSID breaks bash's ${} parsing (it opens a quote).
+HOTSPOT_SSID="${HOTSPOT_SSID:-}"
+HOTSPOT_PASSWORD="${HOTSPOT_PASSWORD:-}"
+[ -n "$HOTSPOT_SSID" ] || HOTSPOT_SSID="hammer's telephone"
+[ -n "$HOTSPOT_PASSWORD" ] || HOTSPOT_PASSWORD="despacito"
 
 log() { echo "[field_wifi] $*"; }
 
@@ -69,11 +74,22 @@ cmd_follow() {
     log "scanning for hotspot SSID '$HOTSPOT_SSID' every 10 s (Ctrl-C to stop)..."
     trap 'log "stopped by user"; exit 0' INT
     while true; do
-        if $NM -t -f SSID dev wifi list 2>/dev/null | grep -qx "$HOTSPOT_SSID"; then
+        # case- and apostrophe-insensitive match: iPhone names broadcast with
+        # a typographic apostrophe (U+2019) and title case
+        actual_ssid=""
+        while IFS= read -r line; do
+            a=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' | tr -d "'\342\200\231")
+            b=$(printf '%s' "$HOTSPOT_SSID" | tr '[:upper:]' '[:lower:]' | tr -d "'\342\200\231")
+            if [ "$a" = "$b" ]; then
+                actual_ssid="$line"
+                break
+            fi
+        done < <($NM -t -f SSID dev wifi list 2>/dev/null)
+        if [ -n "$actual_ssid" ]; then
             if ! $NM -t -f NAME con show | grep -qx "$HOTSPOT_PROFILE"; then
-                log "creating profile $HOTSPOT_PROFILE for '$HOTSPOT_SSID'"
+                log "creating profile $HOTSPOT_PROFILE for '$actual_ssid'"
                 $NM con add type wifi ifname wlan0 con-name "$HOTSPOT_PROFILE" \
-                    ssid "$HOTSPOT_SSID" \
+                    ssid "$actual_ssid" \
                     wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$HOTSPOT_PASSWORD" \
                     || { log "profile creation failed"; exit 1; }
             fi
