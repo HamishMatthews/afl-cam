@@ -16,40 +16,78 @@ PLATFORM = sys.platform  # "linux" or "darwin"
 
 # Camera devices (UVC). Each camera exposes TWO video nodes on the same
 # interface: a main node (streams MJPG) and a metadata node (no formats).
-# Node numbers SHUFFLE ACROSS REBOOTS, so they are resolved at runtime:
-# the USB controller port (xhci.12 = cam0, xhci.11 = cam1 — the rig wiring)
-# plus MJPG support identify each camera's main node. The cameras are USB
-# 2.0 devices, so a camera plugged into a USB 2.0 port enumerates on the
-# EHCI companion controller (fc800000.usb) instead of xhci — those are
-# matched by their port path too. Cameras on undocumented ports fill the
-# remaining slots in sorted order; use the Swap button if the sides come
-# out swapped. The static map is a fallback for when discovery fails.
+# Node numbers SHUFFLE ACROSS REBOOTS, so they are resolved at runtime.
+#   The two cameras carry IDENTICAL USB descriptors (serial "01.00.00",
+#   same mfr/firmware rev) — the PHYSICAL USB SOCKET is the only stable
+#   identity. Each USB2 socket is backed by an EHCI (480M) + OHCI (12M)
+#   companion controller pair; a healthy camera enumerates on the EHCI
+#   side. The rig's sockets are hardcoded:
+#       cam0 (left)  = EHCI fc880000.usb / OHCI fc8c0000.usb  (xhci.12)
+#       cam1 (right) = EHCI fc800000.usb / OHCI fc840000.usb  (xhci.11)
+#   If a camera's high-speed connect chirp fails (its USB firmware can
+#   wedge after a hard crash mid-stream) it re-enumerates at full speed on
+#   the OHCI side, where uvcvideo's probe FAILS — the camera then has no
+#   video node at all and its panel sits frozen. scripts/usb_kick_cameras.sh
+#   soft-resets the socket (no replug needed). A camera found on an
+#   unexpected socket fills the remaining slot in sorted order; use the
+#   Swap button if sides ever come out wrong (it persists).
 #   macOS — AVFoundation device indices (find them with 'afl-cam list-devices')
+_CAMERA_PORTS = {
+    # Physical socket controller pairs: (EHCI, OHCI, xhci-if-moved)
+    "cam0": ("fc880000.usb", "fc8c0000.usb", "xhci-hcd.12.auto"),
+    "cam1": ("fc800000.usb", "fc840000.usb", "xhci-hcd.11.auto"),
+}
+
+def _warn_wedged_cameras():
+    """Print a diagnostic when a camera is stuck at full speed (12 Mbps)."""
+    try:
+        for dev in os.listdir("/sys/bus/usb/devices"):
+            d = Path("/sys/bus/usb/devices", dev)
+            if not (d / "idProduct").exists():
+                continue
+            if (d / "idProduct").read_text().strip() != "28c4":
+                continue
+            speed = (d / "speed").read_text().strip()
+            if speed != "480":
+                print(f"afl-cam: WARNING: camera {dev} enumerated at "
+                      f"{speed} Mbps (wedged) — run "
+                      f"scripts/usb_kick_cameras.sh or replug it",
+                      file=sys.stderr)
+    except OSError:
+        pass
+
 def _discover_cameras():
     try:
         found = {}
         for node in sorted(os.listdir("/sys/class/video4linux")):
             link = os.readlink(f"/sys/class/video4linux/{node}")
-            m = re.search(r"xhci-hcd\.(\d+)\.auto", link)
-            e = re.search(r"fc[0-9a-f]+\.usb/usb\d+/(\d+(?:-\d+)*)/", link)
-            key = m.group(1) if m else ("e" + e.group(1)) if e else None
-            if key is None or key in found:
+            m = re.search(
+                r"platform/(?:[^/]*/)?([0-9a-f]+\.usb|xhci-hcd\.\d+\.auto)"
+                r"/usb\d+/(\d+(?:-\d+)*)/", link)
+            if not m:
+                continue
+            key = (m.group(1), m.group(2))  # (controller, port path)
+            if key in found:
                 continue
             out = subprocess.run(
                 ["v4l2-ctl", "-d", f"/dev/{node}", "--list-formats"],
                 capture_output=True, text=True, timeout=5).stdout
             if "MJPG" in out:
                 found[key] = f"/dev/{node}"
-        by_ctl = {"cam0": "12", "cam1": "11"}
         resolved = {}
-        for cam, ctl in by_ctl.items():
-            if ctl in found:
-                resolved[cam] = found.pop(ctl)
-        for cam in sorted(set(by_ctl) - set(resolved)):
+        for cam, ctl_names in _CAMERA_PORTS.items():
+            for key, dev in list(found.items()):
+                if key[0] in ctl_names:
+                    resolved[cam] = found.pop(key)
+                    break
+        # Cameras on unexpected sockets fill the remaining slots by sorted
+        # controller+port order (best effort).
+        for cam in sorted(set(_CAMERA_PORTS) - set(resolved)):
             if found:
                 key = sorted(found)[0]
                 resolved[cam] = found.pop(key)
-        if len(resolved) == 2:
+        if resolved:
+            _warn_wedged_cameras()
             return resolved
     except (OSError, subprocess.SubprocessError):
         pass

@@ -1,5 +1,6 @@
 """GTK3 GUI for afl-cam — live preview, recording controls, playback browser."""
 
+import json
 import logging
 import os
 import subprocess
@@ -27,6 +28,25 @@ from .remote import RemoteServer
 from .sessions import new_session_dir, session_dir_is_safe, remove_session_dir
 
 log = logging.getLogger("afl_cam.ui")
+
+# Persisted Swap-button state — the cameras are hardcoded to physical USB
+# sockets in config.py; if the rig wiring ever differs, the user's swap
+# sticks across restarts (no physical cable swapping).
+CAMERA_SIDES_FILE = ROOT_DIR / "calibration" / "camera_sides.json"
+
+
+def _load_camera_sides() -> bool:
+    try:
+        return bool(json.loads(CAMERA_SIDES_FILE.read_text()).get("swapped"))
+    except (OSError, ValueError):
+        return False
+
+
+def _save_camera_sides(swapped: bool) -> None:
+    try:
+        CAMERA_SIDES_FILE.write_text(json.dumps({"swapped": swapped}))
+    except OSError:
+        pass
 
 
 
@@ -399,7 +419,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._stitching = False
         self._realigning = False
         self._session_id: int | None = None
-        self._swapped = False
+        self._swapped = _load_camera_sides()
         self._rec_start: float = 0.0
         self._timer_id = None
         self._preview_timer = None
@@ -408,6 +428,8 @@ class MainWindow(Gtk.ApplicationWindow):
         # State: assigned camera per panel position (left=0, right=1)
         # [0] = cam label for left panel, [1] = cam label for right panel
         self._panel_cams = ["cam0", "cam1"]
+        if self._swapped:
+            self._panel_cams.reverse()
 
         self._build_ui()
         self._start_previews()
@@ -628,9 +650,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self._previews.clear()
 
     def _on_swap(self, _btn):
-        """Swap which camera is shown on left vs right."""
+        """Swap which camera is shown on left vs right (persists)."""
         self._swapped = not self._swapped
         self._panel_cams[0], self._panel_cams[1] = self._panel_cams[1], self._panel_cams[0]
+        _save_camera_sides(self._swapped)
         self._stop_previews()
         self._start_previews()
         log.info("Cameras swapped: left=%s right=%s", self._panel_cams[0], self._panel_cams[1])
