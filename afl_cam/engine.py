@@ -21,7 +21,8 @@ from .config import (
     CAMERAS, RESOLUTIONS, DEFAULT_RESOLUTION,
     PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_FPS,
     CAPTURES_DIR, CONTAINER, PLATFORM, EXPOSURE_TIME,
-    NATIVE_BITRATE_KBPS, STITCH_BITRATE_KBPS, PREVIEW_INTERVAL_SECS,
+    ENCODE_CODEC, NATIVE_BITRATE_KBPS, STITCH_BITRATE_KBPS,
+    PREVIEW_INTERVAL_SECS, PREVIEW_SNAP_WIDTH, PREVIEW_SNAP_HEIGHT,
 )
 
 log = logging.getLogger(__name__)
@@ -447,8 +448,11 @@ class CameraRecorderMPP:
             self._running = True
 
             env = dict(os.environ,
+                       AFL_CAM_CODEC=ENCODE_CODEC,
                        AFL_CAM_BITRATE_KBPS=str(NATIVE_BITRATE_KBPS),
-                       AFL_CAM_PREVIEW_SECS=str(PREVIEW_INTERVAL_SECS))
+                       AFL_CAM_PREVIEW_SECS=str(PREVIEW_INTERVAL_SECS),
+                       AFL_CAM_PREVIEW_WIDTH=str(PREVIEW_SNAP_WIDTH),
+                       AFL_CAM_PREVIEW_HEIGHT=str(PREVIEW_SNAP_HEIGHT))
             with open(log_path, "w") as logf:
                 self._proc = subprocess.Popen(
                     cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
@@ -601,8 +605,11 @@ class StitchRecorderMPP:
                        VK_DRIVER_FILES=VK_ICD_FILENAMES,
                        LD_LIBRARY_PATH=VK_LD_LIBRARY_PATH + ":"
                        + os.environ.get("LD_LIBRARY_PATH", ""),
+                       AFL_CAM_CODEC=ENCODE_CODEC,
                        AFL_CAM_STITCH_BITRATE_KBPS=str(STITCH_BITRATE_KBPS),
-                       AFL_CAM_PREVIEW_SECS=str(PREVIEW_INTERVAL_SECS))
+                       AFL_CAM_PREVIEW_SECS=str(PREVIEW_INTERVAL_SECS),
+                       AFL_CAM_PREVIEW_WIDTH=str(PREVIEW_SNAP_WIDTH),
+                       AFL_CAM_PREVIEW_HEIGHT=str(PREVIEW_SNAP_HEIGHT))
             with open(log_path, "w") as logf:
                 self._proc = subprocess.Popen(
                     cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)

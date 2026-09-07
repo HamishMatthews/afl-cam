@@ -6,6 +6,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from threading import Lock, Thread
 
 import gi
@@ -22,6 +23,7 @@ from .capture import (camera_device, camera_present, set_auto_exposure,
                       start_audio_capture, stop_audio_procs)
 from .db import RecordingDB
 from .engine import can_live_stitch, make_preview, make_recorder
+from .remote import RemoteServer
 from .sessions import new_session_dir, session_dir_is_safe, remove_session_dir
 
 log = logging.getLogger("afl_cam.ui")
@@ -247,6 +249,21 @@ class ControlBar(Gtk.Box):
         cameras, stitch afterwards with the Stitch button)."""
         return self.mode_combo.get_active_id() or "live"
 
+    def set_resolution(self, key: str):
+        if key in RESOLUTIONS:
+            self.res_combo.set_active_id(key)
+
+    def set_record_mode(self, key: str):
+        if key in ("live", "separate"):
+            self.mode_combo.set_active_id(key)
+
+    def set_duration(self, secs: float):
+        try:
+            val = int(secs)
+        except (TypeError, ValueError):
+            val = 0
+        self.dur_entry.set_text(str(max(0, min(7200, val))))
+
     def set_recording(self, active: bool):
         if active:
             self.record_btn.set_label("Stop Recording")
@@ -394,6 +411,77 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self._build_ui()
         self._start_previews()
+
+        # Field remote (iPhone over the board AP): HTTP control + preview
+        # snapshots. The server calls the remote_* methods below from its
+        # worker threads; actions cross to the GTK thread via a queue.
+        self._remote_actions: Queue = Queue()
+        self._remote = RemoteServer(self, self._remote_actions)
+        try:
+            self._remote.start()
+        except OSError as e:
+            log.warning("field remote failed to start: %s", e)
+        GLib.timeout_add(100, self._drain_remote_actions)
+
+    # -- field-remote controller interface (called from server threads) -----
+
+    def remote_status(self) -> dict:
+        """Status blob for the field-remote page (JSON-able, thread-safe)."""
+        import shutil
+        du = shutil.disk_usage(ROOT_DIR)
+        session = self._session_dir.name if self._session_dir is not None else None
+        return {
+            "recording": self._recording,
+            "elapsed": time.time() - self._rec_start if self._recording else 0.0,
+            "realigning": self._realigning,
+            "mode": self._controls.get_record_mode(),
+            "resolution": self._controls.get_resolution(),
+            "duration": self._controls.get_duration(),
+            "session": session,
+            "disk_free_gb": round(du.free / 1e9, 1),
+        }
+
+    def remote_preview_dir(self):
+        """Session dir holding the recorder snapshots, or None when idle."""
+        return self._session_dir if self._recording else None
+
+    def remote_action(self, action: str, params: dict) -> bool:
+        """Validate + enqueue a field-remote action for the GTK thread."""
+        if action not in ("toggle", "set_mode", "set_resolution",
+                          "set_duration", "realign", "swap"):
+            return False
+        self._remote_actions.put((action, params))
+        return True
+
+    def _drain_remote_actions(self) -> bool:
+        while not self._remote_actions.empty():
+            action, params = self._remote_actions.get_nowait()
+            try:
+                self._apply_remote_action(action, params)
+            except Exception as e:
+                log.warning("remote action %s failed: %s", action, e)
+        return True
+
+    def _apply_remote_action(self, action: str, params: dict) -> None:
+        """Run a field-remote action on the GTK thread (same paths as the
+        buttons, so recorder/DB behavior is identical)."""
+        if action == "toggle":
+            self._on_record_toggle(None)
+        elif action == "realign":
+            if not self._recording and not self._realigning:
+                self._on_realign(None)
+        elif action == "swap":
+            if not self._recording:
+                self._on_swap(None)
+        elif action == "set_mode":
+            if not self._recording:
+                self._controls.set_record_mode(str(params.get("value", "")))
+        elif action == "set_resolution":
+            if not self._recording:
+                self._controls.set_resolution(str(params.get("value", "")))
+        elif action == "set_duration":
+            if not self._recording:
+                self._controls.set_duration(float(params.get("value", 0) or 0))
 
 
 
@@ -673,7 +761,7 @@ class MainWindow(Gtk.ApplicationWindow):
         # cameras; poll for fresh frames so the panels aren't frozen.
         self._preview_mtimes = {"cam0": 0.0, "cam1": 0.0}
         self._preview_live = set()
-        self._preview_timer = GLib.timeout_add(1000, self._poll_recording_previews)
+        self._preview_timer = GLib.timeout_add(200, self._poll_recording_previews)
 
     def _poll_recording_previews(self) -> bool:
         """1 Hz check for fresh recorder snapshots (GTK thread)."""

@@ -1,0 +1,120 @@
+#!/bin/bash
+# field_wifi.sh — field network helper for the afl-cam rig (iPhone control).
+#
+# The board has onboard WiFi 6E. Two ways to connect the operator's iPhone
+# at the ground (no router available), plus a way home:
+#
+#   field_wifi.sh ap      — board becomes its own access point.
+#                           iPhone: join WiFi "afl-cam" (password aflcam2026),
+#                           open http://10.42.0.1:8080/ in Safari.
+#                           (Profile afl-cam-ap, autoconnects on boot at
+#                           priority -999 — the home WiFi wins at home.)
+#
+#   field_wifi.sh follow  — board hunts for the iPhone's Personal Hotspot and
+#                           joins it (for when the phone is already sharing).
+#                           Usage: HOTSPOT_SSID="John's iPhone" \
+#                                  HOTSPOT_PASSWORD=secret field_wifi.sh follow
+#                           The operator browses to the board's DHCP IP on
+#                           port 8080 (printed when connected).
+#                           NOTE: iOS hotspot isolates clients, so ONLY the
+#                           phone can reach the board in this mode.
+#
+#   field_wifi.sh stop    — leave field mode, restore the home WiFi profile.
+#
+# The afl-cam web control (afl_cam/remote.py, port 8080) runs inside the UI.
+
+set -u
+NM="nmcli"
+
+AP_PROFILE="afl-cam-ap"
+HOTSPOT_PROFILE="afl-cam-hotspot"
+HOTSPOT_SSID="${HOTSPOT_SSID:-iPhone}"
+
+log() { echo "[field_wifi] $*"; }
+
+board_ip() {
+    ip -4 addr show dev wlan0 2>/dev/null | awk '/inet/ && !/127.0.0.1/ {print $2; exit}'
+}
+
+profile_active() {
+    $NM -t -f NAME con show --active 2>/dev/null | grep -qx "$1"
+}
+
+home_profile() {
+    # First non-afl-cam wifi profile (netplan-wlan0-* or similar)
+    $NM -t -f NAME,TYPE con show 2>/dev/null \
+        | awk -F: '$2 ~ /wireless/ && $1 !~ /afl-cam/ {print $1; exit}'
+}
+
+cmd_ap() {
+    log "activating board AP '$AP_PROFILE' (SSID afl-cam / aflcam2026)..."
+    $NM con up "$AP_PROFILE" || { log "failed to bring up $AP_PROFILE"; exit 1; }
+    local ip
+    ip=$(board_ip)
+    log "AP is up. Board IP: ${ip:-10.42.0.1}"
+    log "On the iPhone: join WiFi 'afl-cam' (password aflcam2026),"
+    log "then open http://10.42.0.1:8080/ (or http://orangepi5-max.local:8080/)"
+}
+
+cmd_follow() {
+    if [ -z "${HOTSPOT_PASSWORD:-}" ]; then
+        log "HOTSPOT_PASSWORD is not set. Usage:"
+        log "  HOTSPOT_SSID=\"<phone name>\" HOTSPOT_PASSWORD=<pw> field_wifi.sh follow"
+        exit 1
+    fi
+    if profile_active "$AP_PROFILE"; then
+        log "bringing the board AP down first"
+        $NM con down "$AP_PROFILE"
+    fi
+    log "scanning for hotspot SSID '$HOTSPOT_SSID' every 10 s (Ctrl-C to stop)..."
+    trap 'log "stopped by user"; exit 0' INT
+    while true; do
+        if $NM -t -f SSID dev wifi list 2>/dev/null | grep -qx "$HOTSPOT_SSID"; then
+            if ! $NM -t -f NAME con show | grep -qx "$HOTSPOT_PROFILE"; then
+                log "creating profile $HOTSPOT_PROFILE for '$HOTSPOT_SSID'"
+                $NM con add type wifi ifname wlan0 con-name "$HOTSPOT_PROFILE" \
+                    ssid "$HOTSPOT_SSID" \
+                    wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$HOTSPOT_PASSWORD" \
+                    || { log "profile creation failed"; exit 1; }
+            fi
+            if ! profile_active "$HOTSPOT_PROFILE"; then
+                log "joining hotspot..."
+                $NM con up "$HOTSPOT_PROFILE"
+            fi
+            if $NM -t -f GENERAL.STATE con show "$HOTSPOT_PROFILE" 2>/dev/null \
+                    | grep -q activated; then
+                local ip
+                ip=$(board_ip)
+                log "connected to the iPhone hotspot. Board IP: ${ip:-unknown}"
+                log "On the iPhone, open http://${ip:-<board-ip>}:8080/"
+                trap - INT
+                exit 0
+            fi
+        fi
+        sleep 10
+    done
+}
+
+cmd_stop() {
+    for p in "$AP_PROFILE" "$HOTSPOT_PROFILE"; do
+        if profile_active "$p"; then
+            log "bringing down $p"
+            $NM con down "$p"
+        fi
+    done
+    local home
+    home=$(home_profile)
+    if [ -n "$home" ]; then
+        log "reconnecting home WiFi profile '$home'"
+        $NM con up "$home"
+    else
+        log "no home WiFi profile found — connect manually with: nmcli dev wifi connect <ssid>"
+    fi
+}
+
+case "${1:-}" in
+    ap)     cmd_ap ;;
+    follow) cmd_follow ;;
+    stop)   cmd_stop ;;
+    *)      echo "usage: $0 {ap|follow|stop}" >&2; exit 2 ;;
+esac

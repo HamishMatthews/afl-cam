@@ -123,6 +123,118 @@ static void write_preview(const char *preview_path, const void *jpeg, size_t siz
         rename(tmp, preview_path);
 }
 
+/* ---- downscaled JPEG preview snapshots (MPP jpegenc, MAIN THREAD only) ----
+ * Called from the pairing loop with the decoded NV12 pointers; box-downscale
+ * to ~960x540 + hardware JPEG-encode every AFL_CAM_PREVIEW_SECS. jpegenc
+ * lives on the main thread — never on a worker or capture thread. */
+typedef struct {
+    MppCtx ctx;
+    MppApi *mpi;
+    MppBufferGroup grp;
+    MppBuffer in_buf;
+    MppBuffer out_buf;
+    MppFrame in_frame;
+    RK_U32 w, h, hstride, vstride;
+    int ok;
+} snap_t;
+
+static int snap_init(snap_t *s, int w, int h)
+{
+    memset(s, 0, sizeof *s);
+    s->w = w; s->h = h;
+    s->hstride = MPP_ALIGN(w, 16);
+    s->vstride = MPP_ALIGN(h, 16);
+    if (mpp_create(&s->ctx, &s->mpi)) return -1;
+    if (mpp_init(s->ctx, MPP_CTX_ENC, MPP_VIDEO_CodingMJPEG)) return -1;
+    MppEncCfg cfg = NULL;
+    mpp_enc_cfg_init(&cfg);
+    mpp_enc_cfg_set_s32(cfg, "prep:width", (RK_S32)s->w);
+    mpp_enc_cfg_set_s32(cfg, "prep:height", (RK_S32)s->h);
+    mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", (RK_S32)s->hstride);
+    mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", (RK_S32)s->vstride);
+    mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
+    mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingMJPEG);
+    mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor", 80);
+    if (s->mpi->control(s->ctx, MPP_ENC_SET_CFG, cfg)) return -1;
+    if (mpp_buffer_group_get_internal(&s->grp, MPP_BUFFER_TYPE_DRM)) return -1;
+    if (mpp_buffer_group_limit_config(s->grp, s->hstride * s->vstride * 2, 4)) return -1;
+    if (mpp_buffer_get(s->grp, &s->in_buf, s->hstride * s->vstride * 3 / 2)) return -1;
+    if (mpp_buffer_get(s->grp, &s->out_buf, s->hstride * s->vstride * 2)) return -1;
+    mpp_frame_init(&s->in_frame);
+    mpp_frame_set_width(s->in_frame, s->w);
+    mpp_frame_set_height(s->in_frame, s->h);
+    mpp_frame_set_hor_stride(s->in_frame, s->hstride);
+    mpp_frame_set_ver_stride(s->in_frame, s->vstride);
+    mpp_frame_set_fmt(s->in_frame, MPP_FMT_YUV420SP);
+    mpp_frame_set_buffer(s->in_frame, s->in_buf);
+    s->ok = 1;
+    return 0;
+}
+
+static void snap_write(snap_t *s, const RK_U8 *nv12, RK_U32 sw, RK_U32 sh,
+                       RK_U32 shstride, RK_U32 svstride, const char *path)
+{
+    if (!s->ok || !nv12)
+        return;
+    RK_U8 *dst = (RK_U8 *)mpp_buffer_get_ptr(s->in_buf);
+    const RK_U8 *srcUV = nv12 + (size_t)svstride * sh;
+
+    /* box-downscale Y (any src/dst ratio) */
+    for (RK_U32 oy = 0; oy < s->h; oy++) {
+        RK_U32 y0 = oy * sh / s->h, y1 = (oy + 1) * sh / s->h;
+        if (y1 <= y0) y1 = y0 + 1;
+        RK_U8 *row = dst + oy * s->hstride;
+        for (RK_U32 ox = 0; ox < s->w; ox++) {
+            RK_U32 x0 = ox * sw / s->w, x1 = (ox + 1) * sw / s->w;
+            if (x1 <= x0) x1 = x0 + 1;
+            RK_U32 acc = 0;
+            for (RK_U32 y = y0; y < y1; y++)
+                for (RK_U32 x = x0; x < x1; x++)
+                    acc += nv12[y * shstride + x];
+            row[ox] = (RK_U8)(acc / ((y1 - y0) * (x1 - x0)));
+        }
+    }
+    /* chroma: src NV12-interleaved at sw/2 x sh/2; dst at s->w/2 x s->h/2 */
+    RK_U8 *dstUV = dst + s->hstride * s->vstride;
+    for (RK_U32 oy = 0; oy < s->h / 2; oy++) {
+        RK_U32 y0 = oy * (sh / 2) / (s->h / 2), y1 = (oy + 1) * (sh / 2) / (s->h / 2);
+        if (y1 <= y0) y1 = y0 + 1;
+        for (RK_U32 ox = 0; ox < s->w / 2; ox++) {
+            RK_U32 x0 = ox * (sw / 2) / (s->w / 2), x1 = (ox + 1) * (sw / 2) / (s->w / 2);
+            if (x1 <= x0) x1 = x0 + 1;
+            RK_U32 accU = 0, accV = 0;
+            for (RK_U32 y = y0; y < y1; y++)
+                for (RK_U32 x = x0; x < x1; x++) {
+                    accU += srcUV[y * shstride + x * 2];
+                    accV += srcUV[y * shstride + x * 2 + 1];
+                }
+            dstUV[(oy * (s->w / 2) + ox) * 2] = (RK_U8)(accU / ((y1 - y0) * (x1 - x0)));
+            dstUV[(oy * (s->w / 2) + ox) * 2 + 1] = (RK_U8)(accV / ((y1 - y0) * (x1 - x0)));
+        }
+    }
+
+    MppPacket enc_pkt = NULL;
+    mpp_packet_init_with_buffer(&enc_pkt, s->out_buf);
+    mpp_packet_set_length(enc_pkt, 0);
+    {
+        MppMeta m = mpp_frame_get_meta(s->in_frame);
+        if (m)
+            mpp_meta_set_packet(m, KEY_OUTPUT_PACKET, enc_pkt);
+    }
+    mpp_packet_deinit(&enc_pkt);
+
+    if (s->mpi->encode_put_frame(s->ctx, s->in_frame))
+        return;
+    MppPacket pkt = NULL;
+    if (s->mpi->encode_get_packet(s->ctx, &pkt) || !pkt)
+        return;
+    void *ptr = mpp_packet_get_pos(pkt);
+    size_t len = mpp_packet_get_length(pkt);
+    if (ptr && len)
+        write_preview(path, ptr, len);
+    mpp_packet_deinit(&pkt);
+}
+
 /* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
  * for the auto-settle-then-lock exposure loop (copied from cam2h264.c). */
 static double frame_luma(MppFrame frame)
@@ -1200,12 +1312,6 @@ static void *capture_thread(void *arg) {
                          vbuf.timestamp.tv_usec;
         size_t jpeg_size = vbuf.bytesused;
 
-        /* live-preview snapshot: raw JPEG payload straight to disk */
-        if (now_us() - c->last_snap >= c->snap_interval_us) {
-            write_preview(c->preview_path, c->bufs[vbuf.index].start, jpeg_size);
-            c->last_snap = now_us();
-        }
-
         MppBuffer dec_in_buf = NULL;
         MppPacket dec_pkt = NULL;
         RK_S32 r = mpp_buffer_get(c->pkt_grp, &dec_in_buf, jpeg_size);
@@ -1387,7 +1493,7 @@ int main(int argc, char **argv) {
                 snprintf(c->preview_path, sizeof c->preview_path,
                          "cam%d_preview.jpg", i);
         }
-        c->snap_interval_us = 2 * 1000000LL;
+        c->snap_interval_us = 200000LL;   /* 5 fps; tune with AFL_CAM_PREVIEW_SECS */
         if (getenv("AFL_CAM_PREVIEW_SECS"))
             c->snap_interval_us =
                 (int64_t)(atof(getenv("AFL_CAM_PREVIEW_SECS")) * 1e6);
@@ -1400,12 +1506,26 @@ int main(int argc, char **argv) {
     }
     cma_print("after cameras");
 
+    /* preview snapshot encoders (MPP jpegenc, main thread only) */
+    snap_t snaps[2];
+    {
+        int pv_w = 960, pv_h = 540;
+        if (getenv("AFL_CAM_PREVIEW_WIDTH")) pv_w = atoi(getenv("AFL_CAM_PREVIEW_WIDTH"));
+        if (getenv("AFL_CAM_PREVIEW_HEIGHT")) pv_h = atoi(getenv("AFL_CAM_PREVIEW_HEIGHT"));
+        for (int i = 0; i < 2; i++)
+            if (snap_init(&snaps[i], pv_w, pv_h))
+                fprintf(stderr, "preview: jpegenc init failed — no snapshots\n");
+    }
+
     /* ---- encoder (composite canvas) ---- */
     MppCtx enc_ctx = NULL;
     MppApi *enc_mpi = NULL;
     ret = mpp_create(&enc_ctx, &enc_mpi);
     if (ret) { fprintf(stderr, "mpp_create enc failed\n"); return 1; }
-    ret = mpp_init(enc_ctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC);
+    /* Codec: HEVC default (see cam2h264 --bench); H.264 via AFL_CAM_CODEC=h264 */
+    int use_hevc = !(getenv("AFL_CAM_CODEC") && !strcmp(getenv("AFL_CAM_CODEC"), "h264"));
+    ret = mpp_init(enc_ctx, MPP_CTX_ENC,
+                   use_hevc ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC);
     if (ret) { fprintf(stderr, "mpp_init enc failed\n"); return 1; }
     MppEncCfg enc_cfg = NULL;
     mpp_enc_cfg_init(&enc_cfg);
@@ -1414,9 +1534,8 @@ int main(int argc, char **argv) {
     RK_U32 evs = MPP_ALIGN(g.canvas_h, 16);
     {
         /* Encode bitrate (kbps). The 5304-wide composite canvas holds 2.3x
-         * a 4K frame's pixels; 30 Mbps starved it. Default 60 Mbps, tune
-         * with AFL_CAM_STITCH_BITRATE_KBPS. */
-        RK_S32 bps = 60000;
+         * a 4K frame's pixels; tune with AFL_CAM_STITCH_BITRATE_KBPS. */
+        RK_S32 bps = 80000;
         if (getenv("AFL_CAM_STITCH_BITRATE_KBPS"))
             bps = atoi(getenv("AFL_CAM_STITCH_BITRATE_KBPS"));
         const char *keys[8] = { "prep:width", "prep:height", "prep:hor_stride",
@@ -1427,6 +1546,8 @@ int main(int argc, char **argv) {
                            bps * 1000, (RK_S32)(bps * 950L), (RK_S32)(bps * 1050L) };
         for (int i = 0; i < 8; i++)
             mpp_enc_cfg_set_s32(enc_cfg, keys[i], vals[i]);
+        mpp_enc_cfg_set_s32(enc_cfg, "codec:type",
+                            use_hevc ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:gop", fps);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_in_flex", 0);
@@ -1435,10 +1556,12 @@ int main(int argc, char **argv) {
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_flex", 0);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_num", fps);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_denorm", 1);
-        mpp_enc_cfg_set_s32(enc_cfg, "h264:profile", 100);
-        mpp_enc_cfg_set_s32(enc_cfg, "h264:level", 52);
-        mpp_enc_cfg_set_s32(enc_cfg, "h264:cabac_en", 1);
-        mpp_enc_cfg_set_s32(enc_cfg, "h264:trans8x8", 1);
+        if (!use_hevc) {
+            mpp_enc_cfg_set_s32(enc_cfg, "h264:profile", 100);
+            mpp_enc_cfg_set_s32(enc_cfg, "h264:level", 52);
+            mpp_enc_cfg_set_s32(enc_cfg, "h264:cabac_en", 1);
+            mpp_enc_cfg_set_s32(enc_cfg, "h264:trans8x8", 1);
+        }
     }
     ret = enc_mpi->control(enc_ctx, MPP_ENC_SET_CFG, enc_cfg);
     if (ret) { fprintf(stderr, "enc set cfg failed %d\n", ret); return 1; }
@@ -1625,6 +1748,22 @@ int main(int argc, char **argv) {
         /* DMA-written memory via a cached alias: invalidate before reads */
         mpp_buffer_sync_ro_begin(cams[0].ring.slots[f0_idx].buf);
         mpp_buffer_sync_ro_begin(cams[1].ring.slots[pair_idx].buf);
+
+        /* live-preview snapshots from the paired NV12 (main thread, ~1-3 ms
+         * every 0.5 s each) */
+        if (now_us() - cams[0].last_snap >= cams[0].snap_interval_us) {
+            snap_write(&snaps[0], y0_ptr, cams[0].width, cams[0].height,
+                       mpp_frame_get_hor_stride(f0), mpp_frame_get_ver_stride(f0),
+                       cams[0].preview_path);
+            cams[0].last_snap = now_us();
+        }
+        if (now_us() - cams[1].last_snap >= cams[1].snap_interval_us) {
+            MppFrame f1 = cams[1].ring.slots[pair_idx].frame;
+            snap_write(&snaps[1], y1_ptr, cams[1].width, cams[1].height,
+                       mpp_frame_get_hor_stride(f1), mpp_frame_get_ver_stride(f1),
+                       cams[1].preview_path);
+            cams[1].last_snap = now_us();
+        }
 
         if (nogpu) {
             /* diagnostic: straight to the worker as a grey frame */

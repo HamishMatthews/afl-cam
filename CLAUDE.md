@@ -17,6 +17,11 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - Recordings: `outputs/<session>/` + `recordings.db` (WAL). Commit & push to
   GitHub (`origin`, branch `rk3588-native-recording`) when done — that's the
   standing instruction.
+- Field remote (iPhone): the UI runs `afl_cam/remote.py` (stdlib HTTP server
+  on 0.0.0.0:8080). Field networks: `scripts/field_wifi.sh ap` (board AP
+  `afl-cam`/`aflcam2026`, iPhone opens http://10.42.0.1:8080/) or
+  `field_wifi.sh follow` (join the iPhone's hotspot), `field_wifi.sh stop` to
+  restore home WiFi. NM profile `afl-cam-ap` is pre-created.
 
 ## Key files
 
@@ -79,8 +84,15 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - **NVMe**: root disk (Samsung 980) overheats → PCIe link drop → ext4 errors →
   black screen. `pcie_aspm=off nvme_core.default_ps_max_latency_us=0` are in
   `/boot/armbianEnv.txt`; the drive STILL needs a heatsink (hwmon7 crit
-  84850 m°C). Journald loses the crashed boot's logs (persistent journal at
-  `/var/log.hdd/journal`).
+  84850 m°C). The journal IS persistent now (2026-09-07): Storage=persistent
+  + `armbian-ramlog` patched to bind-mount `/var/log.hdd/journal` onto
+  `/var/log/journal` (journald ignores symlinked journal dirs, and only opens
+  the system journal after a flush request — `journalctl --flush`).
+- **Crashes (2026-09-07)**: two hard lockups (black screen → 22 s hardware
+  watchdog reboot, ~20:57 and ~21:42) BOTH while the rkvenc encoders were
+  under load — bench runs and recorder smoke tests. Temps were fine both
+  times; no panic in the (now persistent) journal. Prime suspect: power
+  supply sag under VPU load. Watch for this pattern in the field.
 
 ## Current state (2026-09-06)
 
@@ -90,21 +102,27 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   median (was 13–70 px before the canvas-space refinement). Near-field grass
   (~19 px bottom band) is genuine parallax — physics, not a bug.
 - Re-align button works end-to-end and streams logs; dump writes are atomic.
-- Live preview while recording (2026-09-06): the recorders write raw-JPEG
-  snapshots to `<session>/camN_preview.jpg` every `AFL_CAM_PREVIEW_SECS`
-  (default 2 s, atomic tmp+rename); the UI polls them at 1 Hz and shows them
-  in the preview panels (`recording — live preview` status).
-- Encode bitrate defaults (2026-09-06): 45 Mbps per camera, 60 Mbps for the
-  stitched canvas (was 20/30 — the ~125 Mbps UVC MJPEG source was starved).
-  Tune with `AFL_CAM_BITRATE_KBPS` / `AFL_CAM_STITCH_BITRATE_KBPS` (engine
-  sets these for spawned recorders from `config.py`). CBR scales with actual
-  fps, so dim-light ~20 fps recordings undershoot the target proportionally.
+- Live preview while recording (2026-09-07): the recorders box-downscale the
+  decoded NV12 to 960×540 and MPP-jpegenc it (main thread only) to
+  `<session>/camN_preview.jpg` every `AFL_CAM_PREVIEW_SECS` (default 0.2 s =
+  5 fps, atomic tmp+rename); the UI polls at 200 ms and the field-remote
+  page polls over HTTP. 10 fps is one env var away; true smooth preview
+  would need a second low-res MPP encode + HLS (phase 3, not built).
+- Encode defaults (2026-09-07): **HEVC** 60 Mbps per camera, 80 Mbps for the
+  stitched canvas (`AFL_CAM_CODEC=h264` to revert; measured via `cam2h264
+  --bench` — dual-concurrent 4K30 HEVC@60M sustains ~49 fps each on the
+  single rkvenc core, HEVC is faster than H.264 at the canvas size). CBR
+  scales with actual fps, so dim-light ~20 fps recordings undershoot the
+  target proportionally.
+- Field remote (2026-09-07): `afl_cam/remote.py` + `afl_cam/remote/index.html`
+  — iPhone control (toggle/mode/res/duration/realign/swap) + 5 fps preview
+  polling; actions cross to the GTK thread via a queue. Untested end-to-end
+  with the real UI (standalone server tests pass).
 - Pending: outdoor bright-daylight 30 fps verification; NVMe heatsink;
   gnome-shell burns ~385% CPU (software-rendered desktop — consider a lighter
   session); GPU governor persistence (user decision); the UI's
   `recordings not saving` report from 2026-09-06 may need reproducing;
-  iPhone control/preview (board has onboard WiFi 6E AP6611 — the plan is
-  board-as-AP + tiny web server + Safari snapshot polling, see below).
+  bcmdhd AP mode needs the 10-minute desk test (`field_wifi.sh ap` + iPhone).
 
 ## More context
 

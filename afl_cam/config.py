@@ -99,15 +99,22 @@ NATIVE_RECORDER_SRC = ROOT_DIR / "afl_cam" / "native" / "cam2h264.c"
 NATIVE_RECORDER_BIN = ROOT_DIR / "afl_cam" / "native" / "cam2h264"
 NATIVE_CODEC = "H264"
 NATIVE_CONTAINER = "mp4"
-# rkvenc CBR targets (kbps). The 4K30 UVC source MJPEG runs ~125 Mbps, so
-# 20 Mbps starved grass/detail. 45 Mbps per camera and 60 Mbps for the
-# 5304-wide stitched canvas are the quality/file-size sweet spots
-# (~20 GB/hr per camera at 45 Mbps). Tune via env or here.
-NATIVE_BITRATE_KBPS = int(os.environ.get("AFL_CAM_BITRATE_KBPS", "45000"))
-STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "60000"))
-# The native recorders write a raw-JPEG snapshot to <session>/camN_preview.jpg
-# this often; the UI polls those files for a live preview while recording.
-PREVIEW_INTERVAL_SECS = float(os.environ.get("AFL_CAM_PREVIEW_SECS", "2"))
+# rkvenc encode settings. Codec: HEVC default — measured (cam2h264 --bench)
+# same-or-better throughput than H.264 on this silicon, ~2x quality per bit,
+# and dual-concurrent 4K30 HEVC@60M sustains ~49 fps each (1.6x headroom).
+# H.264 via AFL_CAM_CODEC=h264 (drop bitrate to ~45M — 60M H.264 is marginal).
+# Bitrate: the 4K30 UVC source MJPEG runs ~125 Mbps; 60/80 Mbps HEVC ≈
+# 90/120 Mbps H.264 quality (~27 GB/hr per camera at 60 Mbps — the NVMe has
+# ~875 GB free). Tune via env or here.
+ENCODE_CODEC = os.environ.get("AFL_CAM_CODEC", "hevc")   # "hevc" | "h264"
+NATIVE_BITRATE_KBPS = int(os.environ.get("AFL_CAM_BITRATE_KBPS", "60000"))
+STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "80000"))
+# The native recorders downscale decoded NV12 and MPP-jpegenc it to
+# <session>/camN_preview.jpg this often; the UI (and the field-remote web
+# page) poll those files for a live preview while recording.
+PREVIEW_INTERVAL_SECS = float(os.environ.get("AFL_CAM_PREVIEW_SECS", "0.2"))
+PREVIEW_SNAP_WIDTH = int(os.environ.get("AFL_CAM_PREVIEW_WIDTH", "960"))
+PREVIEW_SNAP_HEIGHT = int(os.environ.get("AFL_CAM_PREVIEW_HEIGHT", "540"))
 
 # Exposure for the MPP recorder: 0 = auto-settle-then-lock (the recorder
 # matches the auto exposure's brightness with a locked manual value after
