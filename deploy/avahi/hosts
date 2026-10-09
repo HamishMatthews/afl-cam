@@ -1,0 +1,4 @@
+# avahi static hostname entries — published over mDNS by avahi-daemon.
+# aflcam.local = the rig on its own AP (the fixed shared-mode address).
+# At home the board keeps its regular name orangepi5-max.local.
+10.42.0.1 aflcam.local

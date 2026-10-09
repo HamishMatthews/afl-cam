@@ -1,0 +1,11 @@
+[Unit]
+Description=Pin the Mali GPU governor to performance (afl-cam stitch capacity)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo performance > /sys/class/devfreq/fb000000.gpu/governor 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

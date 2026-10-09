@@ -1,0 +1,13 @@
+<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+
+<!-- aflcam.local mDNS alias: the phone opens http://aflcam.local/ instead
+     of remembering 10.42.0.1 (Safari resolves .local natively). Published
+     alongside the real hostname; installed by scripts/install_field_services.sh -->
+<service-group>
+  <name replace-wildcards="yes">aflcam</name>
+  <service>
+    <type>_http._tcp</type>
+    <port>80</port>
+  </service>
+</service-group>

@@ -24,13 +24,17 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   GitHub (`origin`, branch `rk3588-native-recording`) when done — that's the
   standing instruction.
 - Field remote (iPhone): primary = the afl-camd daemon (port 80, web UI +
-  WHEP/HLS preview via MediaMTX on :8889/:8888). The GTK UI's remote page
-  (`afl_cam/remote.py`, port 8080) is the fallback when the UI runs.
-  Field networks: `scripts/field_wifi.sh ap` (board AP
-  `afl-cam`/`aflcam2026`, iPhone opens http://10.42.0.1/) or
-  `field_wifi.sh follow` (join the iPhone's hotspot), `field_wifi.sh stop` to
-  restore home WiFi. NM profile `afl-cam-ap` is pre-created. iPhone desk
-  test checklist: `field_desk_test.md` (NOT yet run with a real iPhone).
+  WHEP/HLS preview via MediaMTX on :8889/:8888). **Productionised
+  (2026-10-09): `scripts/install_field_services.sh` enables systemd units
+  (mediamtx, afl-camd, gpu-governor) + the aflcam.local mDNS alias, and
+  the afl-cam-ap NM profile autoconnects at priority -999 — at the ground
+  the AP comes up by itself on boot (home WiFi wins at home). Field flow:
+  power on → phone joins `afl-cam`/`aflcam2026` → http://aflcam.local/.**
+  `scripts/field_wifi.sh ap|follow|stop` switches modes manually. The GTK
+  UI's remote page (`afl_cam/remote.py`, port 8080) is the fallback when
+  the UI runs — stop the daemon first (`systemctl stop afl-camd`; daemon
+  and UI can't share the cameras). iPhone desk test checklist:
+  `field_desk_test.md` (NOT yet run with a real iPhone).
 
 ## Key files
 
@@ -154,8 +158,14 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   times; no panic in the (now persistent) journal. Prime suspect: power
   supply sag under VPU load. Watch for this pattern in the field.
 
-## Current state (2026-10-09)
+## Current state (2026-10-09, evening update)
 
+- **The rig is productionised**: systemd units enabled for mediamtx +
+  afl-camd + gpu-governor (performance at boot), aflcam.local mDNS alias
+  published (verified answering A queries with 10.42.0.1), AP profile
+  autoconnects at the ground. Power on → phone joins `afl-cam` → opens
+  http://aflcam.local/. The daemon holds the cameras only when a phone is
+  connected (idle closes them after AFL_CAM_IDLE_SECS).
 - **afl-camd field daemon built and verified end-to-end from a laptop**
   (iphone-control-plan.md build order steps 2–6): cam2stitch daemon mode
   (standby/record toggle + ctl socket + stitched H.264 preview + proxy),
@@ -169,8 +179,9 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   `field_desk_test.md` and run it before game day.**
 - The GTK UI path is unchanged and still works (legacy-mode regression
   run: 199/197 frames encoded, clean mux). UI + daemon are mutually
-  exclusive — the daemon must be stopped (`systemctl stop afl-camd`) to
-  run the UI with cameras.
+  exclusive — `systemctl stop afl-camd` to run the UI with cameras; a
+  daemon wake attempt while the UI owns the cameras fails cleanly
+  (error banner + retry), it does not steal them.
 - Master encode capacity note: at 80 Mbps HEVC the full canvas sustains
   roughly the sensor rate in dim scenes (~13–20 fps); at brighter light
   (~24–34 fps input) the encoder drops frames when input exceeds its
@@ -200,11 +211,8 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   with the real UI (standalone server tests pass).
 - Pending: the `field_desk_test.md` iPhone run; outdoor bright-daylight
   30 fps verification; NVMe heatsink; gnome-shell burns ~385% CPU
-  (software-rendered desktop — consider a lighter session); GPU governor
-  persistence (user decision); the UI's `recordings not saving` report
-  from 2026-09-06 may need reproducing; MediaMTX/afl-camd systemd units
-  written but the install step still needs running
-  (`scripts/install_field_services.sh` — needs sudo).
+  (software-rendered desktop — consider a lighter session); the UI's
+  `recordings not saving` report from 2026-09-06 may need reproducing.
 
 ## More context
 

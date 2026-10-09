@@ -9,14 +9,17 @@ can settle.
 
 ## 1. Join and stay joined (do this first)
 
-```bash
-scripts/field_wifi.sh ap
-```
+The rig is productionised: `scripts/install_field_services.sh` runs once,
+and from then on **power on → wait ~40 s → the phone does everything**.
+At the ground the board's AP comes up by itself (the home WiFi is out of
+range); at home the board joins the house WiFi instead and the same page
+works at http://orangepi5-max.local/. (To switch modes by hand:
+`scripts/field_wifi.sh ap` / `follow` / `stop`.)
 
 - iPhone: join WiFi `afl-cam` (password `aflcam2026`).
-- Open `http://10.42.0.1/` — the afl-cam page should come up, the chip
-  should go `starting` → `standby`, and the preview should start within
-  ~10 s (WHEP, or HLS after the 3 s fallback).
+- Open `http://aflcam.local/` (or `http://10.42.0.1/`) — the afl-cam page
+  should come up, the chip should go `starting` → `standby`, and the
+  preview should start within ~10 s (WHEP, or HLS after the 3 s fallback).
 - Leave the phone on the page for 30+ minutes. The page must stay live
   (status ticking, preview frames) — this catches AP-side disconnects.
 - iOS may show "No Internet Connection" under the WiFi name. Expected —

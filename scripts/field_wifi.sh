@@ -6,9 +6,11 @@
 #
 #   field_wifi.sh ap      — board becomes its own access point.
 #                           iPhone: join WiFi "afl-cam" (password aflcam2026),
-#                           open http://10.42.0.1/ in Safari.
-#                           (Profile afl-cam-ap, autoconnects on boot at
-#                           priority -999 — the home WiFi wins at home.)
+#                           open http://aflcam.local/ (or http://10.42.0.1/).
+#                           NOTE: at the ground the AP comes up BY ITSELF on
+#                           boot (profile afl-cam-ap, autoconnect priority
+#                           -999 — the home WiFi wins at home); this command
+#                           is only for switching modes manually.
 #
 #   field_wifi.sh follow  — board hunts for the iPhone's Personal Hotspot and
 #                           joins it (for when the phone is already sharing).
@@ -57,11 +59,9 @@ home_profile() {
 cmd_ap() {
     log "activating board AP '$AP_PROFILE' (SSID afl-cam / aflcam2026)..."
     $NM con up "$AP_PROFILE" || { log "failed to bring up $AP_PROFILE"; exit 1; }
-    local ip
-    ip=$(board_ip)
-    log "AP is up. Board IP: ${ip:-10.42.0.1}"
+    log "AP is up."
     log "On the iPhone: join WiFi 'afl-cam' (password aflcam2026),"
-    log "then open http://10.42.0.1/ (or http://orangepi5-max.local/)"
+    log "then open http://aflcam.local/ (or http://10.42.0.1/)"
 }
 
 cmd_follow() {
