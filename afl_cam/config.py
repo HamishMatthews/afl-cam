@@ -61,8 +61,11 @@ def _discover_cameras():
         found = {}
         for node in sorted(os.listdir("/sys/class/video4linux")):
             link = os.readlink(f"/sys/class/video4linux/{node}")
+            # The controller segment IMMEDIATELY before /usbN/: an xhci path
+            # carries an extra segment (.../fc000000.usb/xhci-hcd.11.auto/
+            # usb1/...), so capture whichever lands right before the bus.
             m = re.search(
-                r"platform/(?:[^/]*/)?([0-9a-f]+\.usb|xhci-hcd\.\d+\.auto)"
+                r"/(xhci-hcd\.\d+\.auto|[0-9a-f]+\.usb)"
                 r"/usb\d+/(\d+(?:-\d+)*)/", link)
             if not m:
                 continue
