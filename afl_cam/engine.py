@@ -283,28 +283,8 @@ def is_rockchip() -> bool:
 
 def ensure_cam2stitch() -> Optional[Path]:
     """Compile the live-stitch recorder if missing or stale."""
-    import subprocess
-
-    from .config import STITCH_RECORDER_BIN, STITCH_RECORDER_SRC
-
-    if STITCH_RECORDER_BIN.exists() and STITCH_RECORDER_SRC.exists() and \
-            STITCH_RECORDER_BIN.stat().st_mtime >= STITCH_RECORDER_SRC.stat().st_mtime:
-        return STITCH_RECORDER_BIN
-
-    cmd = [
-        "gcc", "-O2", "-I/usr/local/include/rockchip",
-        "-o", str(STITCH_RECORDER_BIN), str(STITCH_RECORDER_SRC),
-        "-L/usr/local/lib", "-lrockchip_mpp", "-lvulkan", "-lpthread",
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.error("cam2stitch build failed: %s", e)
-        return None
-    if result.returncode != 0:
-        log.error("cam2stitch build failed: %s", result.stderr.strip()[-400:])
-        return None
-    return STITCH_RECORDER_BIN
+    from .config import build_cam2stitch
+    return build_cam2stitch()
 
 
 def can_live_stitch() -> bool:
@@ -488,7 +468,7 @@ class CameraRecorderMPP:
         from afl_cam.retime import mux_with_pts_rate
 
         if mux_with_pts_rate(raw, out.with_suffix(".pts"), out,
-                             fallback_fps=30.0):
+                             fallback_fps=30.0, codec=ENCODE_CODEC):
             raw.unlink(missing_ok=True)
             return True
         import subprocess

@@ -1,0 +1,17 @@
+[Unit]
+Description=afl-cam preview server (MediaMTX: RTSP in, WHEP/HLS out)
+Documentation=https://github.com/bluenviron/mediamtx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
+Restart=on-failure
+RestartSec=2
+# Streaming is lossless re-muxing; keep it out of the way of cam2stitch
+Nice=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

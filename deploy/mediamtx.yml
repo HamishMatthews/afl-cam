@@ -1,0 +1,34 @@
+# afl-cam preview server — MediaMTX config (iphone-control-plan.md §4).
+#
+# One path: `preview`. cam2stitch encodes a stitched H.264 preview
+# (~1600x572 CBR 3.5 Mbps, GOP 1s) and sends it as Annex-B over UDP to
+# 127.0.0.1:8890; the afl-camd daemon runs a supervised ffmpeg that picks
+# it up (`-c copy`) and publishes RTSP to rtsp://127.0.0.1:8554/preview.
+# The phone then gets:
+#   WebRTC/WHEP  http://<board>:8889/preview/whep      (~150-300 ms)
+#   HLS fallback http://<board>:8888/preview/index.m3u8 (seconds)
+# Nothing streams over WiFi unless a phone is actually watching.
+#
+# Installed by scripts/install_field_services.sh to /usr/local/etc/mediamtx.yml
+
+logLevel: info
+logDestinations: [stdout]
+
+rtsp: yes
+rtspAddress: :8554
+
+rtmp: no
+srt: no
+api: no
+
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigin: '*'
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcAllowOrigin: '*'
+
+paths:
+  preview:
+    # Published via RTSP by the daemon's ffmpeg; readers attach on demand.

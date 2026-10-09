@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="afl-cam">
+<title>afl-cam</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1f2630; --ink: #e6edf3;
+    --dim: #8b949e; --line: #30363d; --red: #f85149; --green: #3fb950;
+    --amber: #d29922; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding-bottom: calc(24px + env(safe-area-inset-bottom));
+  }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .03em; }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+  }
+  .state-chip {
+    margin-left: auto; font-size: 12px; font-weight: 600; padding: 3px 10px;
+    border-radius: 999px; border: 1px solid var(--line); color: var(--dim);
+    text-transform: uppercase; letter-spacing: .05em;
+  }
+  .state-recording { color: #fff; background: var(--red); border-color: var(--red); }
+  .state-finalizing { color: #000; background: var(--amber); border-color: var(--amber); }
+  .state-error { color: #fff; background: #b62324; border-color: #b62324; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .65; } }
+
+  #banner {
+    display: none; background: #3d1515; color: #ffd7d5; border-bottom: 1px solid #7f1d1d;
+    padding: 10px 16px; font-size: 14px;
+  }
+
+  main { max-width: 860px; margin: 0 auto; padding: 12px 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 12px; }
+
+  /* ---- record block ---- */
+  #rec { padding: 16px; text-align: center; }
+  #elapsed { font-variant-numeric: tabular-nums; font-size: 44px; font-weight: 700; margin: 4px 0 12px; }
+  #recBtn {
+    width: 100%; max-width: 340px; padding: 18px 0; font-size: 22px; font-weight: 700;
+    border-radius: 999px; border: none; color: #fff; background: var(--red);
+    letter-spacing: .04em;
+  }
+  #recBtn.stop { background: #b62324; }
+  #recBtn:disabled { opacity: .5; }
+  #hint { margin-top: 10px; color: var(--dim); font-size: 13px; }
+
+  /* ---- stats ---- */
+  #stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+  .stat { padding: 12px; border-right: 1px solid var(--line); text-align: center; }
+  .stat:last-child { border-right: none; }
+  .stat .v { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  .warn .v { color: var(--amber); }
+
+  /* ---- preview ---- */
+  #preview { position: relative; background: #000; border-radius: 12px; overflow: hidden; }
+  #vid { display: block; width: 100%; aspect-ratio: 2.8 / 1; background: #000; }
+  #preview-state {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--dim); font-size: 14px; text-align: center; padding: 0 24px;
+  }
+  #guide { position: absolute; top: 8%; height: 84%; left: 50%; width: 1px; background: rgba(255,255,255,.35); }
+  #guide::before { content: "seam"; position: absolute; top: -14px; left: -14px; font-size: 9px; color: rgba(255,255,255,.5); }
+
+  /* ---- schedule ---- */
+  #sched { padding: 12px 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #sched label { color: var(--dim); font-size: 13px; }
+  #sched input {
+    background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font-size: 15px; color-scheme: dark;
+  }
+  .mini-btn {
+    background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 14px; font-size: 14px;
+  }
+  .mini-btn.danger { color: #ffa198; border-color: #7f1d1d; }
+  #sched-status { color: var(--green); font-size: 13px; }
+
+  /* ---- recordings ---- */
+  #recs { padding: 12px 16px; }
+  #recs h2 { font-size: 15px; margin: 2px 0 10px; }
+  .rec {
+    display: grid; grid-template-columns: 108px 1fr auto; gap: 12px; align-items: center;
+    padding: 10px 0; border-top: 1px solid var(--line);
+  }
+  .rec .thumb { width: 108px; height: 60px; object-fit: cover; border-radius: 8px; background: #000; }
+  .rec .meta .t { font-weight: 600; font-size: 14px; }
+  .rec .meta .s { color: var(--dim); font-size: 12px; margin-top: 2px; }
+  .rec .badges { margin-top: 3px; display: flex; gap: 4px; flex-wrap: wrap; }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
+  .badge.ok { color: var(--green); border-color: var(--green); }
+  .rec .acts { display: flex; flex-direction: column; gap: 6px; }
+  .empty { color: var(--dim); text-align: center; padding: 18px 0; }
+
+  /* player modal */
+  #player {
+    position: fixed; inset: 0; background: rgba(0,0,0,.9); z-index: 10;
+    display: none; align-items: center; justify-content: center;
+  }
+  #player video { width: 100%; max-height: 100vh; }
+  #player .close { position: absolute; top: 12px; right: 16px; color: #fff; font-size: 26px; }
+
+  footer { text-align: center; color: var(--dim); font-size: 12px; padding: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>afl-cam</h1>
+  <span id="chip" class="state-chip">…</span>
+</header>
+<div id="banner"></div>
+
+<main>
+  <section id="rec">
+    <div id="elapsed">0:00:00</div>
+    <button id="recBtn" disabled>…</button>
+    <div id="hint"></div>
+  </section>
+
+  <section id="stats">
+    <div class="stat" id="st-storage"><div class="v">–</div><div class="k">minutes left</div></div>
+    <div class="stat" id="st-temp"><div class="v">–</div><div class="k">board °C</div></div>
+    <div class="stat" id="st-fps"><div class="v">–</div><div class="k">cam fps</div></div>
+    <div class="stat" id="st-skew"><div class="v">–</div><div class="k">pair skew</div></div>
+    <div class="stat" id="st-last"><div class="v">–</div><div class="k">last recording</div></div>
+  </section>
+
+  <section id="preview">
+    <video id="vid" playsinline muted autoplay></video>
+    <div id="guide"></div>
+    <div id="preview-state">preview connecting…</div>
+  </section>
+
+  <section id="sched">
+    <label>Start at</label>
+    <input type="time" id="sched-time">
+    <label>Stop after</label>
+    <input type="number" id="sched-dur" min="1" max="360" step="15" value="135" style="width:74px">
+    <label>min</label>
+    <button class="mini-btn" id="sched-set">Set schedule</button>
+    <button class="mini-btn danger" id="sched-clear">Clear</button>
+    <span id="sched-status"></span>
+  </section>
+
+  <section id="recs">
+    <h2>Recordings</h2>
+    <div id="rec-list"><div class="empty">loading…</div></div>
+  </section>
+</main>
+
+<div id="player">
+  <video controls playsinline></video>
+  <div class="close" onclick="closePlayer()">×</div>
+</div>
+
+<footer>afl-cam · join the rig's WiFi and add this page to your Home Screen</footer>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const HOST = location.hostname || location.host;
+let S = null;                  // last status snapshot
+let ws = null;
+let pc = null;                 // WHEP peer connection
+let clockPosted = false;
+let token = new URLSearchParams(location.search).get("t") || localStorage.getItem("aflToken") || "";
+if (token) localStorage.setItem("aflToken", token);
+const AUTH = token ? {"X-AFL-Token": token} : {};
+
+/* ---------- status + ws ---------- */
+function applyStatus(s) {
+  S = s;
+  const chip = $("chip");
+  chip.textContent = s.state;
+  chip.className = "state-chip" + (s.recording ? " state-recording" :
+    s.state === "finalizing" ? " state-finalizing" :
+    s.state === "error" ? " state-error" : "");
+
+  const btn = $("recBtn");
+  if (s.recording) {
+    btn.textContent = "■ STOP RECORDING";
+    btn.classList.add("stop");
+    btn.disabled = false;
+  } else {
+    btn.textContent = "● RECORD";
+    btn.classList.remove("stop");
+    btn.disabled = !(s.state === "standby" || s.state === "idle");
+  }
+  $("elapsed").textContent = s.elapsed_hms || "0:00:00";
+  $("banner").style.display = s.error ? "block" : "none";
+  $("banner").textContent = "⚠ " + s.error;
+  $("hint").textContent = s.state === "idle" ? "pipeline asleep — press RECORD (cameras take a few seconds to wake)"
+    : s.state === "starting" ? "cameras waking up…"
+    : s.state === "finalizing" ? "saving the last recording…"
+    : s.state === "standby" && !s.recording ? "standby — framing live" : "";
+
+  $("st-storage").querySelector(".v").textContent = s.storage ? s.storage.minutes_left : "–";
+  const tc = s.temp || {};
+  $("st-temp").querySelector(".v").textContent =
+    (tc.soc_c != null ? tc.soc_c + "°" : "–") + (tc.nvme_c != null ? " · " + tc.nvme_c + "°" : "");
+  $("st-temp").classList.toggle("warn", !!tc.critical);
+
+  const st = s.stitch;
+  if (st) {
+    const now = Date.now();
+    let fpsTxt = "–";
+    if (prevStitch && st.cam0.frames >= prevStitch.cam0.frames) {
+      const dt = Math.max(0.5, (now - prevStitchAt) / 1000);
+      const f0 = (st.cam0.frames - prevStitch.cam0.frames) / dt;
+      const f1 = (st.cam1.frames - prevStitch.cam1.frames) / dt;
+      fpsTxt = Math.round(f0) + " / " + Math.round(f1);
+    }
+    prevStitch = st; prevStitchAt = now;
+    $("st-fps").querySelector(".v").textContent = fpsTxt;
+    $("st-skew").querySelector(".v").textContent =
+      st.skew_avg_us >= 0 ? Math.round(st.skew_avg_us / 1000) + "ms" : "–";
+  }
+  const lr = s.last_recording;
+  $("st-last").querySelector(".v").textContent = lr ? (lr.ok ? "✓" : "✗") : "–";
+
+  // schedule display
+  if (s.schedule) {
+    const d = new Date(s.schedule.start_at);
+    $("sched-status").textContent = "set: " + d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})
+      + " +" + s.schedule.stop_after / 60 + "min";
+  } else {
+    $("sched-status").textContent = "";
+  }
+
+  // clock sync (once per page load, if the board is unsynced)
+  if (!clockPosted && s.clock && !s.clock.synced) {
+    clockPosted = true;
+    fetch("/api/time", {method:"POST", headers:{"Content-Type":"application/json", ...AUTH},
+      body: JSON.stringify({epoch_ms: Date.now()})}).catch(() => {});
+  }
+}
+let prevStitch = null, prevStitchAt = 0;
+
+function connectWS() {
+  try { ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + HOST + "/api/events"); }
+  catch (e) { ws = null; }
+  if (!ws) return;
+  ws.onmessage = ev => { try { applyStatus(JSON.parse(ev.data)); } catch (e) {} };
+  ws.onclose = () => { ws = null; setTimeout(pollFallback, 2000); };
+}
+function pollFallback() {
+  if (ws) return;
+  fetch("/api/status").then(r => r.json()).then(applyStatus).catch(() => {});
+  setTimeout(pollFallback, 2000);
+}
+
+/* ---------- preview (WHEP -> HLS fallback) ---------- */
+function startPreview() {
+  const vid = $("vid"), state = $("preview-state");
+  const hls = "http://" + HOST + ":8888/preview/index.m3u8";
+  let gotTrack = false;
+  const fallbackTimer = setTimeout(() => { if (!gotTrack) hlsFallback(); }, 3000);
+  const hlsFallback = () => {
+    if (gotTrack || !vid) return;
+    state.textContent = "WebRTC unavailable — falling back to HLS…";
+    try {
+      vid.src = hls;                       // Safari plays HLS natively
+      vid.play().catch(() => { state.textContent = "preview unavailable"; });
+      const failTimer = setTimeout(() => {
+        if (vid.readyState < 2) state.textContent = "preview stream not running — is the pipeline up?";
+      }, 8000);
+      vid.addEventListener("playing", () => { clearTimeout(failTimer); state.style.display = "none"; }, {once:true});
+    } catch (e) { state.textContent = "preview unavailable"; }
+  };
+  (async () => {
+    try {
+      const whep = "http://" + HOST + ":8889/preview/whep";
+      pc = new RTCPeerConnection({iceServers: []});
+      pc.addTransceiver("video", {direction: "recvonly"});
+      pc.ontrack = ev => {
+        gotTrack = true;
+        clearTimeout(fallbackTimer);
+        vid.srcObject = ev.streams[0];
+        vid.play().catch(() => {});
+        state.style.display = "none";
+      };
+      const offer = await (await fetch(whep)).text();
+      await pc.setRemoteDescription({type: "offer", sdp: offer});
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await fetch(whep, {method: "POST",
+        headers: {"Content-Type": "application/sdp"}, body: answer.sdp});
+      setTimeout(() => { if (!gotTrack) hlsFallback(); }, 6000);
+    } catch (e) { hlsFallback(); }
+  })();
+}
+
+/* ---------- controls ---------- */
+$("recBtn").addEventListener("click", async () => {
+  const s = S || {};
+  const action = s.recording ? "stop" : "start";
+  $("recBtn").disabled = true;
+  try {
+    const r = await fetch("/api/record/" + action, {method: "POST",
+      headers: {"Content-Type": "application/json", ...AUTH},
+      body: JSON.stringify({request_id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now())})});
+    const j = await r.json();
+    if (!j.ok) $("hint").textContent = j.error || "action failed";
+  } catch (e) { $("hint").textContent = "network error"; }
+  setTimeout(() => { if (S) applyStatus(S); }, 400);
+});
+
+$("sched-set").addEventListener("click", async () => {
+  const t = $("sched-time").value, mins = parseFloat($("sched-dur").value || "0");
+  if (!t || mins <= 0) { $("sched-status").textContent = "pick a time and duration"; return; }
+  const [hh, mm] = t.split(":").map(Number);
+  const start = new Date();
+  start.setHours(hh, mm, 0, 0);
+  if (start.getTime() <= Date.now()) start.setDate(start.getDate() + 1);
+  const r = await fetch("/api/schedule", {method: "POST",
+    headers: {"Content-Type": "application/json", ...AUTH},
+    body: JSON.stringify({start_at: start.getTime(), stop_after: mins * 60})});
+  const j = await r.json();
+  $("sched-status").textContent = j.ok ? "scheduled ✓" : (j.error || "failed");
+  $("sched-status").style.color = j.ok ? "" : "var(--red)";
+});
+$("sched-clear").addEventListener("click", async () => {
+  await fetch("/api/schedule", {method: "POST",
+    headers: {"Content-Type": "application/json", ...AUTH},
+    body: JSON.stringify({start_at: null})});
+  $("sched-status").textContent = "";
+});
+
+/* ---------- recordings ---------- */
+function fmtBytes(b) {
+  if (!b) return "?";
+  const u = ["B","KB","MB","GB"];
+  let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return b.toFixed(b >= 100 ? 0 : 1) + u[i];
+}
+function fmtDur(s) { if (s == null) return "?"; s = Math.round(s); return Math.floor(s/60) + ":" + String(s%60).padStart(2,"0"); }
+function loadRecordings() {
+  fetch("/api/recordings").then(r => r.json()).then(j => {
+    const list = $("rec-list");
+    const recs = (j.recordings || []).slice(0, 30);
+    if (!recs.length) { list.innerHTML = '<div class="empty">nothing yet — first game awaits</div>'; return; }
+    list.innerHTML = recs.map(r => `
+      <div class="rec">
+        ${r.thumb ? `<img class="thumb" src="${r.thumb}" alt="">` : '<div class="thumb"></div>'}
+        <div class="meta">
+          <div class="t">${(r.created_at || "").replace(" ", " · ")}${r.recording ? " · 🔴 LIVE" : ""}</div>
+          <div class="s">${fmtDur(r.duration_s)} min:sec · ${fmtBytes(r.size_bytes)}</div>
+          <div class="badges">
+            ${r.has_master ? '<span class="badge ok">master</span>' : '<span class="badge">master –</span>'}
+            ${r.has_proxy ? '<span class="badge ok">proxy</span>' : '<span class="badge">proxy –</span>'}
+            ${r.error ? '<span class="badge" style="color:var(--red)">error</span>' : ""}
+          </div>
+        </div>
+        <div class="acts">
+          ${r.has_proxy ? `<button class="mini-btn" onclick="play(${r.id})">Play</button>`
+                        : '<button class="mini-btn" disabled>Play</button>'}
+          ${r.has_proxy ? `<a class="mini-btn" style="text-decoration:none" href="/api/recordings/${r.id}/proxy.mp4" download>Save</a>` : ""}
+          <button class="mini-btn danger" ${r.recording ? "disabled" : ""} onclick="del(${r.id}, this)">Delete</button>
+        </div>
+      </div>`).join("");
+  }).catch(() => {});
+}
+function play(id) {
+  const p = $("player");
+  p.style.display = "flex";
+  const v = p.querySelector("video");
+  v.src = "/api/recordings/" + id + "/proxy.mp4";
+  v.play().catch(() => {});
+}
+function closePlayer() {
+  const p = $("player");
+  p.querySelector("video").pause();
+  p.querySelector("video").src = "";
+  p.style.display = "none";
+}
+async function del(id, btn) {
+  if (!confirm("Delete this recording? The master is gone too.")) return;
+  btn.disabled = true;
+  const r = await fetch("/api/recordings/" + id, {method: "DELETE", headers: AUTH});
+  const j = await r.json();
+  if (!j.ok) { alert(j.error || "delete failed"); btn.disabled = false; }
+  loadRecordings();
+}
+
+/* ---------- boot ---------- */
+applyStatus({state: "connecting", recording: false, error: null,
+  storage: {minutes_left: 0}, temp: {}, stitch: null,
+  elapsed_hms: "0:00:00", clock: {synced: true}});
+connectWS();
+pollFallback();
+startPreview();
+loadRecordings();
+setInterval(loadRecordings, 15000);
+</script>
+</body>
+</html>

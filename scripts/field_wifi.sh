@@ -6,7 +6,7 @@
 #
 #   field_wifi.sh ap      — board becomes its own access point.
 #                           iPhone: join WiFi "afl-cam" (password aflcam2026),
-#                           open http://10.42.0.1:8080/ in Safari.
+#                           open http://10.42.0.1/ in Safari.
 #                           (Profile afl-cam-ap, autoconnects on boot at
 #                           priority -999 — the home WiFi wins at home.)
 #
@@ -15,13 +15,16 @@
 #                           Usage: HOTSPOT_SSID="John's iPhone" \
 #                                  HOTSPOT_PASSWORD=secret field_wifi.sh follow
 #                           The operator browses to the board's DHCP IP on
-#                           port 8080 (printed when connected).
+#                           port 80 (printed when connected).
 #                           NOTE: iOS hotspot isolates clients, so ONLY the
 #                           phone can reach the board in this mode.
 #
 #   field_wifi.sh stop    — leave field mode, restore the home WiFi profile.
 #
-# The afl-cam web control (afl_cam/remote.py, port 8080) runs inside the UI.
+# The web control is served by the afl-camd daemon on port 80
+# (`uv run afl-cam daemon`, installed as a systemd service by
+# scripts/install_field_services.sh). The GTK UI's remote page
+# (afl_cam/remote.py, port 8080) is the alternative when the UI runs.
 
 set -u
 NM="nmcli"
@@ -58,7 +61,7 @@ cmd_ap() {
     ip=$(board_ip)
     log "AP is up. Board IP: ${ip:-10.42.0.1}"
     log "On the iPhone: join WiFi 'afl-cam' (password aflcam2026),"
-    log "then open http://10.42.0.1:8080/ (or http://orangepi5-max.local:8080/)"
+    log "then open http://10.42.0.1/ (or http://orangepi5-max.local/)"
 }
 
 cmd_follow() {
@@ -102,7 +105,7 @@ cmd_follow() {
                 local ip
                 ip=$(board_ip)
                 log "connected to the iPhone hotspot. Board IP: ${ip:-unknown}"
-                log "On the iPhone, open http://${ip:-<board-ip>}:8080/"
+                log "On the iPhone, open http://${ip:-<board-ip>}/"
                 trap - INT
                 exit 0
             fi

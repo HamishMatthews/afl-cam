@@ -8,6 +8,12 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 ## Running things
 
 - UI: `uv run afl-cam ui` (project `.venv`, py3.14, has `gi`).
+- Field daemon: `uv run afl-cam daemon` — afl-camd (iphone-control-plan.md):
+  supervises a long-running cam2stitch, serves the web UI + REST + WS API
+  (port 80, falls back to 8080; `AFL_CAM_PORT` overrides), session
+  finalize, clock sync, auto-stop, schedule, GPIO. Installed as a systemd
+  service by `scripts/install_field_services.sh` (also installs MediaMTX).
+  The daemon and the GTK UI are mutually exclusive (both want the cameras).
 - Stitcher + alignment scripts: **`/home/hamish/venvs/cv2-new/bin/python3`**
   (OpenCV 5 + PyAV 13; the project venv has no wheels for the bundle API).
 - sudo on this board: `echo 123 | sudo -S -p '' <cmd>`.
@@ -17,29 +23,51 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - Recordings: `outputs/<session>/` + `recordings.db` (WAL). Commit & push to
   GitHub (`origin`, branch `rk3588-native-recording`) when done — that's the
   standing instruction.
-- Field remote (iPhone): the UI runs `afl_cam/remote.py` (stdlib HTTP server
-  on 0.0.0.0:8080). Field networks: `scripts/field_wifi.sh ap` (board AP
-  `afl-cam`/`aflcam2026`, iPhone opens http://10.42.0.1:8080/) or
+- Field remote (iPhone): primary = the afl-camd daemon (port 80, web UI +
+  WHEP/HLS preview via MediaMTX on :8889/:8888). The GTK UI's remote page
+  (`afl_cam/remote.py`, port 8080) is the fallback when the UI runs.
+  Field networks: `scripts/field_wifi.sh ap` (board AP
+  `afl-cam`/`aflcam2026`, iPhone opens http://10.42.0.1/) or
   `field_wifi.sh follow` (join the iPhone's hotspot), `field_wifi.sh stop` to
-  restore home WiFi. NM profile `afl-cam-ap` is pre-created.
+  restore home WiFi. NM profile `afl-cam-ap` is pre-created. iPhone desk
+  test checklist: `field_desk_test.md` (NOT yet run with a real iPhone).
 
 ## Key files
 
 - `afl_cam/native/cam2stitch.c` — THE deliverable: both cameras, jpegd NV12,
   Vulkan map-texture warp (full canvas), two-thread pipeline (main = capture
   + GPU submit + encoder put/drain; worker = SSBO→encoder repack only).
+  DAEMON mode (`AFL_CAM_CTL_SOCK` set): standby until `REC_START <dir>` /
+  `REC_STOP` / `STATUS` / `QUIT` on a unix ctl socket (JSON status pushed
+  ~1/s); master encoder idles in standby (skip put/drain), stop drains the
+  encoder tail (3 quiet drains) before closing; a second rkvenc (H.264
+  Constrained Baseline 1600×564 CBR 3.5M, GOP 1s) encodes a worker-side
+  box-downscale of the canvas → UDP `AFL_CAM_PREVIEW_UDP` (SPS/PPS injected
+  before every IDR packet — rkvenc never emits parameter sets) + proxy
+  files while recording.
 - `afl_cam/native/stitch_nv12.comp` (+ `.spv`) — map-texture shader, BT.601
   limited (jpegd outputs Y 16–235 exactly, `RANGE_FULL=0`), 4-Y-bytes-per-uint
   SSBO packing.
 - `afl_cam/native/cam2h264.c` — per-camera recorder (separate mode).
+- `afl_cam/daemon.py` — afl-camd (stdlib only): supervises cam2stitch
+  (spawn/restart/adopt a live socket from a previous run/idle-close on
+  AFL_CAM_IDLE_SECS), REST + WebSocket API, web UI, finalize (master mux
+  with hvc1 tag + proxy faststart + thumbnail), phone clock sync, auto-stop
+  (temp/storage), schedule, GPIO button/LED.
+- `afl_cam/web/index.html` — the phone page: status/REC/elapsed, WHEP
+  preview with HLS fallback, schedule, recordings browser (play/save/delete).
+- `deploy/mediamtx.yml` + `deploy/systemd/*` + `scripts/install_field_services.sh`
+  — MediaMTX (:8554 RTSP in, :8889 WHEP, :8888 HLS) and afl-camd units.
 - `afl_cam/config.py` — camera discovery, `STITCH_PARAMS_DIR`
-  (`calibration/stitch_live_full`), `STITCH_CANVAS_WIDTH=5304`, Vulkan env.
+  (`calibration/stitch_live_full`), `STITCH_CANVAS_WIDTH=5304`, Vulkan env,
+  `build_cam2stitch()`/`vk_env()` helpers (stdlib, shared with the daemon).
 - `afl_cam/engine.py` — spawns recorders, `can_live_stitch()` gate.
 - `afl_cam/stitcher.py` — post-stitch engine; **uses the frozen alignment
   when `calibration/stitch_live_full/map0.bin` is non-empty**
   (`AFL_CAM_REBUNDLE=1` restores per-session bundling).
 - `afl_cam/ui.py` — GTK3 app; Re-align button streams output to the terminal.
-- `afl_cam/retime.py` — VFR→CFR remux from `.pts` sidecars (cv2-new venv).
+- `afl_cam/retime.py` — VFR→CFR remux from `.pts` sidecars; HEVC muxes are
+  tagged `hvc1` (iPhone/QuickTime refuse `hev1`).
 - `scripts/recapture_alignment.py` — re-align chain (UI button backend):
   stills → `dump_camera_params.py` (bundle) → `refine_rotation.py` →
   `dump_camera_params.py --r1` (final, atomic writes).
@@ -51,6 +79,26 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - **MPP encoder put/drain MUST run on the main thread.** Encoder calls from a
   worker thread produce intermittent phantom/corrupt packets (allocator fill
   bytes as NALs). The worker only repacks memory; the main thread submits.
+- **Daemon-mode ctl thread only parses + sets flags.** Every application
+  action in cam2stitch daemon mode (file open/close, IDR, encoder) runs on
+  the main loop; the ctl thread must never touch the encoder or files.
+  REC_STOP closes the files only after the encoder drain goes quiet (3
+  consecutive empty drains), or the tail frames are lost.
+- **rkvenc never emits SPS/PPS in-band** — `prep:header_mode` EACH_IDR is
+  silently ignored (IDRs carry SEI only), and rkvenc packs `[SEI][IDR]`
+  into ONE packet, so the packet's first NAL is type 6: any IDR test must
+  SCAN the packet for a type-5 NAL, not read the first NAL. The preview
+  encoder injects the GET_HDR_SYNC-captured SPS/PPS before every IDR on the
+  UDP path (ffmpeg's h264 demuxer refuses PPS-less streams) and writes it
+  into the proxy file on REC_START.
+- **cam2stitch status/socket pitfalls (afl-camd)**: a supervisor must
+  PROBE the ctl socket before unlinking it (unlinking a live socket orphans
+  a still-running pipeline); killing the daemon without its SIGTERM handler
+  orphans cam2stitch holding the cameras; `sqlite3` connections cross
+  threads need `check_same_thread=False`; stdlib-WS servers must override
+  `shutdown_request` (ThreadingMixIn's `shutdown(SHUT_WR)` FINs upgraded
+  connections) and pass `socket.dup()` straight to the WS wrapper (a
+  double-wrapped fd gets closed by the intermediate object's `__del__`).
 - **Encoder packet group limit must exceed the rotating buffers** (8 with a
   4-ring): exhaustion makes SPS/PPS header gets fail and packets alias stale
   memory.
@@ -106,9 +154,29 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   times; no panic in the (now persistent) journal. Prime suspect: power
   supply sag under VPU load. Watch for this pattern in the field.
 
-## Current state (2026-09-06)
+## Current state (2026-10-09)
 
-- Live stitch at 5304×1896 canvas, quality parity with `cv2.remap` math
+- **afl-camd field daemon built and verified end-to-end from a laptop**
+  (iphone-control-plan.md build order steps 2–6): cam2stitch daemon mode
+  (standby/record toggle + ctl socket + stitched H.264 preview + proxy),
+  MediaMTX v1.21.2 (RTSP in :8554, WHEP :8889, HLS :8888), afl-camd
+  (supervise/adopt/idle-close, REST + WebSocket, finalize with hvc1 master
+  + faststart proxy + thumbnail, clock sync, auto-stop, schedule, GPIO
+  stubs), phone web UI. Verified: record cycles (master 99% frame capture,
+  proxy muxes, thumbs), Range/206 serving, WS pushes, RTSP decode +
+  HLS playlist, idempotent start/stop, DELETE, crash-retry + socket
+  adoption. **NOT verified: Safari on the board AP — see
+  `field_desk_test.md` and run it before game day.**
+- The GTK UI path is unchanged and still works (legacy-mode regression
+  run: 199/197 frames encoded, clean mux). UI + daemon are mutually
+  exclusive — the daemon must be stopped (`systemctl stop afl-camd`) to
+  run the UI with cameras.
+- Master encode capacity note: at 80 Mbps HEVC the full canvas sustains
+  roughly the sensor rate in dim scenes (~13–20 fps); at brighter light
+  (~24–34 fps input) the encoder drops frames when input exceeds its
+  capacity (pre-existing MPP real-time drop behaviour, same in legacy
+  mode). Daylight 30 fps verification still pending.
+- Live stitch at 5304×1876 canvas, quality parity with `cv2.remap` math
   (Y corr 0.999965), encoder + GPU pipelined ≈ 30 fps capacity.
 - Frozen alignment refined for the static rig: overlap misalignment ~0.5 px
   median (was 13–70 px before the canvas-space refinement). Near-field grass
@@ -130,11 +198,13 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   — iPhone control (toggle/mode/res/duration/realign/swap) + 5 fps preview
   polling; actions cross to the GTK thread via a queue. Untested end-to-end
   with the real UI (standalone server tests pass).
-- Pending: outdoor bright-daylight 30 fps verification; NVMe heatsink;
-  gnome-shell burns ~385% CPU (software-rendered desktop — consider a lighter
-  session); GPU governor persistence (user decision); the UI's
-  `recordings not saving` report from 2026-09-06 may need reproducing;
-  bcmdhd AP mode needs the 10-minute desk test (`field_wifi.sh ap` + iPhone).
+- Pending: the `field_desk_test.md` iPhone run; outdoor bright-daylight
+  30 fps verification; NVMe heatsink; gnome-shell burns ~385% CPU
+  (software-rendered desktop — consider a lighter session); GPU governor
+  persistence (user decision); the UI's `recordings not saving` report
+  from 2026-09-06 may need reproducing; MediaMTX/afl-camd systemd units
+  written but the install step still needs running
+  (`scripts/install_field_services.sh` — needs sudo).
 
 ## More context
 

@@ -26,7 +26,11 @@ class RecordingDB:
     @property
     def conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.path))
+            # check_same_thread=False: the afl-camd daemon shares one
+            # connection across its tick + HTTP threads (sqlite3 serializes
+            # internally; writes in this codebase are short transactions)
+            self._conn = sqlite3.connect(str(self.path),
+                                         check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             for pragma, value in DB_PRAGMAS.items():
                 self._conn.execute(f"PRAGMA {pragma} = {value}")

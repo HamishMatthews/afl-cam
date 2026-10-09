@@ -271,6 +271,17 @@ def cmd_ui(_args):
     ui_main()
 
 
+def cmd_daemon(_args):
+    """Run the afl-camd field daemon (iPhone control, iphone-control-plan.md).
+
+    Supervises the always-on cam2stitch pipeline, serves the web UI + REST
+    + WebSocket API (default port 80), manages sessions/finalize, clock
+    sync, auto-stop, schedule and the GPIO button. The GTK UI must NOT be
+    running at the same time (both want the cameras)."""
+    from .daemon import main as daemon_main
+    daemon_main()
+
+
 def cmd_list(args):
     """List recording sessions (grouped cam0/cam1) with stitch status."""
     db = RecordingDB(DB_PATH)
@@ -578,6 +589,10 @@ def main():
     # ui
     sub.add_parser("ui", help="Launch the GTK recording app")
 
+    # daemon (field control)
+    sub.add_parser("daemon", help="Run the afl-camd field daemon "
+                                  "(iPhone control + web UI + API)")
+
     # check-aim
     sub.add_parser("check-aim", help="Measure current camera overlap for stitching")
 
@@ -662,6 +677,7 @@ def main():
         "devices": cmd_devices,
         "list-devices": cmd_list_devices,
         "ui": cmd_ui,
+        "daemon": cmd_daemon,
         "check-aim": cmd_check_aim,
         "record": cmd_record,
         "preview": cmd_preview,

@@ -217,6 +217,40 @@ VK_ICD_FILENAMES = "/opt/libmali-g610/usr/share/vulkan/icd.d/mali.json"
 VK_LD_LIBRARY_PATH = ("/opt/libmali-g610/usr/lib/aarch64-linux-gnu:"
                       "/opt/libmali-g610/usr/lib/aarch64-linux-gnu/mali")
 
+
+def vk_env(base_env=None) -> dict:
+    """Env for spawning cam2stitch: libmali ICD + LD_LIBRARY_PATH."""
+    env = dict(os.environ if base_env is None else base_env)
+    env["VK_DRIVER_FILES"] = VK_ICD_FILENAMES
+    env["LD_LIBRARY_PATH"] = (VK_LD_LIBRARY_PATH + ":"
+                              + env.get("LD_LIBRARY_PATH", ""))
+    return env
+
+
+def build_cam2stitch() -> Path | None:
+    """Compile the live-stitch recorder if missing or stale (stdlib-only —
+    the afl-camd daemon needs this without importing engine/cv2)."""
+    import subprocess
+
+    if STITCH_RECORDER_BIN.exists() and STITCH_RECORDER_SRC.exists() and \
+            STITCH_RECORDER_BIN.stat().st_mtime >= STITCH_RECORDER_SRC.stat().st_mtime:
+        return STITCH_RECORDER_BIN
+    cmd = [
+        "gcc", "-O2", "-I/usr/local/include/rockchip",
+        "-o", str(STITCH_RECORDER_BIN), str(STITCH_RECORDER_SRC),
+        "-L/usr/local/lib", "-lrockchip_mpp", "-lvulkan", "-lpthread",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"afl-cam: cam2stitch build failed: {e}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(f"afl-cam: cam2stitch build failed: "
+              f"{result.stderr.strip()[-400:]}", file=sys.stderr)
+        return None
+    return STITCH_RECORDER_BIN
+
 # SQLite pragmas
 DB_PRAGMAS = {
     "journal_mode": "WAL",

@@ -50,22 +50,30 @@ def measured_fps(pts_us: np.ndarray, fallback: float = 30.0) -> float:
 
 
 def mux_with_pts_rate(raw: Path, pts_path: Path, out: Path,
-                      fallback_fps: float = 30.0) -> bool:
+                      fallback_fps: float = 30.0,
+                      codec: str = "h264") -> bool:
     """Mux the raw .h264 ES into .mp4 as CFR at the measured real rate.
 
     Stream copy (no re-encode) — the container timestamps are regular at the
     median measured frame rate, so playback speed = real-life speed. The
     `.pts` sidecar remains the exact per-frame timing for the stitcher.
+
+    ``codec="hevc"`` tags the stream hvc1 (not hev1): iPhone/QuickTime
+    refuse to play hev1-tagged HEVC (iphone-control-plan.md §4).
     """
     pts = load_pts(pts_path)
     fps = measured_fps(pts, fallback_fps) if pts is not None else fallback_fps
-    result = subprocess.run(
+    args = [
         # NOTE: -r, not -framerate — ffmpeg 8's raw h264 demuxer ignores
         # -framerate and stamps 30 fps regardless
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "h264", "-r", f"{fps:.4f}", "-i", str(raw),
-         "-c", "copy", str(out)],
-        capture_output=True, text=True, timeout=60)
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "hevc" if codec == "hevc" else "h264",
+        "-r", f"{fps:.4f}", "-i", str(raw),
+        "-c", "copy"]
+    if codec == "hevc":
+        args += ["-tag:v", "hvc1"]
+    args.append(str(out))
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60)
     if result.returncode == 0 and out.exists() and out.stat().st_size > 0:
         return True
     log.error("mux failed for %s: %s", raw.name, result.stderr.strip())
