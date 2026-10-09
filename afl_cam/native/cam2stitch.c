@@ -24,11 +24,38 @@
  * — so: ONE THREAD PER CANVAS PIXEL, uint32 SSBO output (one byte per
  * uint, repacked on the CPU), no shared memory, no barriers, no
  * floatBitsToUint. Fences must be created pre-signaled.
+ *
+ * DAEMON mode (afl-camd field supervisor, iphone-control-plan.md §2.1):
+ * when AFL_CAM_CTL_SOCK is set the pipeline runs CONTINUOUSLY in standby —
+ * cameras open, GPU stitching, preview encoding — and recording is a
+ * toggle. A unix-socket control interface accepts, one command per line:
+ *   REC_START <dir>   open <dir>/stitch.raw.h264 + .pts + proxy files,
+ *                     write the stored SPS/PPS header, force an IDR
+ *   REC_STOP          flush + close the recording files
+ *   STATUS            reply immediately with the current status line
+ *   QUIT              exit cleanly
+ * A JSON status line is pushed to every connected client ~1/s (fps per
+ * camera, pairing dup/skip/skew, encoder stats, preview stats). The ctl
+ * thread only PARSES and sets pending flags — every application action
+ * (file open/close, encoder put/drain, IDR) runs on the MAIN thread.
+ * While not recording the master encoder put/drain is skipped (idle VPU;
+ * AFL_CAM_STANDBY_ENC=keep keeps encoding and drops the output instead).
+ *
+ * PREVIEW encode (iphone-control-plan.md §4): with AFL_CAM_PREVIEW_UDP set,
+ * a second rkvenc session (H.264 Constrained Baseline, ~1600x572 CBR) encodes
+ * a box-downscale of the stitched canvas — done by the worker thread straight
+ * from the packed SSBO. The main thread puts/drains the preview frames
+ * (invariant) and fans the Annex-B packets out to (a) a UDP socket (default
+ * 127.0.0.1:8890) for the ffmpeg->MediaMTX preview chain — best-effort,
+ * dropped when nobody listens — and (b) <rec_dir>/preview.raw.h264 + .pts
+ * while recording (the phone-playable proxy file).
  */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -37,6 +64,9 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
@@ -814,7 +844,381 @@ static void gpu_stitch(gpu_t *g, const void *nv0, const void *nv1, void *tight_o
     g_times[4] = now_us() - t4;
 }
 
-/* ======================= encode worker (pipelined) ======================= */
+/* ================== preview encode (daemon mode) ================== */
+
+/* Second rkvenc session on a ~1600x572 box-downscale of the stitched
+ * canvas (iphone-control-plan.md §4): H.264 Constrained Baseline, CBR
+ * ~3.5 Mbps, GOP 1s — decodes everywhere (Safari WHEP/HLS, Android).
+ * The worker downscales the packed SSBO into a tight staging buffer
+ * (drop-on-busy); the MAIN thread copies it into the encoder input and
+ * put/drains (encoder invariant), fanning packets to UDP + proxy files. */
+typedef struct {
+    MppCtx ctx;
+    MppApi *mpi;
+    MppBufferGroup pkt_grp;
+    MppBuffer out_buf[4];
+    MppFrame in_frame;
+    MppBuffer in_buf;
+    RK_U32 w, h, hs, vs;
+    /* worker -> main handoff (tight staging NV12) */
+    pthread_mutex_t mu;
+    int fresh;
+    uint8_t *stage;             /* tight pv->w * pv->h * 3/2 */
+    /* outputs (main thread only) */
+    FILE *fp_out, *fp_pts;      /* recording proxy files, NULL when idle */
+    void *hdr_data;             /* SPS/PPS (Annex-B), re-sent before IDRs */
+    size_t hdr_len;
+    int udp_fd;
+    struct sockaddr_in udp_addr;
+    int udp_ok;
+    RK_U64 pv_packets, pv_bytes, pv_drops;
+    RK_U64 pv_hdr_sent;         /* SPS/PPS datagrams injected before IDRs */
+    int ok;
+} pv_t;
+
+static int pv_init(pv_t *pv, int w, int h, int fps, int bitrate_kbps) {
+    memset(pv, 0, sizeof *pv);
+    pv->w = w; pv->h = h;
+    pv->hs = MPP_ALIGN(w, 16);
+    pv->vs = MPP_ALIGN(h, 16);
+    pv->udp_fd = -1;
+    pthread_mutex_init(&pv->mu, NULL);
+    pv->stage = malloc((size_t)w * h * 3 / 2);
+    if (!pv->stage)
+        return -1;
+    if (mpp_create(&pv->ctx, &pv->mpi))
+        return -1;
+    if (mpp_init(pv->ctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC))
+        return -1;
+    MppEncCfg cfg = NULL;
+    mpp_enc_cfg_init(&cfg);
+    pv->mpi->control(pv->ctx, MPP_ENC_GET_CFG, cfg);
+    RK_S32 vals[8] = { (RK_S32)pv->w, (RK_S32)pv->h, (RK_S32)pv->hs,
+                       (RK_S32)pv->vs, MPP_FMT_YUV420SP,
+                       bitrate_kbps * 1000, (RK_S32)(bitrate_kbps * 950L),
+                       (RK_S32)(bitrate_kbps * 1050L) };
+    const char *keys[8] = { "prep:width", "prep:height", "prep:hor_stride",
+                            "prep:ver_stride", "prep:format", "rc:bps_target",
+                            "rc:bps_min", "rc:bps_max" };
+    for (int i = 0; i < 8; i++)
+        mpp_enc_cfg_set_s32(cfg, keys[i], vals[i]);
+    mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingAVC);
+    mpp_enc_cfg_set_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+    mpp_enc_cfg_set_s32(cfg, "rc:gop", fps);          /* 1 s — fast joins */
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex", 0);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num", fps);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm", 1);
+    /* Constrained Baseline: no CABAC, no 8x8 — WebRTC-grade compatibility */
+    mpp_enc_cfg_set_s32(cfg, "h264:profile", 66);
+    mpp_enc_cfg_set_s32(cfg, "h264:level", 42);
+    mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", 0);
+    mpp_enc_cfg_set_s32(cfg, "h264:trans8x8", 0);
+    /* SPS/PPS in-band before EVERY IDR: the proxy file starts on a forced
+     * IDR and must carry its own headers (ffmpeg refuses PPS-less streams),
+     * and late UDP joiners (MediaMTX/ffmpeg) self-synchronize within a GOP */
+    mpp_enc_cfg_set_s32(cfg, "prep:header_mode", MPP_ENC_HEADER_MODE_EACH_IDR);
+    if (pv->mpi->control(pv->ctx, MPP_ENC_SET_CFG, cfg))
+        return -1;
+    if (mpp_buffer_group_get_internal(&pv->pkt_grp, MPP_BUFFER_TYPE_DRM))
+        return -1;
+    if (mpp_buffer_group_limit_config(pv->pkt_grp, 1024 * 1024, 8))
+        return -1;
+    for (int i = 0; i < 4; i++)
+        if (mpp_buffer_get(pv->pkt_grp, &pv->out_buf[i], 1024 * 1024))
+            return -1;
+    /* SPS/PPS header — rkvenc does NOT honour prep:header_mode EACH_IDR
+     * (measured: IDRs carry SEI but no parameter sets), so capture the
+     * header once and re-send it before every IDR on the UDP path +
+     * write it into the proxy file on REC_START */
+    {
+        MppBuffer hdr_buf = NULL;
+        MppPacket hdr = NULL;
+        if (!mpp_buffer_get(pv->pkt_grp, &hdr_buf, 1024 * 1024)
+            && !mpp_packet_init_with_buffer(&hdr, hdr_buf)) {
+            mpp_packet_set_length(hdr, 0);
+            if (!pv->mpi->control(pv->ctx, MPP_ENC_GET_HDR_SYNC, hdr)) {
+                void *ptr = mpp_packet_get_pos(hdr);
+                pv->hdr_len = mpp_packet_get_length(hdr);
+                if (ptr && pv->hdr_len) {
+                    pv->hdr_data = malloc(pv->hdr_len);
+                    if (pv->hdr_data)
+                        memcpy(pv->hdr_data, ptr, pv->hdr_len);
+                    else
+                        pv->hdr_len = 0;
+                }
+            }
+            mpp_packet_deinit(&hdr);
+        }
+        if (hdr_buf)
+            mpp_buffer_put(hdr_buf);
+    }
+    if (!pv->hdr_data)
+        fprintf(stderr, "preview: WARNING — no SPS/PPS header captured\n");
+    else if (getenv("AFL_CAM_PV_DEBUG"))
+        fprintf(stderr, "preview: SPS/PPS header captured: %zu bytes\n",
+                pv->hdr_len);
+    /* input: one strided NV12 buffer (the main thread copies into it).
+     * Own group — 1600x576x1.5 exceeds the packet group's 1 MB limit. */
+    mpp_frame_init(&pv->in_frame);
+    mpp_frame_set_width(pv->in_frame, pv->w);
+    mpp_frame_set_height(pv->in_frame, pv->h);
+    mpp_frame_set_hor_stride(pv->in_frame, pv->hs);
+    mpp_frame_set_ver_stride(pv->in_frame, pv->vs);
+    mpp_frame_set_fmt(pv->in_frame, MPP_FMT_YUV420SP);
+    MppBufferGroup in_grp = NULL;
+    if (mpp_buffer_group_get_internal(&in_grp, MPP_BUFFER_TYPE_DRM))
+        return -1;
+    if (mpp_buffer_group_limit_config(in_grp, (size_t)pv->hs * pv->vs * 3 / 2, 2))
+        return -1;
+    if (mpp_buffer_get(in_grp, &pv->in_buf,
+                       (size_t)pv->hs * pv->vs * 3 / 2))
+        return -1;
+    mpp_frame_set_buffer(pv->in_frame, pv->in_buf);
+
+    /* UDP sink (ffmpeg -> MediaMTX chain) */
+    const char *udp = getenv("AFL_CAM_PREVIEW_UDP");
+    if (udp && *udp) {
+        char tmp[128];
+        snprintf(tmp, sizeof tmp, "%s", udp);
+        char *colon = strrchr(tmp, ':');
+        if (colon) {
+            *colon++ = 0;
+            pv->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (pv->udp_fd >= 0) {
+                memset(&pv->udp_addr, 0, sizeof pv->udp_addr);
+                pv->udp_addr.sin_family = AF_INET;
+                pv->udp_addr.sin_port = htons((uint16_t)atoi(colon));
+                pv->udp_addr.sin_addr.s_addr = inet_addr(tmp);
+                if (pv->udp_addr.sin_addr.s_addr != INADDR_NONE)
+                    pv->udp_ok = 1;
+                else {
+                    close(pv->udp_fd);
+                    pv->udp_fd = -1;
+                }
+            }
+        }
+    }
+    pv->ok = 1;
+    return 0;
+}
+
+/* box-downscale the packed SSBO (one Y byte per uint) to the tight
+ * preview staging buffer. Runs on the WORKER thread — one extra SSBO
+ * read pass after the repack; drops the frame if the main thread has
+ * not consumed the previous one yet. */
+static void pv_downscale_ssbo(pv_t *pv, gpu_t *g, int slot) {
+    if (!pv->ok)
+        return;
+    pthread_mutex_lock(&pv->mu);
+    if (pv->fresh) {                 /* main thread behind — drop */
+        pthread_mutex_unlock(&pv->mu);
+        return;
+    }
+    const uint32_t *o32 = g->slots[slot].ssbo_map;
+    size_t cw = g->canvas_w, ch = g->canvas_h, cw4 = cw / 4;
+    uint8_t *y = pv->stage;
+    for (RK_U32 oy = 0; oy < pv->h; oy++) {
+        RK_U32 y0 = (RK_U32)((uint64_t)oy * ch / pv->h);
+        RK_U32 y1 = (RK_U32)((uint64_t)(oy + 1) * ch / pv->h);
+        if (y1 <= y0) y1 = y0 + 1;
+        uint8_t *orow = y + (size_t)oy * pv->w;
+        for (RK_U32 ox = 0; ox < pv->w; ox++) {
+            RK_U32 x0 = (RK_U32)((uint64_t)ox * cw / pv->w);
+            RK_U32 x1 = (RK_U32)((uint64_t)(ox + 1) * cw / pv->w);
+            if (x1 <= x0) x1 = x0 + 1;
+            RK_U32 acc = 0;
+            for (RK_U32 yy = y0; yy < y1; yy++)
+                for (RK_U32 xx = x0; xx < x1; xx++)
+                    acc += (o32[(size_t)yy * cw4 + xx / 4] >> (8 * (xx & 3))) & 0xffu;
+            orow[ox] = (uint8_t)(acc / ((y1 - y0) * (x1 - x0)));
+        }
+    }
+    /* chroma: SSBO UV section is (u | v<<8) per 2x2 block, cw/2 x ch/2 */
+    const uint32_t *uvsrc = o32 + (size_t)ch * cw4;
+    uint8_t *uv = pv->stage + (size_t)pv->w * pv->h;
+    size_t cw2 = cw / 2, ch2 = ch / 2, pw2 = pv->w / 2, ph2 = pv->h / 2;
+    for (RK_U32 oy = 0; oy < ph2; oy++) {
+        RK_U32 y0 = (RK_U32)((uint64_t)oy * ch2 / ph2);
+        RK_U32 y1 = (RK_U32)((uint64_t)(oy + 1) * ch2 / ph2);
+        if (y1 <= y0) y1 = y0 + 1;
+        for (RK_U32 ox = 0; ox < pw2; ox++) {
+            RK_U32 x0 = (RK_U32)((uint64_t)ox * cw2 / pw2);
+            RK_U32 x1 = (RK_U32)((uint64_t)(ox + 1) * cw2 / pw2);
+            if (x1 <= x0) x1 = x0 + 1;
+            RK_U32 accU = 0, accV = 0;
+            for (RK_U32 yy = y0; yy < y1; yy++)
+                for (RK_U32 xx = x0; xx < x1; xx++) {
+                    uint32_t pk = uvsrc[(size_t)yy * cw2 + xx];
+                    accU += pk & 0xffu;
+                    accV += (pk >> 8) & 0xffu;
+                }
+            size_t o = ((size_t)oy * pw2 + ox) * 2;
+            uv[o] = (uint8_t)(accU / ((y1 - y0) * (x1 - x0)));
+            uv[o + 1] = (uint8_t)(accV / ((y1 - y0) * (x1 - x0)));
+        }
+    }
+    pv->fresh = 1;
+    pthread_mutex_unlock(&pv->mu);
+}
+
+/* does this packet contain an IDR NAL anywhere? rkvenc packs
+ * [SEI][IDR slice] into ONE packet, so the packet's FIRST NAL type is 6 —
+ * only a scan finds the IDR (the SPS/PPS injection hinges on it) */
+static int pkt_has_idr(const RK_U8 *p, size_t n) {
+    for (size_t i = 0; i + 3 < n; i++) {
+        size_t sc = 0;
+        if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1)
+            sc = 3;
+        else if (i + 4 < n && p[i] == 0 && p[i + 1] == 0 &&
+                 p[i + 2] == 0 && p[i + 3] == 1)
+            sc = 4;
+        if (sc && i + sc < n && (p[i + sc] & 0x1f) == 5)
+            return 1;
+    }
+    return 0;
+}
+
+/* copy the tight staging frame into the strided encoder input buffer and
+ * put + drain. MAIN THREAD ONLY (encoder invariant). */
+static void pv_put_drain(pv_t *pv, int64_t pts) {
+    if (!pv->ok)
+        return;
+    static const RK_U8 sc[4] = { 0, 0, 0, 1 };
+    pthread_mutex_lock(&pv->mu);
+    if (!pv->fresh) {
+        pthread_mutex_unlock(&pv->mu);
+        return;
+    }
+    uint8_t *dst = (RK_U8 *)mpp_buffer_get_ptr(pv->in_buf);
+    const uint8_t *y = pv->stage;
+    for (RK_U32 row = 0; row < pv->h; row++)
+        memcpy(dst + (size_t)row * pv->hs, y + (size_t)row * pv->w, pv->w);
+    const uint8_t *uv = pv->stage + (size_t)pv->w * pv->h;
+    uint8_t *duv = dst + (size_t)pv->hs * pv->vs;
+    for (RK_U32 row = 0; row < pv->h / 2; row++)
+        memcpy(duv + (size_t)row * pv->hs, uv + (size_t)row * pv->w, pv->w);
+    pv->fresh = 0;
+    pthread_mutex_unlock(&pv->mu);
+
+    /* fresh input frame each put (same rule as snap_write: a reused
+     * frame's stale packet meta double-releases the output buffer) */
+    mpp_frame_deinit(&pv->in_frame);
+    mpp_frame_init(&pv->in_frame);
+    mpp_frame_set_width(pv->in_frame, pv->w);
+    mpp_frame_set_height(pv->in_frame, pv->h);
+    mpp_frame_set_hor_stride(pv->in_frame, pv->hs);
+    mpp_frame_set_ver_stride(pv->in_frame, pv->vs);
+    mpp_frame_set_fmt(pv->in_frame, MPP_FMT_YUV420SP);
+    mpp_frame_set_buffer(pv->in_frame, pv->in_buf);
+    mpp_frame_set_pts(pv->in_frame, pts);
+    {
+        MppPacket enc_pkt = NULL;
+        if (!mpp_packet_init_with_buffer(&enc_pkt, pv->out_buf[0])) {
+            mpp_packet_set_length(enc_pkt, 0);
+            MppMeta m = mpp_frame_get_meta(pv->in_frame);
+            if (m)
+                mpp_meta_set_packet(m, KEY_OUTPUT_PACKET, enc_pkt);
+            mpp_packet_deinit(&enc_pkt);
+        }
+    }
+    if (pv->mpi->encode_put_frame(pv->ctx, pv->in_frame))
+        return;
+
+    for (;;) {
+        MppPacket pkt = NULL;
+        MPP_RET ret = pv->mpi->encode_get_packet(pv->ctx, &pkt);
+        if (ret == MPP_ERR_TIMEOUT || !pkt)
+            break;
+        if (ret)
+            break;
+        void *ptr = mpp_packet_get_pos(pkt);
+        size_t plen = mpp_packet_get_length(pkt);
+        if (ptr && plen) {
+            /* same defensive NAL check as the master worker_drain:
+             * reject the allocator-fill phantom (01 02 03 04 ... run,
+             * no start code) */
+            int has_sc = plen >= 4 && memcmp(ptr, sc, 4) == 0;
+            RK_U8 nal = (has_sc ? ((RK_U8 *)ptr)[4] : ((RK_U8 *)ptr)[0]) & 0x1f;
+            int phantom = !has_sc && plen >= 8 &&
+                          ((RK_U8 *)ptr)[0] == 1 && ((RK_U8 *)ptr)[1] == 2 &&
+                          ((RK_U8 *)ptr)[2] == 3 && ((RK_U8 *)ptr)[3] == 4;
+            int ok_nal = (nal == 1 || nal == 5 || nal == 6 ||
+                          nal == 7 || nal == 8 || nal == 9);
+            if (getenv("AFL_CAM_PV_DEBUG") && nal == 5)
+                fprintf(stderr, "pv: IDR packet — hdr=%p len=%zu udp_ok=%d\n",
+                        (void *)pv->hdr_data, pv->hdr_len, pv->udp_ok);
+            if (ok_nal && !phantom) {
+                int has_header_sc = has_sc;
+                if (pv->fp_out) {
+                    if (!has_header_sc)
+                        fwrite(sc, 1, 4, pv->fp_out);
+                    fwrite(ptr, 1, plen, pv->fp_out);
+                    if (pv->fp_pts) {
+                        RK_S64 pkt_pts = mpp_packet_get_pts(pkt);
+                        if (pkt_pts <= 0)
+                            pkt_pts = pts;
+                        fprintf(pv->fp_pts, "%lld\n", (long long)pkt_pts);
+                    }
+                    fflush(pv->fp_out);
+                    if (pv->fp_pts)
+                        fflush(pv->fp_pts);
+                }
+                if (pv->udp_ok) {
+                    /* normalize to a start-code stream and send in 60 KB
+                     * datagrams (well under the UDP payload limit);
+                     * ffmpeg's h264 demuxer reassembles by start codes,
+                     * so chunk boundaries may slice NALs freely.
+                     * rkvenc emits IDRs WITHOUT parameter sets — prepend
+                     * the captured SPS/PPS so late joiners (ffmpeg starts
+                     * seconds after cam2stitch) self-sync within a GOP */
+                    if (pkt_has_idr((const RK_U8 *)ptr, plen)
+                        && pv->hdr_data && pv->hdr_len) {
+                        size_t off = 0;
+                        while (off < pv->hdr_len) {
+                            size_t n = pv->hdr_len - off;
+                            if (n > 60000)
+                                n = 60000;
+                            sendto(pv->udp_fd, (char *)pv->hdr_data + off, n,
+                                   0, (struct sockaddr *)&pv->udp_addr,
+                                   sizeof pv->udp_addr);
+                            off += n;
+                        }
+                        pv->pv_hdr_sent++;
+                        if (getenv("AFL_CAM_PV_DEBUG") && pv->pv_hdr_sent < 4)
+                            fprintf(stderr, "pv: sent %zu-byte SPS/PPS before "
+                                    "IDR (udp_ok=%d)\n",
+                                    pv->hdr_len, pv->udp_ok);
+                    }
+                    if (!has_header_sc)
+                        sendto(pv->udp_fd, sc, 4, 0,
+                               (struct sockaddr *)&pv->udp_addr,
+                               sizeof pv->udp_addr);
+                    size_t off = 0;
+                    while (off < plen) {
+                        size_t n = plen - off;
+                        if (n > 60000)
+                            n = 60000;
+                        ssize_t sent = sendto(pv->udp_fd,
+                                              (char *)ptr + off, n, 0,
+                                              (struct sockaddr *)&pv->udp_addr,
+                                              sizeof pv->udp_addr);
+                        if (sent < 0 && (errno == EAGAIN || errno == ENOBUFS))
+                            pv->pv_drops++;
+                        off += n;
+                    }
+                    pv->pv_packets++;
+                    pv->pv_bytes += plen;
+                }
+            }
+        }
+        mpp_packet_deinit(&pkt);
+    }
+}
+
+
 
 /* main thread: pair → copy → submit GPU. Worker: repack SSBO → encoder.
  * The stages overlap: while the GPU runs frame i the worker encodes frame
@@ -843,6 +1247,11 @@ typedef struct {
     MppBuffer enc_out_buf[4];
     RK_U32 ehs, evs;
     FILE *fp_out, *fp_pts;
+    int recording;              /* daemon toggle — MAIN THREAD ONLY */
+    int stopping;               /* REC_STOP: no new puts, drain the tail */
+    int empty_drains;           /* consecutive empty drains while stopping */
+    int64_t rec_bytes;          /* master bytes written (main thread) */
+    pv_t *pv;                   /* preview encoder (daemon mode) or NULL */
     int use_hevc;               /* packet validator: H.264 whitelist vs HEVC */
     pthread_mutex_t ack_mu;
     pthread_cond_t ack_cv;
@@ -899,6 +1308,7 @@ static void worker_put_frame(worker_ctx_t *w, MppFrame ef, MppBuffer out_buf) {
     mpp_packet_deinit(&enc_pkt);
     MPP_RET ret = w->enc_mpi->encode_put_frame(w->enc_ctx, ef);
     if (ret) fprintf(stderr, "encode_put_frame failed %d\n", ret);
+    else w->put_total++;
 }
 
 static int worker_drain(worker_ctx_t *w, int64_t fallback_pts) {
@@ -942,14 +1352,22 @@ static int worker_drain(worker_ctx_t *w, int64_t fallback_pts) {
                           nal == 7 || nal == 8 || nal == 9);
             }
             if (ok_nal) {
-                if (plen < 4 || memcmp(ptr, sc, 4) != 0)
-                    fwrite(sc, 1, 4, w->fp_out);
-                fwrite(ptr, 1, plen, w->fp_out);
-                if (w->fp_pts) {
-                    RK_S64 pkt_pts = mpp_packet_get_pts(enc_pkt);
-                    if (pkt_pts <= 0)
-                        pkt_pts = fallback_pts;
-                    fprintf(w->fp_pts, "%lld\n", (long long)pkt_pts);
+                if (w->recording && w->fp_out) {
+                    if (plen < 4 || memcmp(ptr, sc, 4) != 0)
+                        fwrite(sc, 1, 4, w->fp_out);
+                    fwrite(ptr, 1, plen, w->fp_out);
+                    w->rec_bytes += plen;
+                    if (w->fp_pts) {
+                        RK_S64 pkt_pts = mpp_packet_get_pts(enc_pkt);
+                        if (pkt_pts <= 0)
+                            pkt_pts = fallback_pts;
+                        fprintf(w->fp_pts, "%lld\n", (long long)pkt_pts);
+                    }
+                    /* flush per packet: a crash loses at most one frame,
+                     * and the phone can watch bytes grow in near-realtime */
+                    fflush(w->fp_out);
+                    if (w->fp_pts)
+                        fflush(w->fp_pts);
                 }
             } else {
                 fprintf(stderr, "worker: dropping bad packet (nal %u, %zu bytes)\n",
@@ -1004,6 +1422,9 @@ static void *encode_worker(void *arg) {
         } else {
             repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
         }
+        /* preview downscale (daemon mode): one extra SSBO read pass */
+        if (w->pv)
+            pv_downscale_ssbo(w->pv, w->g, it.slot);
         pthread_mutex_lock(&w->ack_mu);
         w->ack_done[it.slot] = 1;
         pthread_cond_broadcast(&w->ack_cv);
@@ -1127,6 +1548,7 @@ typedef struct {
     RK_U32 width, height, fps;
     RK_S32 exposure;
     int count;                  /* frames decoded */
+    int errors;                 /* decode failures (status reporting) */
     /* exposure state machine (cam2h264.c) */
     int lock_pending, lock_phase, refine_left, refine_rounds;
     double target_luma, luma_acc;
@@ -1382,11 +1804,11 @@ static void *capture_thread(void *arg) {
         mpp_packet_deinit(&dec_pkt);
         mpp_buffer_put(dec_in_buf);
         ioctl(c->fd, VIDIOC_QBUF, &vbuf);
-        if (r) { slot->state = 0; continue; }
+        if (r) { c->errors++; slot->state = 0; continue; }
 
         MppFrame dec_frame = NULL;
         r = c->dec_mpi->decode_get_frame(c->dec_ctx, &dec_frame);
-        if (r || !dec_frame) { slot->state = 0; continue; }
+        if (r || !dec_frame) { c->errors++; slot->state = 0; continue; }
         if (mpp_frame_get_info_change(dec_frame)) {
             c->dec_mpi->control(c->dec_ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
             mpp_frame_deinit(&dec_frame);
@@ -1394,6 +1816,7 @@ static void *capture_thread(void *arg) {
             continue;
         }
         if (mpp_frame_get_errinfo(dec_frame)) {
+            c->errors++;
             mpp_frame_deinit(&dec_frame);
             slot->state = 0;
             continue;
@@ -1448,6 +1871,350 @@ static int run_src_mode(const char *dir, const char *in0, const char *in1,
     return 0;
 }
 
+/* ==================== daemon control socket ==================== */
+
+/* Only when AFL_CAM_CTL_SOCK is set (afl-camd supervisor). Line protocol,
+ * one command per line: REC_START <dir> / REC_STOP / STATUS / QUIT.
+ * The ctl thread only parses and sets pending flags + replies; ALL
+ * application actions run on the main thread (see ctl_apply_pending).
+ * A JSON status line is pushed to every connected client ~1/s. */
+
+typedef struct {
+    int fd;
+    char buf[1024];
+    int len;
+} ctl_client_t;
+
+typedef struct {
+    pthread_mutex_t mu;
+    /* ctl thread -> main loop */
+    int start_pending, stop_pending, quit_pending;
+    char start_dir[512];
+    /* main loop -> ctl thread (status) */
+    int recording;
+    char rec_dir[512];
+    int64_t rec_start_us;
+    int64_t rec_bytes;
+    int status_gen;
+    char status_buf[2048];
+    int status_len;
+    /* socket */
+    int listen_fd;
+    ctl_client_t clients[16];
+    int n_clients;
+} ctl_t;
+
+static void ctl_reply(ctl_t *c, int fd, const char *msg) {
+    char line[512];
+    int n = snprintf(line, sizeof line, "%s\n", msg);
+    if (n > 0)
+        send(fd, line, (size_t)n, MSG_NOSIGNAL);
+}
+
+/* called by the MAIN thread once per frame */
+static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
+                        int out_count, int dup_count, int skip_count,
+                        int skipped_start, int64_t skew_sum, int64_t skew_n) {
+    if (!c)
+        return;
+    pthread_mutex_lock(&c->mu);
+    c->rec_bytes = w->rec_bytes;
+    int64_t elapsed = c->recording ? now_us() - c->rec_start_us : 0;
+    int64_t skew = skew_n ? skew_sum / skew_n : -1;
+    int n = snprintf(c->status_buf, sizeof c->status_buf,
+        "{\"state\":\"%s\",\"rec_dir\":\"%s\",\"rec_elapsed_s\":%lld.%03lld,"
+        "\"rec_bytes\":%lld,"
+        "\"cam0\":{\"frames\":%d,\"errors\":%d},"
+        "\"cam1\":{\"frames\":%d,\"errors\":%d},"
+        "\"paired\":%d,\"dup\":%d,\"skip\":%d,\"start_trim\":%d,"
+        "\"skew_avg_us\":%lld,"
+        "\"enc\":{\"packets\":%d,\"put\":%d,\"drained\":%d},"
+        "\"preview\":{\"on\":%d,\"packets\":%llu,\"bytes\":%llu,"
+        "\"drops\":%llu,\"hdr_sent\":%llu}}\n",
+        c->recording ? "recording" : "standby",
+        c->recording ? c->rec_dir : "",
+        (long long)(elapsed / 1000000), (long long)((elapsed / 1000) % 1000),
+        (long long)c->rec_bytes,
+        cams[0].count, cams[0].errors,
+        cams[1].count, cams[1].errors,
+        out_count, dup_count, skip_count, skipped_start,
+        (long long)skew,
+        w->enc_count, w->put_total, w->drained_total,
+        pv && pv->ok ? 1 : 0,
+        (unsigned long long)(pv ? pv->pv_packets : 0),
+        (unsigned long long)(pv ? pv->pv_bytes : 0),
+        (unsigned long long)(pv ? pv->pv_drops : 0),
+        (unsigned long long)(pv ? pv->pv_hdr_sent : 0));
+    if (n > 0 && n < (int)sizeof c->status_buf)
+        c->status_len = n;
+    c->status_gen++;
+    pthread_mutex_unlock(&c->mu);
+}
+
+/* called by the MAIN thread once the encoder drain has gone quiet while
+ * stopping: flush + close the recording files (proxy included) */
+static void ctl_finish_stop(ctl_t *c, worker_ctx_t *w, pv_t *pv) {
+    if (w->fp_out)
+        fclose(w->fp_out);
+    if (w->fp_pts)
+        fclose(w->fp_pts);
+    w->fp_out = w->fp_pts = NULL;
+    if (pv && pv->ok) {
+        if (pv->fp_out)
+            fclose(pv->fp_out);
+        if (pv->fp_pts)
+            fclose(pv->fp_pts);
+        pv->fp_out = pv->fp_pts = NULL;
+    }
+    w->recording = 0;
+    w->stopping = 0;
+    w->empty_drains = 0;
+    int64_t bytes = w->rec_bytes;
+    char closed_dir[512];
+    pthread_mutex_lock(&c->mu);
+    c->recording = 0;
+    strncpy(closed_dir, c->rec_dir, sizeof closed_dir - 1);
+    closed_dir[sizeof closed_dir - 1] = 0;
+    pthread_mutex_unlock(&c->mu);
+    fprintf(stderr, "ctl: REC_STOP — closed %s (%lld bytes)\n",
+            closed_dir, (long long)bytes);
+}
+
+/* called by the MAIN thread at the bottom of each loop iteration:
+ * apply pending REC_START/REC_STOP/QUIT after the drain, so a stop
+ * flushes the last packets and a start begins on a clean encoder. */
+static void ctl_apply_pending(ctl_t *c, worker_ctx_t *w, pv_t *pv,
+                              MppCtx enc_ctx, MppApi *enc_mpi,
+                              const void *hdr_data, size_t hdr_len) {
+    if (!c)
+        return;
+    pthread_mutex_lock(&c->mu);
+    int stop = c->stop_pending;
+    int start = c->start_pending;
+    int quit = c->quit_pending;
+    char dir[512];
+    strncpy(dir, c->start_dir, sizeof dir - 1);
+    dir[sizeof dir - 1] = 0;
+    c->stop_pending = c->start_pending = 0;
+    pthread_mutex_unlock(&c->mu);
+
+    if (stop) {
+        if (w->recording && !w->stopping) {
+            /* no new puts; keep draining until the encoder goes quiet,
+             * then close (the tail packets otherwise never reach disk) */
+            w->stopping = 1;
+            w->empty_drains = 0;
+            fprintf(stderr, "ctl: REC_STOP requested — draining encoder tail\n");
+        }
+    }
+    if (start) {
+        if (!w->recording) {
+            char rawp[1024], ptsp[1024], pvraw[1024], pvpts[1024];
+            mkdir(dir, 0755);
+            snprintf(rawp, sizeof rawp, "%s/stitch.raw.h264", dir);
+            snprintf(ptsp, sizeof ptsp, "%s/stitch.pts", dir);
+            FILE *f = fopen(rawp, "wb");
+            if (!f) {
+                fprintf(stderr, "ctl: REC_START open %s failed: %s\n",
+                        rawp, strerror(errno));
+            } else {
+                if (hdr_data && hdr_len)
+                    fwrite(hdr_data, 1, hdr_len, f);
+                w->fp_out = f;
+                w->fp_pts = fopen(ptsp, "w");
+                w->recording = 1;
+                w->rec_bytes = hdr_len;
+                pthread_mutex_lock(&c->mu);
+                c->recording = 1;
+                c->rec_start_us = now_us();
+                strncpy(c->rec_dir, dir, sizeof c->rec_dir - 1);
+                c->rec_dir[sizeof c->rec_dir - 1] = 0;
+                pthread_mutex_unlock(&c->mu);
+                /* proxy preview files: start with the SPS/PPS header, then
+                 * the next IDR (forced above) */
+                if (pv && pv->ok) {
+                    snprintf(pvraw, sizeof pvraw, "%s/preview.raw.h264", dir);
+                    snprintf(pvpts, sizeof pvpts, "%s/preview.pts", dir);
+                    pv->fp_out = fopen(pvraw, "wb");
+                    pv->fp_pts = fopen(pvpts, "w");
+                    if (pv->fp_out && pv->hdr_data && pv->hdr_len)
+                        fwrite(pv->hdr_data, 1, pv->hdr_len, pv->fp_out);
+                    pv->mpi->control(pv->ctx, MPP_ENC_SET_IDR_FRAME, NULL);
+                }
+                enc_mpi->control(enc_ctx, MPP_ENC_SET_IDR_FRAME, NULL);
+                fprintf(stderr, "ctl: REC_START -> %s\n", dir);
+            }
+        }
+    }
+    if (quit)
+        g_running = 0;
+}
+
+static int ctl_handle_line(ctl_t *c, int fd, char *line) {
+    /* returns 1 to keep the client, 0 to close it.
+     * CALLER HOLDS c->mu (the ctl thread's read loop) — no locking here. */
+    while (*line == ' ' || *line == '\t')
+        line++;
+    char *eol = strpbrk(line, "\r\n");
+    if (eol)
+        *eol = 0;
+    if (!*line)
+        return 1;
+    if (!strncmp(line, "REC_START ", 10) && strlen(line) > 10) {
+        char *dir = line + 10;
+        while (*dir == ' ')
+            dir++;
+        if (!*dir) {
+            ctl_reply(c, fd, "ERR missing dir");
+            return 1;
+        }
+        int already = c->recording || c->start_pending;
+        if (!already) {
+            strncpy(c->start_dir, dir, sizeof c->start_dir - 1);
+            c->start_dir[sizeof c->start_dir - 1] = 0;
+            c->start_pending = 1;
+        }
+        ctl_reply(c, fd, already ? "ERR already recording" : "OK");
+        return 1;
+    }
+    if (!strcmp(line, "REC_STOP")) {
+        c->stop_pending = 1;
+        ctl_reply(c, fd, c->recording ? "OK" : "OK idle");
+        return 1;
+    }
+    if (!strcmp(line, "STATUS")) {
+        if (c->status_len > 0 && c->status_len < (int)sizeof c->status_buf)
+            send(fd, c->status_buf, (size_t)c->status_len, MSG_NOSIGNAL);
+        return 1;
+    }
+    if (!strcmp(line, "QUIT")) {
+        c->quit_pending = 1;
+        ctl_reply(c, fd, "OK");
+        return 1;
+    }
+    ctl_reply(c, fd, "ERR unknown command");
+    return 1;
+}
+
+static void *ctl_thread(void *arg) {
+    ctl_t *c = arg;
+    int64_t last_push = 0;
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        int maxfd = c->listen_fd;
+        FD_SET(c->listen_fd, &rfds);
+        pthread_mutex_lock(&c->mu);
+        for (int i = 0; i < c->n_clients; i++) {
+            FD_SET(c->clients[i].fd, &rfds);
+            if (c->clients[i].fd > maxfd)
+                maxfd = c->clients[i].fd;
+        }
+        int status_gen = c->status_gen;
+        pthread_mutex_unlock(&c->mu);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+        int n = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;   /* listen fd gone — process exiting */
+        }
+        if (FD_ISSET(c->listen_fd, &rfds)) {
+            int fd = accept(c->listen_fd, NULL, NULL);
+            if (fd >= 0) {
+                int fl = fcntl(fd, F_GETFL, 0);
+                fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+                pthread_mutex_lock(&c->mu);
+                if (c->n_clients < 16) {
+                    c->clients[c->n_clients].fd = fd;
+                    c->clients[c->n_clients].len = 0;
+                    c->n_clients++;
+                } else {
+                    close(fd);
+                }
+                pthread_mutex_unlock(&c->mu);
+            }
+        }
+        pthread_mutex_lock(&c->mu);
+        for (int i = 0; i < c->n_clients; ) {
+            ctl_client_t *cl = &c->clients[i];
+            if (FD_ISSET(cl->fd, &rfds)) {
+                char tmp[512];
+                ssize_t r = recv(cl->fd, tmp, sizeof tmp, 0);
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    i++;
+                    continue;    /* spurious wakeup — nothing to read */
+                }
+                if (r <= 0) {
+                    close(cl->fd);
+                    memmove(&c->clients[i], &c->clients[i + 1],
+                            (size_t)(c->n_clients - i - 1) * sizeof *cl);
+                    c->n_clients--;
+                    continue;
+                }
+                for (ssize_t k = 0; k < r && cl->len < (int)sizeof cl->buf - 1; k++) {
+                    cl->buf[cl->len++] = tmp[k];
+                    if (tmp[k] == '\n') {
+                        cl->buf[cl->len] = 0;
+                        char line[1024];
+                        strncpy(line, cl->buf, sizeof line - 1);
+                        line[sizeof line - 1] = 0;
+                        cl->len = 0;
+                        if (!ctl_handle_line(c, cl->fd, line)) {
+                            close(cl->fd);
+                            memmove(&c->clients[i], &c->clients[i + 1],
+                                    (size_t)(c->n_clients - i - 1) * sizeof *cl);
+                            c->n_clients--;
+                            break;
+                        }
+                    }
+                }
+            }
+            i++;
+        }
+        /* push status to everyone when it changed and ~1 s has passed */
+        if (status_gen != c->status_gen && now_us() - last_push > 500000) {
+            last_push = now_us();
+            for (int i = 0; i < c->n_clients; i++)
+                if (c->status_len > 0)
+                    send(c->clients[i].fd, c->status_buf,
+                         (size_t)c->status_len, MSG_NOSIGNAL);
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+    return NULL;
+}
+
+static ctl_t *ctl_start(const char *sock_path) {
+    ctl_t *c = calloc(1, sizeof *c);
+    if (!c)
+        return NULL;
+    pthread_mutex_init(&c->mu, NULL);
+    c->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (c->listen_fd < 0) {
+        free(c);
+        return NULL;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", sock_path);
+    unlink(sock_path);               /* stale socket from a dead instance */
+    if (bind(c->listen_fd, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+        listen(c->listen_fd, 8) < 0) {
+        fprintf(stderr, "ctl: bind %s failed: %s\n", sock_path,
+                strerror(errno));
+        close(c->listen_fd);
+        free(c);
+        return NULL;
+    }
+    chmod(sock_path, 0660);
+    pthread_t th;
+    pthread_create(&th, NULL, ctl_thread, c);
+    fprintf(stderr, "ctl: listening on %s\n", sock_path);
+    return c;
+}
+
 /* ========================= live mode ========================= */
 
 static void usage(const char *argv0) {
@@ -1500,6 +2267,16 @@ int main(int argc, char **argv) {
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGPIPE, SIG_IGN);   /* send() on a dead ctl client must not kill us */
+
+    /* daemon mode: afl-camd supervises us — standby until REC_START */
+    int daemon_mode = getenv("AFL_CAM_CTL_SOCK") != NULL;
+    /* standby master encode: "skip" (default) idles the VPU — puts resume
+     * on REC_START with a forced IDR; "keep" encodes continuously and
+     * drops the output (diagnostic fallback) */
+    int keep_enc = getenv("AFL_CAM_STANDBY_ENC") &&
+                   !strcmp(getenv("AFL_CAM_STANDBY_ENC"), "keep");
+    const char *snap_dir = getenv("AFL_CAM_PREVIEW_DIR");
 
     RK_S32 ret = 0;
     char path[1024];
@@ -1535,9 +2312,13 @@ int main(int argc, char **argv) {
         c->width = width; c->height = height; c->fps = fps; c->exposure = exposure;
         c->lock_pending = (exposure <= 0);
         c->lock_exp = 166;
-        /* live preview: <outdir>/cam<i>_preview.jpg every AFL_CAM_PREVIEW_SECS */
-        snprintf(c->preview_path, sizeof c->preview_path, "%s", out_path);
-        {
+        /* live preview: <outdir>/cam<i>_preview.jpg every AFL_CAM_PREVIEW_SECS
+         * (or AFL_CAM_PREVIEW_DIR when set — daemon mode has no outdir yet) */
+        if (snap_dir && *snap_dir)
+            snprintf(c->preview_path, sizeof c->preview_path,
+                     "%s/cam%d_preview.jpg", snap_dir, i);
+        else {
+            snprintf(c->preview_path, sizeof c->preview_path, "%s", out_path);
             char *slash = strrchr(c->preview_path, '/');
             if (slash)
                 snprintf(slash + 1, sizeof c->preview_path - (slash + 1 - c->preview_path),
@@ -1609,6 +2390,11 @@ int main(int argc, char **argv) {
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_flex", 0);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_num", fps);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_denorm", 1);
+        /* SPS/PPS in-band before every IDR: a recording whose file header
+         * was lost (crash recovery) still decodes, and the stream is
+         * self-contained for any consumer */
+        mpp_enc_cfg_set_s32(enc_cfg, "prep:header_mode",
+                            MPP_ENC_HEADER_MODE_EACH_IDR);
         if (!use_hevc) {
             mpp_enc_cfg_set_s32(enc_cfg, "h264:profile", 100);
             mpp_enc_cfg_set_s32(enc_cfg, "h264:level", 52);
@@ -1643,10 +2429,13 @@ int main(int argc, char **argv) {
     if (ret) { fprintf(stderr, "enc in grp failed %d\n", ret); return 1; }
 
 
-    FILE *fp_out = fopen(out_path, "wb");
-    if (!fp_out) { perror(out_path); return 1; }
+    /* master output: opened at startup in legacy mode; opened per
+     * REC_START in daemon mode (the ctl section swaps the pointers) */
+    FILE *fp_out = NULL;
     FILE *fp_pts = NULL;
-    {
+    if (!daemon_mode) {
+        fp_out = fopen(out_path, "wb");
+        if (!fp_out) { perror(out_path); return 1; }
         char pts_path[1024];
         char *dot;
         snprintf(pts_path, sizeof pts_path, "%s", out_path);
@@ -1658,7 +2447,12 @@ int main(int argc, char **argv) {
         fp_pts = fopen(pts_path, "w");
     }
 
-    /* SPS/PPS header (cam2h264.c) */
+    /* SPS/PPS header (cam2h264.c) — captured ONCE at init; legacy mode
+     * writes it to the output file now, daemon mode replays it into every
+     * recording's file on REC_START (the header get only works cleanly
+     * before frames flow) */
+    void *hdr_data = NULL;
+    size_t hdr_len = 0;
     {
         MppBuffer hdr_buf = NULL;
         MppPacket hdr = NULL;
@@ -1671,15 +2465,25 @@ int main(int argc, char **argv) {
             if (ret) fprintf(stderr, "GET_HDR_SYNC failed %d\n", ret);
             if (!ret) {
                 void *ptr = mpp_packet_get_pos(hdr);
-                size_t hlen = mpp_packet_get_length(hdr);
-                if (ptr && hlen)
-                    fwrite(ptr, 1, hlen, fp_out);
+                hdr_len = mpp_packet_get_length(hdr);
+                if (ptr && hdr_len) {
+                    hdr_data = malloc(hdr_len);
+                    if (hdr_data) {
+                        memcpy(hdr_data, ptr, hdr_len);
+                        if (fp_out)
+                            fwrite(hdr_data, 1, hdr_len, fp_out);
+                    } else {
+                        hdr_len = 0;
+                    }
+                }
             }
             mpp_packet_deinit(&hdr);
         }
         if (hdr_buf)
             mpp_buffer_put(hdr_buf);
     }
+    if (!hdr_data)
+        fprintf(stderr, "WARNING: no SPS/PPS header captured\n");
 
     /* ---- encoder input frames (ENC_RING deep — the worker fills frame i
      * while the encoder still owns i-1..i-3) ---- */
@@ -1699,6 +2503,33 @@ int main(int argc, char **argv) {
         mpp_frame_set_buffer(enc_in[i], enc_in_buf[i]);
     }
 
+    /* ---- preview encoder (daemon mode, AFL_CAM_PREVIEW_UDP set) ----
+     * H.264 ~1600x572 (canvas aspect) CBR — the phone preview + proxy.
+     * Init BEFORE the worker starts: the worker downscales into its stage. */
+    pv_t pv = {0};
+    int pv_ok = 0;
+    if (getenv("AFL_CAM_PREVIEW_UDP")) {
+        int pv_w = 1600;
+        if (getenv("AFL_CAM_PREVIEW_VIDEO_W"))
+            pv_w = atoi(getenv("AFL_CAM_PREVIEW_VIDEO_W"));
+        int pv_h = (int)((int64_t)pv_w * g.canvas_h / g.canvas_w) & ~1;
+        if (pv_h < 2)
+            pv_h = 2;
+        if (getenv("AFL_CAM_PREVIEW_VIDEO_H"))
+            pv_h = atoi(getenv("AFL_CAM_PREVIEW_VIDEO_H"));
+        int pv_bps = 3500;
+        if (getenv("AFL_CAM_PREVIEW_BITRATE_KBPS"))
+            pv_bps = atoi(getenv("AFL_CAM_PREVIEW_BITRATE_KBPS"));
+        if (pv_init(&pv, pv_w, pv_h, (int)fps, pv_bps))
+            fprintf(stderr, "preview: rkvenc init failed — no stitched preview\n");
+        else {
+            pv_ok = 1;
+            fprintf(stderr, "preview: %dx%d H.264 CBR %d kbps%s\n",
+                    pv.w, pv.h, pv_bps,
+                    pv.udp_ok ? "" : " (UDP sink unavailable)");
+        }
+    }
+
     /* ---- start capture threads ---- */
     int64_t t_start = now_us();
     int64_t t_deadline = wall_sec > 0 ? t_start + (int64_t)wall_sec * 1000000 : 0;
@@ -1713,6 +2544,7 @@ int main(int argc, char **argv) {
     MppFrame cur1 = NULL;
     int out_count = 0;
     int skipped_start = 0, dup_count = 0, skip_count = 0;
+    int64_t skew_sum = 0, skew_n = 0;
 
     /* ---- pipelined worker (repack + encode) ---- */
     worker_ctx_t w = {0};
@@ -1728,6 +2560,9 @@ int main(int argc, char **argv) {
     }
     w.ehs = ehs; w.evs = evs;
     w.fp_out = fp_out; w.fp_pts = fp_pts;
+    w.recording = !daemon_mode;     /* legacy records from the first frame */
+    w.rec_bytes = hdr_len;
+    w.pv = pv_ok ? &pv : NULL;
     pthread_cond_init(&w.q->cv, NULL);
     pthread_cond_init(&w.ack_cv, NULL);
     pthread_mutex_init(&w.ack_mu, NULL);
@@ -1735,6 +2570,17 @@ int main(int argc, char **argv) {
         w.ack_done[k] = 1;   /* nothing pending before the first submits */
     pthread_t wthread;
     pthread_create(&wthread, NULL, encode_worker, &w);
+
+    /* ---- daemon control socket (AFL_CAM_CTL_SOCK) ---- */
+    ctl_t *ctl = NULL;
+    const char *ctl_sock_path = NULL;
+    if (daemon_mode) {
+        ctl_sock_path = getenv("AFL_CAM_CTL_SOCK");
+        ctl = ctl_start(ctl_sock_path);
+        if (!ctl)
+            fprintf(stderr, "ctl: control socket unavailable — recording "
+                            "cannot be toggled remotely\n");
+    }
 
     /* per-GPU-slot pending frame info (pts assigned at submit time, pushed
      * to the worker when the slot's result comes back 3 frames later) */
@@ -1790,6 +2636,8 @@ int main(int argc, char **argv) {
 
         /* ---- pipelined GPU stage (main thread) ---- */
         int64_t mid = (p0_pts + pair_pts) / 2;
+        skew_sum += p0_pts > pair_pts ? p0_pts - pair_pts : pair_pts - p0_pts;
+        skew_n++;
         int64_t t_stage = now_us();
         /* our cached mmap of the decoder buffers (MPP's own mapping is
          * uncached — the 24.9MB staging copy would take ~200ms) */
@@ -1817,9 +2665,22 @@ int main(int argc, char **argv) {
                 pthread_cond_wait(&w.ack_cv, &w.ack_mu);
             w.ack_done[0] = 0;
             pthread_mutex_unlock(&w.ack_mu);
-            mpp_frame_set_pts(enc_in[0], mid);
-            worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
-            worker_drain(&w, mid);
+            if ((w.recording || keep_enc) && !w.stopping) {
+                mpp_frame_set_pts(enc_in[0], mid);
+                worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
+                worker_drain(&w, mid);
+            }
+            if (w.recording && w.stopping) {
+                int got = worker_drain(&w, mid);
+                if (got == 0) {
+                    if (++w.empty_drains >= 3)
+                        ctl_finish_stop(ctl, &w, pv_ok ? &pv : NULL);
+                } else {
+                    w.empty_drains = 0;
+                }
+            }
+            if (pv_ok)
+                pv_put_drain(&pv, mid);
         } else {
             gpu_slot_t *s = &g.slots[g.k];
             int k = g.k;
@@ -1864,9 +2725,27 @@ int main(int argc, char **argv) {
              * the MAIN thread — the proven-clean sync path. The drain
              * returns immediately: the encoder finished ~30ms ago. */
             if (put_pts >= 0) {
-                mpp_frame_set_pts(enc_in[0], put_pts);
-                worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
-                worker_drain(&w, put_pts);
+                if ((w.recording || keep_enc) && !w.stopping) {
+                    mpp_frame_set_pts(enc_in[0], put_pts);
+                    worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
+                    worker_drain(&w, put_pts);
+                }
+                /* stitched preview (daemon): every canvas frame, on the
+                 * main thread — UDP best-effort + proxy while recording */
+                if (pv_ok)
+                    pv_put_drain(&pv, put_pts);
+            }
+            if (w.recording && w.stopping) {
+                /* draining the encoder tail: no new puts. Outside the
+                 * put_pts guard so a stop inside the first 3 frames also
+                 * drains and closes (put_pts < 0 there). */
+                int got = worker_drain(&w, put_pts);
+                if (got == 0) {
+                    if (++w.empty_drains >= 3)
+                        ctl_finish_stop(ctl, &w, pv_ok ? &pv : NULL);
+                } else {
+                    w.empty_drains = 0;
+                }
             }
         }
         ring_release(&cams[0].ring, f0_idx);
@@ -1874,6 +2753,13 @@ int main(int argc, char **argv) {
         if (out_count % 10 == 0)
             fprintf(stderr, "submitted %d frames (main %.1fms, encoded %d)\n",
                     out_count, (now_us() - t_stage) / 1000.0, w.enc_count);
+
+        /* daemon: publish status + apply pending REC_START/REC_STOP/QUIT
+         * (bottom of the iteration — a stop flushes the last packets) */
+        ctl_publish(ctl, cams, &w, pv_ok ? &pv : NULL, out_count, dup_count,
+                    skip_count, skipped_start, skew_sum, skew_n);
+        ctl_apply_pending(ctl, &w, pv_ok ? &pv : NULL, enc_ctx, enc_mpi,
+                          hdr_data, hdr_len);
     }
 
     /* ---- stop + EOS (main thread — the old proven-clean path) ---- */
@@ -1895,9 +2781,20 @@ int main(int argc, char **argv) {
     }
     for (int i = 0; i < 2; i++)
         pthread_join(cams[i].thread, NULL);
-    if (fp_pts)
-        fclose(fp_pts);
-    fclose(fp_out);
+    /* flush + close whatever recording files are still open (daemon mode
+     * may quit mid-recording — afl-camd muxes what was written) */
+    if (w.fp_out)
+        fclose(w.fp_out);
+    if (w.fp_pts)
+        fclose(w.fp_pts);
+    if (pv_ok) {
+        if (pv.fp_out)
+            fclose(pv.fp_out);
+        if (pv.fp_pts)
+            fclose(pv.fp_pts);
+    }
+    if (ctl && ctl_sock_path)
+        unlink(ctl_sock_path);
     fprintf(stderr, "submitted %d frames, encoded %d (start-trimmed %d, dup %d, skip %d)\n",
             out_count, w.enc_count, skipped_start, dup_count, skip_count);
     return 0;

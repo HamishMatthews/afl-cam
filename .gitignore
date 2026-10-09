@@ -49,3 +49,7 @@ Thumbs.db
 .idea/
 afl_cam/native/stitch.spv
 afl_cam/native/gpu_stitch
+
+# MediaMTX auto-generated TLS material (created in cwd at first start)
+auto.crt
+auto.key
