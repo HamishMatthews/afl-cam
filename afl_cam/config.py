@@ -19,23 +19,26 @@ PLATFORM = sys.platform  # "linux" or "darwin"
 # Node numbers SHUFFLE ACROSS REBOOTS, so they are resolved at runtime.
 #   The two cameras carry IDENTICAL USB descriptors (serial "01.00.00",
 #   same mfr/firmware rev) — the PHYSICAL USB SOCKET is the only stable
-#   identity. Each USB2 socket is backed by an EHCI (480M) + OHCI (12M)
-#   companion controller pair; a healthy camera enumerates on the EHCI
-#   side. The rig's sockets are hardcoded:
-#       cam0 (left)  = EHCI fc880000.usb / OHCI fc8c0000.usb  (xhci.12)
-#       cam1 (right) = EHCI fc800000.usb / OHCI fc840000.usb  (xhci.11)
+#   identity. The rig's sockets are PHYSICALLY LABELED (2026-10-09):
+#   the left camera's plug always goes in the LEFT socket, the right
+#   camera's in the RIGHT socket, and this map is the hardcoded wiring:
+#       cam0 (left)  = xhci.11 USB3 socket (usb1; USB2 aliases below)
+#       cam1 (right) = xhci.12 USB3 socket (usb3)
+#   Each USB2 socket is backed by an EHCI (480M) + OHCI (12M) companion
+#   pair, listed as aliases in case the cables move back to the USB2
+#   sockets. If the rig wiring EVER changes, edit this one map — there is
+#   no Swap button (removed 2026-10-09 by design: labels, not software).
 #   If a camera's high-speed connect chirp fails (its USB firmware can
 #   wedge after a hard crash mid-stream) it re-enumerates at full speed on
 #   the OHCI side, where uvcvideo's probe FAILS — the camera then has no
 #   video node at all and its panel sits frozen. scripts/usb_kick_cameras.sh
-#   soft-resets the socket (no replug needed). A camera found on an
-#   unexpected socket fills the remaining slot in sorted order; use the
-#   Swap button if sides ever come out wrong (it persists).
+#   soft-resets the socket (no replug needed); the UI runs it automatically
+#   at startup when a camera is missing.
 #   macOS — AVFoundation device indices (find them with 'afl-cam list-devices')
 _CAMERA_PORTS = {
-    # Physical socket controller pairs: (EHCI, OHCI, xhci-if-moved)
-    "cam0": ("fc880000.usb", "fc8c0000.usb", "xhci-hcd.12.auto"),
-    "cam1": ("fc800000.usb", "fc840000.usb", "xhci-hcd.11.auto"),
+    # Physical socket controller aliases: (USB3 xhci, USB2 EHCI, USB2 OHCI)
+    "cam0": ("xhci-hcd.11.auto", "fc800000.usb", "fc840000.usb"),
+    "cam1": ("xhci-hcd.12.auto", "fc880000.usb", "fc8c0000.usb"),
 }
 
 def _warn_wedged_cameras():
@@ -56,27 +59,35 @@ def _warn_wedged_cameras():
     except OSError:
         pass
 
+def _scan_cameras():
+    """All MJPG-capable video nodes, keyed by physical USB socket.
+
+    dict[(controller, port_path), node]. The controller segment is the one
+    IMMEDIATELY before /usbN/: an xhci path carries an extra segment
+    (.../fc000000.usb/xhci-hcd.11.auto/usb1/...).
+    """
+    found = {}
+    for node in sorted(os.listdir("/sys/class/video4linux")):
+        link = os.readlink(f"/sys/class/video4linux/{node}")
+        m = re.search(
+            r"/(xhci-hcd\.\d+\.auto|[0-9a-f]+\.usb)"
+            r"/usb\d+/(\d+(?:-\d+)*)/", link)
+        if not m:
+            continue
+        key = (m.group(1), m.group(2))  # (controller, port path)
+        if key in found:
+            continue
+        out = subprocess.run(
+            ["v4l2-ctl", "-d", f"/dev/{node}", "--list-formats"],
+            capture_output=True, text=True, timeout=5).stdout
+        if "MJPG" in out:
+            found[key] = f"/dev/{node}"
+    return found
+
+
 def _discover_cameras():
     try:
-        found = {}
-        for node in sorted(os.listdir("/sys/class/video4linux")):
-            link = os.readlink(f"/sys/class/video4linux/{node}")
-            # The controller segment IMMEDIATELY before /usbN/: an xhci path
-            # carries an extra segment (.../fc000000.usb/xhci-hcd.11.auto/
-            # usb1/...), so capture whichever lands right before the bus.
-            m = re.search(
-                r"/(xhci-hcd\.\d+\.auto|[0-9a-f]+\.usb)"
-                r"/usb\d+/(\d+(?:-\d+)*)/", link)
-            if not m:
-                continue
-            key = (m.group(1), m.group(2))  # (controller, port path)
-            if key in found:
-                continue
-            out = subprocess.run(
-                ["v4l2-ctl", "-d", f"/dev/{node}", "--list-formats"],
-                capture_output=True, text=True, timeout=5).stdout
-            if "MJPG" in out:
-                found[key] = f"/dev/{node}"
+        found = _scan_cameras()
         resolved = {}
         for cam, ctl_names in _CAMERA_PORTS.items():
             for key, dev in list(found.items()):
@@ -95,6 +106,17 @@ def _discover_cameras():
     except (OSError, subprocess.SubprocessError):
         pass
     return None
+
+
+def rediscover_cameras():
+    """Re-run discovery, updating the module CAMERAS dict IN PLACE (same
+    object — callers holding a reference see the new assignment)."""
+    resolved = _discover_cameras()
+    if resolved is None:
+        resolved = {"cam0": "/dev/video0", "cam1": "/dev/video1"}
+    CAMERAS.clear()
+    CAMERAS.update(resolved)
+    return dict(CAMERAS)
 
 CAMERAS = _discover_cameras() if PLATFORM == "linux" else {
     "cam0": "0",

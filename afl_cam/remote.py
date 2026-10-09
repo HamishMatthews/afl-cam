@@ -1,7 +1,7 @@
 """afl-cam field remote — stdlib-only iPhone/Safari control + preview server.
 
 A tiny ``ThreadingHTTPServer`` on 0.0.0.0 that gives a phone on the board's
-AP (or LAN) the same record/stop, realign and swap controls as the GTK UI,
+AP (or LAN) the same record/stop, realign and duration controls as the GTK UI,
 plus a live snapshot preview while recording.
 
 Design
@@ -43,7 +43,6 @@ Action vocabulary (POST /api/control JSON body)::
     {"action": "set_resolution","value": "4K"|"1440p"|"1080p"|"720p"}
     {"action": "set_duration",  "value": <int seconds, 0 = manual>}
     {"action": "realign"}                         re-freeze alignment
-    {"action": "swap"}                            swap left/right cameras
 
 Unknown and refused actions both come back ``ok: false`` with an error
 string — the controller decides what is legal at that moment and the server

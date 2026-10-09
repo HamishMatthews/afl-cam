@@ -1,6 +1,5 @@
 """GTK3 GUI for afl-cam — live preview, recording controls, playback browser."""
 
-import json
 import logging
 import os
 import subprocess
@@ -20,33 +19,15 @@ from .config import (
     CAMERAS, RESOLUTIONS, DEFAULT_RESOLUTION, LIVE_STITCH,
     PREVIEW_WIDTH, PREVIEW_HEIGHT, CAPTURES_DIR, DB_PATH, ROOT_DIR, PLATFORM,
 )
-from .capture import (camera_device, camera_present, set_auto_exposure,
-                      start_audio_capture, stop_audio_procs)
+from .capture import (camera_device, camera_present, ensure_cameras,
+                      set_auto_exposure, start_audio_capture,
+                      stop_audio_procs)
 from .db import RecordingDB
 from .engine import can_live_stitch, make_preview, make_recorder
 from .remote import RemoteServer
 from .sessions import new_session_dir, session_dir_is_safe, remove_session_dir
 
 log = logging.getLogger("afl_cam.ui")
-
-# Persisted Swap-button state — the cameras are hardcoded to physical USB
-# sockets in config.py; if the rig wiring ever differs, the user's swap
-# sticks across restarts (no physical cable swapping).
-CAMERA_SIDES_FILE = ROOT_DIR / "calibration" / "camera_sides.json"
-
-
-def _load_camera_sides() -> bool:
-    try:
-        return bool(json.loads(CAMERA_SIDES_FILE.read_text()).get("swapped"))
-    except (OSError, ValueError):
-        return False
-
-
-def _save_camera_sides(swapped: bool) -> None:
-    try:
-        CAMERA_SIDES_FILE.write_text(json.dumps({"swapped": swapped}))
-    except OSError:
-        pass
 
 
 
@@ -181,7 +162,7 @@ class PreviewPanel(Gtk.Frame):
             return self._got_frame
 
 
-# Control bar — resolution, duration, record/stop, swap
+# Control bar — resolution, duration, record/stop
 
 class ControlBar(Gtk.Box):
     """Recording controls — two rows so the bar fits narrow screens."""
@@ -198,11 +179,7 @@ class ControlBar(Gtk.Box):
         self.pack_start(row1, False, False, 0)
         self.pack_start(row2, False, False, 0)
 
-        # Row 1: Swap | Resolution | Mode | Duration +/-
-        self.swap_btn = Gtk.Button(label="Swap")
-        self.swap_btn.set_tooltip_text("Rotate left/right camera previews")
-        row1.pack_start(self.swap_btn, False, False, 0)
-
+        # Row 1: Resolution | Mode | Duration +/-
         row1.pack_start(Gtk.Label(label="Res:"), False, False, 0)
         self.res_combo = Gtk.ComboBoxText()
         for key in RESOLUTIONS:
@@ -419,20 +396,24 @@ class MainWindow(Gtk.ApplicationWindow):
         self._stitching = False
         self._realigning = False
         self._session_id: int | None = None
-        self._swapped = _load_camera_sides()
         self._rec_start: float = 0.0
         self._timer_id = None
         self._preview_timer = None
         self._session_dir: Path | None = None
 
+        # Camera bring-up: kick wedged devices and re-discover if any
+        # camera is missing (see capture.py). Left/right is hardcoded to
+        # the physically labeled sockets — no swap feature.
+        log.info("cameras: %s", ensure_cameras())
+
         # State: assigned camera per panel position (left=0, right=1)
         # [0] = cam label for left panel, [1] = cam label for right panel
         self._panel_cams = ["cam0", "cam1"]
-        if self._swapped:
-            self._panel_cams.reverse()
+        self._health_last_kick = 0.0
 
         self._build_ui()
         self._start_previews()
+        GLib.timeout_add(5000, self._health_check)
 
         # Field remote (iPhone over the board AP): HTTP control + preview
         # snapshots. The server calls the remote_* methods below from its
@@ -470,7 +451,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def remote_action(self, action: str, params: dict) -> bool:
         """Validate + enqueue a field-remote action for the GTK thread."""
         if action not in ("toggle", "set_mode", "set_resolution",
-                          "set_duration", "realign", "swap"):
+                          "set_duration", "realign"):
             return False
         self._remote_actions.put((action, params))
         return True
@@ -492,9 +473,6 @@ class MainWindow(Gtk.ApplicationWindow):
         elif action == "realign":
             if not self._recording and not self._realigning:
                 self._on_realign(None)
-        elif action == "swap":
-            if not self._recording:
-                self._on_swap(None)
         elif action == "set_mode":
             if not self._recording:
                 self._controls.set_record_mode(str(params.get("value", "")))
@@ -539,7 +517,6 @@ class MainWindow(Gtk.ApplicationWindow):
 
 # Controls 
         self._controls = ControlBar()
-        self._controls.swap_btn.connect("clicked", self._on_swap)
         self._controls.record_btn.connect("clicked", self._on_record_toggle)
         main.pack_start(self._controls, False, False, 0)
 
@@ -649,16 +626,23 @@ class MainWindow(Gtk.ApplicationWindow):
             p.stop()
         self._previews.clear()
 
-    def _on_swap(self, _btn):
-        """Swap which camera is shown on left vs right (persists)."""
-        self._swapped = not self._swapped
-        self._panel_cams[0], self._panel_cams[1] = self._panel_cams[1], self._panel_cams[0]
-        _save_camera_sides(self._swapped)
-        self._stop_previews()
+    def _health_check(self) -> bool:
+        """Idle watchdog: a camera can drop mid-session (USB glitch,
+        wedge). If a device path vanishes, kick + rediscover + restart
+        previews. Never runs while recording — cameras are busy then.
+        Throttled to one recovery attempt per 30 s."""
+        if self._recording or self._stitching or self._realigning:
+            return True
+        if all(camera_present(c) for c in ("cam0", "cam1")):
+            return True
+        now = time.time()
+        if now - self._health_last_kick < 30:
+            return True
+        self._health_last_kick = now
+        log.warning("camera drop detected — attempting recovery")
+        log.info("cameras: %s", ensure_cameras())
         self._start_previews()
-        log.info("Cameras swapped: left=%s right=%s", self._panel_cams[0], self._panel_cams[1])
-
-
+        return True
 
     def _on_record_toggle(self, _btn):
         if self._recording:
@@ -773,7 +757,6 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self._recording = True
         self._controls.set_recording(True)
-        self._controls.swap_btn.set_sensitive(False)
         self._stitch_btn.set_sensitive(False)
         self._controls.status_label.set_text("Recording... 0:00")
         self._rec_start = time.time()
@@ -856,7 +839,6 @@ class MainWindow(Gtk.ApplicationWindow):
             self._preview_timer = None
         self._stop_audio()
         self._controls.set_recording(False)
-        self._controls.swap_btn.set_sensitive(True)
         self._stitch_btn.set_sensitive(not self._stitching)
         self._controls.status_label.set_text("Ready")
         self._recording_list.refresh()
@@ -1071,7 +1053,6 @@ class MainWindow(Gtk.ApplicationWindow):
         """Disable interactive buttons while a stitch is running."""
         self._stitch_btn.set_sensitive(not busy)
         self._controls.record_btn.set_sensitive(not busy)
-        self._controls.swap_btn.set_sensitive(not busy)
         self._realign_btn.set_sensitive(not busy)
 
     def _on_realign(self, _btn):

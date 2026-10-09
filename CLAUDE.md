@@ -78,17 +78,21 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   frames (no V4L2 gain control exists). The recorder's "auto-settle-then-lock"
   checks mean frame interval. Never assume fps limits from time-of-day — the
   pipeline capacity is ~30 fps at full canvas when light allows.
-- **Camera discovery** (`config.py`): the cameras carry IDENTICAL USB serials
-  (`01.00.00`, same mfr/firmware) — the PHYSICAL USB SOCKET is the only
-  identity. Hardcoded: cam0 (left) = EHCI `fc880000.usb`/OHCI `fc8c0000.usb`,
-  cam1 (right) = EHCI `fc800000.usb`/OHCI `fc840000.usb` (plus the xhci.12/11
-  aliases if cables move to USB3 ports). Node numbers still shuffle per
-  reboot; discovery keys by controller+port. The Swap button now PERSISTS
-  (`calibration/camera_sides.json`). A camera whose high-speed chirp fails
-  (USB firmware wedged after a crash mid-stream) re-enumerates at 12M on the
-  OHCI side where uvcvideo's probe FAILS (no video node = frozen panel) —
+- **Camera discovery** (`config.py`): the cameras carry IDENTICAL USB
+  descriptors (serial `01.00.00`, same mfr/firmware — descriptor blobs
+  verified byte-identical, 2026-10-09), so identity = the PHYSICALLY
+  LABELED rig sockets. Hardcoded `_CAMERA_PORTS` map: cam0 (left) = xhci.11
+  USB3 socket (USB2 aliases EHCI `fc800000.usb`/OHCI `fc840000.usb`),
+  cam1 (right) = xhci.12 (aliases `fc880000.usb`/`fc8c0000.usb`). Node
+  numbers shuffle per reboot; discovery keys by controller+port. NO swap
+  feature (removed 2026-10-09 by design) — if the rig wiring ever changes,
+  edit that one map. A camera whose high-speed chirp fails (USB firmware
+  wedged after a crash mid-stream) re-enumerates at 12M on the OHCI side
+  where uvcvideo's probe FAILS (no video node = frozen panel) —
   `scripts/usb_kick_cameras.sh` (authorized toggle → EHCI/OHCI rebind)
-  recovers it without a replug; physical replug = VBUS power cycle.
+  recovers it without a replug, and the UI runs it at startup when a
+  camera is missing (needs the `/etc/sudoers.d/afl-cam-usb-kick` NOPASSWD
+  rule); physical replug = VBUS power cycle.
 - **NVMe**: root disk (Samsung 980) overheats → PCIe link drop → ext4 errors →
   black screen. `pcie_aspm=off nvme_core.default_ps_max_latency_us=0` are in
   `/boot/armbianEnv.txt`; the drive STILL needs a heatsink (hwmon7 crit

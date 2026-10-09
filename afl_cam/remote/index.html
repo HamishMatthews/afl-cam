@@ -155,7 +155,6 @@
     </div>
     <div id="btnrow">
       <button id="realign" type="button">Re-align</button>
-      <button id="swap" type="button">Swap</button>
     </div>
   </section>
 </main>
@@ -195,7 +194,7 @@ const DURS = [[0, "Manual"], [60, "1 min"], [300, "5 min"], [600, "10 min"],
 
 const el = {
   status: $("statusline"), rec: $("rec"), msg: $("msg"),
-  realign: $("realign"), swap: $("swap"),
+  realign: $("realign"),
   mode: $("mode"), res: $("res"), dur: $("dur"),
   img: [$("img0"), $("img1")], ph: [$("ph0"), $("ph1")],
 };
@@ -371,7 +370,6 @@ function refreshControls() {
   el.realign.disabled = raBusy || S.recording || S.recBusy || !S.online;
   el.realign.textContent = raBusy ? "Re-aligning…" : "Re-align";
 
-  el.swap.disabled = locked || !S.online;
 }
 
 function msg(text, kind) {
@@ -445,9 +443,6 @@ el.realign.addEventListener("click", async () => {
   }
 });
 
-el.swap.addEventListener("click", async () => {
-  if (S.recording || S.realigning || S.realignBusy) return;
-  if (await post("swap")) msg("cameras swapped — check preview order", "ok");
 });
 
 /* ---------------- main loop ---------------- */

@@ -13,7 +13,8 @@ from typing import List, Optional
 
 import cv2
 
-from .config import AUDIO_DEVICES, CAMERAS, PLATFORM
+from .config import AUDIO_DEVICES, CAMERAS, PLATFORM, ROOT_DIR, \
+    rediscover_cameras
 
 log = logging.getLogger("afl_cam.capture")
 
@@ -34,6 +35,49 @@ def camera_present(cam_key: str) -> bool:
         cap.release()
         return ok
     return os.path.exists(dev)
+
+
+# ---------------------------------------------------------------------------
+# Camera bring-up. Left/right is HARDCODED to the physically labeled rig
+# sockets (config._CAMERA_PORTS) — no swap feature, no image tests. The
+# only runtime hazard is a camera whose USB firmware wedges after a hard
+# crash mid-stream: it re-enumerates at 12 Mbps where uvcvideo's probe
+# fails, leaving no /dev node. usb_kick_cameras.sh recovers it.
+# ---------------------------------------------------------------------------
+
+KICK_SCRIPT = ROOT_DIR / "scripts" / "usb_kick_cameras.sh"
+
+
+def kick_wedged_cameras() -> bool:
+    """Soft-reset a camera stuck at 12 Mbps (no /dev node, frozen panel).
+
+    Needs the NOPASSWD sudoers rule for usb_kick_cameras.sh; fails quietly
+    without it (the script is idempotent — exits 0 when both are healthy).
+    """
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", str(KICK_SCRIPT)],
+            capture_output=True, text=True, timeout=60)
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def ensure_cameras() -> str:
+    """Bring-up at (re)start: if a camera is missing, kick wedged devices
+    and re-discover. Returns a one-line summary for the log."""
+    if PLATFORM == "darwin":
+        return "macOS: fixed AVFoundation indices"
+    missing = [c for c in ("cam0", "cam1") if not camera_present(c)]
+    if missing:
+        kick_wedged_cameras()
+        rediscover_cameras()
+        missing = [c for c in ("cam0", "cam1") if not camera_present(c)]
+    summary = (f"{2 - len(missing)}/2 cameras online: "
+               f"cam0={CAMERAS.get('cam0')} cam1={CAMERAS.get('cam1')}")
+    if missing:
+        summary += f" (missing: {', '.join(missing)} — replug/relabel check)"
+    return summary
 
 
 def capture_frame(cam_key: str, width: int = 3840, height: int = 2160):
