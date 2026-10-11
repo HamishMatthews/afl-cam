@@ -129,23 +129,11 @@ cmd_ap() {
 }
 
 cmd_boot_ap() {
-    # afl-cam-ap.service at boot: wait for NM to settle, then bring the AP
-    # up ONLY if no home WiFi connected (at the ground). At home, do nothing.
-    local waited=0
-    while [ $waited -lt 45 ]; do
-        if [ -n "$(home_active)" ]; then
-            log "home WiFi connected — AP not needed"
-            exit 0
-        fi
-        # a failed home connection attempt looks like "connecting"
-        if $NM -t -f DEVICE,STATE dev status 2>/dev/null | grep -q "wlan0:connected"; then
-            log "wlan0 connected — AP not needed"
-            exit 0
-        fi
-        sleep 5
-        waited=$((waited + 5))
-    done
-    log "no home WiFi after ${waited}s — bringing the AP up"
+    # afl-cam-ap.service at boot. Internet comes from the WIRED LAN
+    # (2026-10-11) — the WiFi radio's only job is the field AP, so it
+    # comes up unconditionally. (The old home-WiFi gate made the AP stand
+    # down at home and confused desk tests.)
+    log "wired LAN is the internet path — bringing the AP up"
     stop_hostapd
     start_hostapd || exit 1
 }
