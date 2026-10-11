@@ -906,6 +906,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._set_time(body)
         if path == "/api/schedule":
             return self._schedule(body)
+        if path == "/api/release":
+            self.daemon.release_for_ui()
+            return self._ok()
         self._err("not found", status=404)
 
     def do_DELETE(self):
@@ -1007,6 +1010,8 @@ class CamDaemon:
         self._pending_start = False
         self._pending_stop = False
         self._idle_sigterm = False    # we asked the pipeline down (not a crash)
+        self._hold_until = 0.0        # UI handover: don't respawn until then
+        self._sigterm_sent_at = 0.0   # SIGTERM'd; SIGKILL if it doesn't exit
         self._starting_since = 0.0
         self._intents_lock = threading.Lock()
         self._requests: dict = {}    # request_id -> outcome (idempotency)
@@ -1106,11 +1111,47 @@ class CamDaemon:
         (crash retries) and any recent HTTP/WS activity."""
         if self.stopping:
             return False
+        if time.time() < self._hold_until:
+            return False           # UI handover in progress
         if self.state != "idle":
             return True
         if self._pending_start or self._ws:
             return True
         return time.time() - self._last_http < 2
+
+    def release_for_ui(self):
+        """Hand the cameras to the desktop UI (POST /api/release): close
+        the pipeline and hold off respawning long enough for the UI to
+        open the cameras without a race. The daemon keeps serving the
+        phone page and resumes automatically on the next wake once the
+        UI has closed."""
+        log.info("release: closing the pipeline for the desktop UI")
+        self._idle_sigterm = True
+        self._last_http = 0.0       # this request must not wake it back up
+        self._set_state("idle")
+        self._hold_until = time.time() + 15
+        self._sigterm_sent_at = time.time()
+        proc = self.supervisor.proc
+        if proc is None and self.supervisor._adopted:
+            # adopted (foreign) pipeline: ask it over the ctl socket
+            try:
+                self.supervisor.command("QUIT", timeout=3)
+            except Exception:
+                pass
+        elif proc is not None:
+            # Wait here so the caller knows the cameras are free: cam2stitch
+            # can deadlock in its exit path and must be SIGKILLed — the
+            # tick has the same enforcement as a safety net (2026-10-11).
+            proc.send_signal(15)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning("release: pipeline didn't exit in 5s — SIGKILL")
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
 
     def request_new(self, request_id: str) -> bool:
         with self._intents_lock:
@@ -1183,9 +1224,14 @@ class CamDaemon:
                 self._set_state("starting", error=None)
 
             if self.state == "starting":
+                # released for the UI handover: the pipeline being down is
+                # intentional — go idle instead of spinning in "starting"
+                if time.time() < self._hold_until \
+                        and self.supervisor.proc is None:
+                    self._set_state("idle")
                 # adopted pipelines have proc=None — the socket connection
                 # and the pushed status are the liveness proof, not proc
-                if st is not None and (
+                elif st is not None and (
                         self.supervisor.proc is not None
                         or self.supervisor._adopted):
                     if st.get("state") == "recording":
@@ -1266,8 +1312,22 @@ class CamDaemon:
                          IDLE_STOP_SECS)
                 self._idle_sigterm = True
                 self._set_state("idle")
+                self._sigterm_sent_at = now
                 if self.supervisor.proc is not None:
                     self.supervisor.proc.send_signal(15)
+
+            # enforce pipeline death: cam2stitch can deadlock in its exit
+            # path (all threads in futex waits after closing the cameras —
+            # seen 2026-10-11). Cameras are already free at that point, so
+            # a SIGKILL is clean. Without this, the open ctl socket makes
+            # the supervisor wait forever and the cameras never hand over.
+            if self._sigterm_sent_at and self.supervisor.proc is not None \
+                    and self.supervisor.proc.poll() is None \
+                    and now - self._sigterm_sent_at > 5:
+                log.warning("pipeline didn't exit %.0fs after SIGTERM — "
+                            "SIGKILL", now - self._sigterm_sent_at)
+                self.supervisor.proc.kill()
+                self._sigterm_sent_at = 0.0
 
             # hardware button (GPIO, optional): toggle record
             self._poll_button()

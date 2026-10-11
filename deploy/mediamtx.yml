@@ -23,11 +23,17 @@ api: no
 
 hls: yes
 hlsAddress: :8888
-hlsAllowOrigin: '*'
+hlsAllowOrigins: ['*']
+# Standard (mpegts) HLS, NOT low-latency: the stitched preview is VFR
+# (camera sensors jitter), and LL-HLS requires constant part durations —
+# mediamtx logged "part duration changed ... will cause an error in iOS
+# clients" and iPhones showed black/catchup/not-running (2026-10-11).
+hlsVariant: mpegts
+hlsSegmentDuration: 1s
 
 webrtc: yes
 webrtcAddress: :8889
-webrtcAllowOrigin: '*'
+webrtcAllowOrigins: ['*']
 
 paths:
   preview:

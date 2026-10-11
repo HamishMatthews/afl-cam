@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
@@ -625,9 +626,10 @@ class MainWindow(Gtk.ApplicationWindow):
         return False  # one-shot
 
     def _check_daemon_conflict(self) -> bool:
-        """Warn when afl-camd (the field daemon) owns the cameras — the
-        previews will show no frames. Clear instruction beats the old
-        silent "no frames — wrong device?" confusion."""
+        """afl-camd (the phone service) may own the cameras. Offer a
+        one-click handover: the daemon closes its pipeline on request
+        (it keeps serving the phone page and resumes automatically once
+        the UI closes) — no sudo, no terminal, no restart."""
         try:
             active = subprocess.run(
                 ["systemctl", "is-active", "--quiet", "afl-camd"],
@@ -638,16 +640,32 @@ class MainWindow(Gtk.ApplicationWindow):
             return False
         dialog = Gtk.MessageDialog(
             transient_for=self, modal=True,
-            message_type=Gtk.MessageType.WARNING,
-            buttons=Gtk.ButtonsType.OK,
-            text="afl-camd (the field daemon) is running and owns the cameras.\n"
-                 "The UI previews will show no frames.\n\n"
-                 "Desk mode: run this in a terminal, then restart the UI:\n\n"
-                 "    systemctl stop afl-camd\n\n"
-                 "    uv run afl-cam ui",
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text="The phone service (afl-camd) is running and owns the cameras.",
         )
-        dialog.run()
+        dialog.format_secondary_text(
+            "Take over the cameras for this UI session? The phone page stays "
+            "available and the service resumes automatically when the UI "
+            "closes.")
+        dialog.add_button("Take over from phone service", Gtk.ResponseType.OK)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        response = dialog.run()
         dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return False
+        # the daemon closes the pipeline itself and holds off respawning
+        # while the UI opens the cameras
+        for port in (80, 8080):
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/release", method="POST",
+                    data=b"{}", headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=4)
+                break
+            except OSError:
+                continue
+        time.sleep(2)   # let cam2stitch close the cameras
         return False
 
     def _stop_previews(self):
