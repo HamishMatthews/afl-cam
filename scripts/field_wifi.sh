@@ -71,7 +71,7 @@ start_hostapd() {
     # requests flap the interface and wedge the bcmdhd firmware (channel
     # stuck at 5GHz/34, garbage SSID buffer — verified 2026-10-11).
     sudo_cmd $NM dev set wlan0 managed no
-    if pgrep -f "hostapd .*afl-cam" > /dev/null; then
+    if pgrep -x hostapd > /dev/null; then
         log "hostapd already running"
         return 0
     fi
@@ -101,7 +101,9 @@ start_hostapd() {
 }
 
 stop_hostapd() {
-    sudo_cmd pkill -f "hostapd .*afl-cam" 2>/dev/null || true
+    # -x exact-name only: pkill -f patterns match the caller's own command
+    # line and kill it (exit 144 — bit us twice)
+    sudo_cmd pkill -x hostapd 2>/dev/null || true
     sudo_cmd pkill -x dnsmasq 2>/dev/null || true
     sudo_cmd ip addr flush dev wlan0 2>/dev/null || true
     sleep 1
@@ -160,7 +162,9 @@ cmd_follow() {
     trap 'log "stopped by user"; exit 0' INT
     while true; do
         # case- and apostrophe-insensitive match: iPhone names broadcast with
-        # a typographic apostrophe (U+2019) and title case
+        # a typographic apostrophe (U+2019) and title case. Scan with iw
+        # directly — nmcli scans need polkit, and this board's polkit agent
+        # is wedged (stuck auth dialogs, 2026-10-11).
         actual_ssid=""
         while IFS= read -r line; do
             a=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' | tr -d "'\342\200\231")
@@ -169,7 +173,8 @@ cmd_follow() {
                 actual_ssid="$line"
                 break
             fi
-        done < <($NM -t -f SSID dev wifi list 2>/dev/null)
+        done < <(sudo_cmd iw dev wlan0 scan 2>/dev/null \
+            | awk '/SSID:/{sub(/^[ \t]*SSID: /, ""); print}')
         if [ -n "$actual_ssid" ]; then
             if ! $NM -t -f NAME con show | grep -qx "$HOTSPOT_PROFILE"; then
                 log "creating profile $HOTSPOT_PROFILE for '$actual_ssid'"
