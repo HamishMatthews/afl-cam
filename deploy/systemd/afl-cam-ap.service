@@ -1,0 +1,12 @@
+[Unit]
+Description=afl-cam field AP (hostapd + dnsmasq — only when no home WiFi)
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/hamish/Documents/afl-cam/scripts/field_wifi.sh ap-boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

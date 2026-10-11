@@ -7,11 +7,13 @@
 # Installs and enables:
 #   /usr/local/bin/mediamtx            MediaMTX v1.21.2 (checksum-verified)
 #   /usr/local/etc/mediamtx.yml        preview server config (deploy/)
-#   systemd units:                     mediamtx, afl-camd, gpu-governor
+#   hostapd (apt) + /etc/hostapd/afl-cam.conf
+#   systemd units:                     mediamtx, afl-camd, gpu-governor,
+#                                      afl-cam-ap (boot-time field AP)
 #   /etc/avahi/services/aflcam.service aflcam.local mDNS alias
-# and verifies the afl-cam-ap NetworkManager profile autoconnects
-# (priority -999: the home WiFi wins at home; at the ground, where the
-# home network is absent, the board's AP comes up by itself — no scripts).
+# AP note (verified 2026-10-09): NM's AP mode hangs on this board's bcmdhd
+# driver — the AP runs hostapd+dnsmasq (afl-cam-ap.service brings it up at
+# boot only when no home WiFi is connected; NM keeps the home client job).
 #
 # The GTK UI (afl-cam ui) is the desk tool: stop afl-camd first
 # (systemctl stop afl-camd) — daemon and UI can't share the cameras.
@@ -40,28 +42,28 @@ $SUDO bash -c "
     cp deploy/systemd/mediamtx.service /etc/systemd/system/
     cp deploy/systemd/afl-camd.service /etc/systemd/system/
     cp deploy/systemd/gpu-governor.service /etc/systemd/system/
-    mkdir -p /etc/avahi/services
+    cp deploy/systemd/afl-cam-ap.service /etc/systemd/system/
+    mkdir -p /etc/avahi/services /etc/hostapd
     cp deploy/avahi/aflcam.service /etc/avahi/services/
     cp deploy/avahi/hosts /etc/avahi/hosts
+    cp deploy/hostapd-afl-cam.conf /etc/hostapd/afl-cam.conf
     systemctl daemon-reload
-    systemctl enable mediamtx afl-camd gpu-governor
-    systemctl restart avahi-daemon gpu-governor mediamtx afl-camd
+    systemctl enable mediamtx afl-camd gpu-governor afl-cam-ap
+    systemctl restart avahi-daemon gpu-governor mediamtx afl-camd afl-cam-ap
 "
 
-echo "[install] verifying the AP profile autoconnects (field boot = board AP)…"
+echo "[install] hostapd (NM AP mode hangs on this bcmdhd board)…"
+if ! which hostapd > /dev/null 2>&1; then
+    $SUDO apt-get install -y hostapd
+fi
+
+echo "[install] neutering the legacy NM AP profile (its activations wedge the WiFi)…"
 if nmcli -t -f NAME con show | grep -qx "afl-cam-ap"; then
-    $SUDO nmcli con modify afl-cam-ap \
-        connection.autoconnect yes connection.autoconnect-priority -999
-else
-    echo "[install] WARNING: afl-cam-ap profile missing — create it with:"
-    echo "  nmcli con add type wifi ifname wlan0 con-name afl-cam-ap mode ap \\"
-    echo "    ssid afl-cam wifi-sec.key-mgmt wpa-psk wifi-sec.psk aflcam2026 \\"
-    echo "    ipv4.method shared connection.autoconnect yes \\"
-    echo "    connection.autoconnect-priority -999"
+    $SUDO nmcli con modify afl-cam-ap connection.autoconnect no
 fi
 
 echo
 echo "[install] done. From now on: power on -> join 'afl-cam' (aflcam2026)"
 echo "           -> open http://aflcam.local/  (or http://10.42.0.1/)."
 echo "           At home the board joins the house WiFi instead:"
-echo "           http://aflcam.local/ works there too."
+echo "           http://orangepi5-max.local/ works there too."

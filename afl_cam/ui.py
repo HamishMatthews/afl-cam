@@ -574,6 +574,9 @@ class MainWindow(Gtk.ApplicationWindow):
         # Initial list load
         GLib.idle_add(self._recording_list.refresh)
 
+        # afl-camd conflict warning (after the window is visible)
+        GLib.idle_add(self._check_daemon_conflict)
+
 
 
     def _start_previews(self):
@@ -618,8 +621,34 @@ class MainWindow(Gtk.ApplicationWindow):
     def _check_preview_frames(self) -> bool:
         for side, panel in (("left", self._left_panel), ("right", self._right_panel)):
             if self._previews.get(side) is not None and not panel.got_frame:
-                panel.set_status("no frames — wrong device?")
+                panel.set_status("no frames — camera busy or wedged?")
         return False  # one-shot
+
+    def _check_daemon_conflict(self) -> bool:
+        """Warn when afl-camd (the field daemon) owns the cameras — the
+        previews will show no frames. Clear instruction beats the old
+        silent "no frames — wrong device?" confusion."""
+        try:
+            active = subprocess.run(
+                ["systemctl", "is-active", "--quiet", "afl-camd"],
+                timeout=5).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            active = False
+        if not active:
+            return False
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK,
+            text="afl-camd (the field daemon) is running and owns the cameras.\n"
+                 "The UI previews will show no frames.\n\n"
+                 "Desk mode: run this in a terminal, then restart the UI:\n\n"
+                 "    systemctl stop afl-camd\n\n"
+                 "    uv run afl-cam ui",
+        )
+        dialog.run()
+        dialog.destroy()
+        return False
 
     def _stop_previews(self):
         for p in self._previews.values():

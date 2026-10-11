@@ -916,24 +916,26 @@ static int pv_init(pv_t *pv, int w, int h, int fps, int bitrate_kbps) {
     mpp_enc_cfg_set_s32(cfg, "h264:level", 42);
     mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", 0);
     mpp_enc_cfg_set_s32(cfg, "h264:trans8x8", 0);
-    /* SPS/PPS in-band before EVERY IDR: the proxy file starts on a forced
-     * IDR and must carry its own headers (ffmpeg refuses PPS-less streams),
-     * and late UDP joiners (MediaMTX/ffmpeg) self-synchronize within a GOP */
-    mpp_enc_cfg_set_s32(cfg, "prep:header_mode", MPP_ENC_HEADER_MODE_EACH_IDR);
+    /* (prep:header_mode EACH_IDR is NOT set: the cfg write fails with
+     * ret -1 on this encoder — rkvenc never emits parameter sets anyway,
+     * the drain injects the captured SPS/PPS before IDRs instead) */
     if (pv->mpi->control(pv->ctx, MPP_ENC_SET_CFG, cfg))
         return -1;
+    /* packet group EXACTLY as the proven cam2h264 recorder: 4MB buffers,
+     * limit 4, ONE held output buffer (the 1MBx8 + 4-held arrangement
+     * made rkvenc's H.264 path double-release packets every frame —
+     * "non-positive ref_count" spam, 400MB log, wedged pipeline) */
     if (mpp_buffer_group_get_internal(&pv->pkt_grp, MPP_BUFFER_TYPE_DRM))
         return -1;
-    if (mpp_buffer_group_limit_config(pv->pkt_grp, 1024 * 1024, 8))
+    if (mpp_buffer_group_limit_config(pv->pkt_grp, 4 * 1024 * 1024, 4))
         return -1;
-    for (int i = 0; i < 4; i++)
-        if (mpp_buffer_get(pv->pkt_grp, &pv->out_buf[i], 1024 * 1024))
-            return -1;
+    if (mpp_buffer_get(pv->pkt_grp, &pv->out_buf[0], 4 * 1024 * 1024))
+        return -1;
     /* SPS/PPS header — rkvenc does NOT honour prep:header_mode EACH_IDR
      * (measured: IDRs carry SEI but no parameter sets), so capture the
      * header once and re-send it before every IDR on the UDP path +
      * write it into the proxy file on REC_START */
-    {
+    if (!getenv("AFL_CAM_PV_NOHDR")) {
         MppBuffer hdr_buf = NULL;
         MppPacket hdr = NULL;
         if (!mpp_buffer_get(pv->pkt_grp, &hdr_buf, 1024 * 1024)
@@ -1103,16 +1105,13 @@ static void pv_put_drain(pv_t *pv, int64_t pts) {
     pv->fresh = 0;
     pthread_mutex_unlock(&pv->mu);
 
-    /* fresh input frame each put (same rule as snap_write: a reused
-     * frame's stale packet meta double-releases the output buffer) */
-    mpp_frame_deinit(&pv->in_frame);
-    mpp_frame_init(&pv->in_frame);
-    mpp_frame_set_width(pv->in_frame, pv->w);
-    mpp_frame_set_height(pv->in_frame, pv->h);
-    mpp_frame_set_hor_stride(pv->in_frame, pv->hs);
-    mpp_frame_set_ver_stride(pv->in_frame, pv->vs);
-    mpp_frame_set_fmt(pv->in_frame, MPP_FMT_YUV420SP);
-    mpp_frame_set_buffer(pv->in_frame, pv->in_buf);
+    /* persistent input frame — the MASTER encoder reuses ONE frame per
+     * put (set_pts + fresh output packet) and runs clean for hours. The
+     * deinit/reinit-per-put variant corrupted MPP's buffer refcounts
+     * under continuous preview encoding: after some hours the encoder
+     * path spammed "non-positive ref_count / put_meta invalid negative
+     * ref_count" (a 400MB log), stalled the main loop and wedged the
+     * pipeline (2026-10-11). Do NOT reintroduce per-put frame teardown. */
     mpp_frame_set_pts(pv->in_frame, pts);
     {
         MppPacket enc_pkt = NULL;
@@ -2390,11 +2389,11 @@ int main(int argc, char **argv) {
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_flex", 0);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_num", fps);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_out_denorm", 1);
-        /* SPS/PPS in-band before every IDR: a recording whose file header
-         * was lost (crash recovery) still decodes, and the stream is
-         * self-contained for any consumer */
-        mpp_enc_cfg_set_s32(enc_cfg, "prep:header_mode",
-                            MPP_ENC_HEADER_MODE_EACH_IDR);
+        /* (prep:header_mode is NOT set — the cfg write fails ret -1 on
+         * rkvenc and appears to leave the encoder emitting parameter-set
+         * packets with a broken lifecycle: per-frame double-release spam.
+         * The SPS/PPS header is captured once and written per file at
+         * REC_START instead.) */
         if (!use_hevc) {
             mpp_enc_cfg_set_s32(enc_cfg, "h264:profile", 100);
             mpp_enc_cfg_set_s32(enc_cfg, "h264:level", 52);

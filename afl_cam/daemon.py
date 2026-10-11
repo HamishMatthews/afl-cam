@@ -200,7 +200,7 @@ class StitchSupervisor(threading.Thread):
         logf = open(LIVE_SNAP_DIR / "stitch.log", "w")
         try:
             self.proc = subprocess.Popen(
-                cmd, stdout=logf, stderr=subprocess.STDOUT,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 env=env, cwd=str(ROOT_DIR))
         except OSError as e:
             log.error("stitch: spawn failed: %s", e)
@@ -208,6 +208,13 @@ class StitchSupervisor(threading.Thread):
             self.proc = None
             return False
         self._logf = logf
+        # filter thread: drop the PRE-EXISTING MPP refcount noise (present
+        # since before the daemon era — verified in commit 9ba8dc3 — and
+        # benign for the stream, but 2 lines/frame would flood the log:
+        # a wedged weekend wrote 400MB before logrotate was added)
+        threading.Thread(
+            target=self._pump_log, args=(self.proc, logf),
+            name="stitch-log", daemon=True).start()
         self._adopted = False
         # wait for the ctl socket (pipeline init takes ~1-3 s)
         deadline = time.time() + 20
@@ -223,6 +230,21 @@ class StitchSupervisor(threading.Thread):
         log.error("stitch: ctl socket never appeared")
         return False
 
+    def _pump_log(self, proc, logf):
+        _BENIGN = (b"ref_count", b"invalid mem pool ptr",
+                   b"put_meta invalid negative", b"MppPacket 0x")
+        try:
+            for line in proc.stdout:
+                if any(pat in line for pat in _BENIGN):
+                    continue
+                try:
+                    logf.write(line.decode(errors="replace"))
+                    logf.flush()
+                except OSError:
+                    break
+        except (OSError, ValueError):
+            pass
+
     def stop(self):
         self._stop.set()
         try:
@@ -236,6 +258,36 @@ class StitchSupervisor(threading.Thread):
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 proc.kill()
+
+    def kill_pipeline(self):
+        """Hard-reset a wedged pipeline so the supervisor respawns it
+        (watchdog path: stuck starting, or status stalled while running)."""
+        log.error("stitch: killing the pipeline (watchdog)")
+        self.set_status(None)
+        proc = self.proc
+        self.proc = None
+        self._adopted = False
+        if proc is None:
+            # adopted (foreign) process: ask it nicely over the socket
+            try:
+                self.command("QUIT", timeout=3)
+            except Exception:
+                pass
+        elif proc.poll() is None:
+            try:
+                proc.send_signal(15)
+                proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        if self._logf is not None:
+            try:
+                self._logf.close()
+            except OSError:
+                pass
+            self._logf = None
 
     def build_ok(self) -> bool:
         return build_cam2stitch() is not None
@@ -955,6 +1007,7 @@ class CamDaemon:
         self._pending_start = False
         self._pending_stop = False
         self._idle_sigterm = False    # we asked the pipeline down (not a crash)
+        self._starting_since = 0.0
         self._intents_lock = threading.Lock()
         self._requests: dict = {}    # request_id -> outcome (idempotency)
         self._request_order: list = []
@@ -1130,7 +1183,11 @@ class CamDaemon:
                 self._set_state("starting", error=None)
 
             if self.state == "starting":
-                if st is not None and self.supervisor.proc is not None:
+                # adopted pipelines have proc=None — the socket connection
+                # and the pushed status are the liveness proof, not proc
+                if st is not None and (
+                        self.supervisor.proc is not None
+                        or self.supervisor._adopted):
                     if st.get("state") == "recording":
                         # pipeline was already recording (daemon restarted
                         # while cam2stitch kept running)
@@ -1143,6 +1200,27 @@ class CamDaemon:
                     self._set_state("error", error=(
                         "pipeline failed to start — cameras busy or "
                         "init failed; check the board"))
+
+            # watchdogs: a stuck pipeline must never hold the cameras
+            # indefinitely (2026-10-11: a wedged encoder stalled the main
+            # loop, status stopped, and the daemon sat in "starting" for
+            # 36 hours with the cameras held)
+            if self.state == "starting" \
+                    and now - self._starting_since > 30:
+                log.error("watchdog: stuck in 'starting' — restarting "
+                          "the pipeline")
+                self.supervisor.kill_pipeline()
+                self._starting_since = now
+            elif self.state in ("standby", "recording", "finalizing") \
+                    and self.supervisor.status_ts \
+                    and now - self.supervisor.status_ts > 10:
+                log.error("watchdog: stitch status stalled %.0fs — "
+                          "restarting the pipeline",
+                          now - self.supervisor.status_ts)
+                self.supervisor.kill_pipeline()
+                if self.session is not None:
+                    # finalize what was written (per-packet flushes)
+                    self.on_stitch_exit()
 
             # pending start
             if self._pending_start and self.state == "standby":
@@ -1210,6 +1288,8 @@ class CamDaemon:
         if self.state != state:
             log.info("state: %s -> %s%s", self.state, state,
                      f" ({error})" if error else "")
+            if state == "starting":
+                self._starting_since = time.time()
         if error is not None:
             self.error = error
         elif self.state == "error" and state not in ("error", "finalizing"):
