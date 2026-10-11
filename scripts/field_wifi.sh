@@ -52,17 +52,36 @@ profile_active() {
 }
 
 home_profile() {
-    # First non-afl-cam wifi profile (netplan-wlan0-* or similar)
-    $NM -t -f NAME,TYPE con show 2>/dev/null \
-        | awk -F: '$2 ~ /wireless/ && $1 !~ /afl-cam/ {print $1; exit}'
+    # Prefer the netplan home connection; fall back to any non-afl-cam
+    # wireless profile (the phone-hotspot one would otherwise win).
+    local first=""
+    local name
+    while IFS= read -r name; do
+        [ -n "$first" ] || first="$name"
+        case "$name" in
+            netplan-*) echo "$name"; return ;;
+        esac
+    done < <($NM -t -f NAME,TYPE con show 2>/dev/null \
+        | awk -F: '$2 ~ /wireless/ && $1 !~ /afl-cam/ {print $1}')
+    echo "$first"
 }
 
 start_hostapd() {
+    # Lock NM out of wlan0 while hostapd owns it: NM/gnome-shell scan
+    # requests flap the interface and wedge the bcmdhd firmware (channel
+    # stuck at 5GHz/34, garbage SSID buffer — verified 2026-10-11).
+    sudo_cmd $NM dev set wlan0 managed no
     if pgrep -f "hostapd .*afl-cam" > /dev/null; then
         log "hostapd already running"
         return 0
     fi
     log "starting hostapd (SSID afl-cam / aflcam2026)..."
+    # bcmdhd needs the interface explicitly switched to AP role; hostapd's
+    # own set-type never sticks and then keys/beacons are refused.
+    sudo_cmd ip link set wlan0 down
+    sudo_cmd iw dev wlan0 set type __ap
+    sudo_cmd ip link set wlan0 up
+    sleep 1
     sudo_cmd nohup hostapd "$HOSTAPD_CONF" > /tmp/hostapd.log 2>&1 &
     sleep 3
     if pgrep -f "hostapd .*afl-cam" > /dev/null; then
@@ -136,6 +155,7 @@ cmd_follow() {
         exit 1
     fi
     stop_hostapd
+    sudo_cmd $NM dev set wlan0 managed yes
     log "scanning for hotspot SSID '$HOTSPOT_SSID' every 10 s (Ctrl-C to stop)..."
     trap 'log "stopped by user"; exit 0' INT
     while true; do
@@ -176,8 +196,32 @@ cmd_follow() {
     done
 }
 
+cmd_recover() {
+    # bcmdhd firmware-wedge recovery, verified 2026-10-11: unload the
+    # driver, rebind the SDIO host (re-runs the pwrseq power-on sequence
+    # for gpio85), reload. Clears the stuck-channel/garbage-SSID wedge
+    # without a reboot.
+    log "recovering the WiFi chip (driver reload + SDIO power cycle)..."
+    stop_hostapd
+    sudo_cmd $NM dev set wlan0 managed no
+    sudo_cmd ip link set wlan0 down 2>/dev/null
+    sudo_cmd rmmod bcmdhd_sdio 2>/dev/null
+    sleep 1
+    sudo_cmd bash -c "echo 3 > /proc/sys/vm/drop_caches"
+    sudo_cmd bash -c "echo fe2d0000.mmc > /sys/bus/platform/drivers/dwmmc_rockchip/unbind"
+    sleep 1
+    sudo_cmd bash -c "echo fe2d0000.mmc > /sys/bus/platform/drivers/dwmmc_rockchip/bind"
+    sleep 4
+    sudo_cmd modprobe bcmdhd_sdio
+    sleep 10
+    sudo_cmd ip link set wlan0 up
+    sleep 2
+    log "recovery done — run 'field_wifi.sh ap' to start the AP"
+}
+
 cmd_stop() {
     stop_hostapd
+    sudo_cmd $NM dev set wlan0 managed yes
     local home
     home=$(home_profile)
     if [ -n "$home" ]; then
@@ -192,6 +236,7 @@ case "${1:-}" in
     ap)          cmd_ap ;;
     ap-boot)     cmd_boot_ap ;;
     follow)      cmd_follow ;;
+    recover)     cmd_recover ;;
     stop)        cmd_stop ;;
-    *)           echo "usage: $0 {ap|ap-boot|follow|stop}" >&2; exit 2 ;;
+    *)           echo "usage: $0 {ap|ap-boot|follow|recover|stop}" >&2; exit 2 ;;
 esac

@@ -26,13 +26,15 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - Field remote (iPhone): primary = the afl-camd daemon (port 80, web UI +
   WHEP/HLS preview via MediaMTX on :8889/:8888). **Productionised
   (2026-10-09): `scripts/install_field_services.sh` enables systemd units
-  (mediamtx, afl-camd, gpu-governor) + the aflcam.local mDNS alias, and
-  the afl-cam-ap NM profile autoconnects at priority -999 — at the ground
-  the AP comes up by itself on boot (home WiFi wins at home). Field flow:
-  power on → phone joins `afl-cam`/`aflcam2026` → http://aflcam.local/.**
-  `scripts/field_wifi.sh ap|follow|stop` switches modes manually. The GTK
-  UI's remote page (`afl_cam/remote.py`, port 8080) is the fallback when
-  the UI runs — stop the daemon first (`systemctl stop afl-camd`; daemon
+  (mediamtx, afl-camd, gpu-governor) + the aflcam.local mDNS alias. At the
+  ground the afl-cam-ap.service boots the AP via `field_wifi.sh ap-boot`
+  (hostapd+dnsmasq, not the broken NM-AP path; waits 45 s for home WiFi
+  first, so home wins at home). Field flow: power on → phone joins
+  `afl-cam`/`aflcam2026` → http://aflcam.local/.**
+  `scripts/field_wifi.sh ap|ap-boot|follow|recover|stop` switches modes
+  manually (`recover` = bcmdhd firmware-wedge recovery, no reboot needed).
+  The GTK UI's remote page (`afl_cam/remote.py`, port 8080) is the fallback
+  when the UI runs — stop the daemon first (`systemctl stop afl-camd`; daemon
   and UI can't share the cameras). iPhone desk test checklist:
   `field_desk_test.md` (NOT yet run with a real iPhone).
 
@@ -114,6 +116,23 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - **SSBO sizes**: 4 Y bytes per uint, one `(u|v<<8)` uint per 2×2 chroma
   block → `2*cw*ch` bytes total; canvas width must be `% 4 == 0`. Past
   device-lost crashes were SSBO-size arithmetic (OOB writes), not LLVM.
+- **bcmdhd AP mode (2026-10-11, root cause of the invisible AP)**: the chip
+  can do AP, but only if nothing else touches wlan0. NM/gnome-shell scan
+  requests while hostapd owns the interface flap it → the firmware wedges
+  (stuck at 5 GHz channel 34, garbage SSID buffer, `iw` keeps reporting
+  `type managed`, hostapd crash-loops "key not allowed / Failed to set
+  beacon parameters") — and the wedge survives soft rfkill AND module
+  reload; only the SDIO power-on sequence clears it. Rules: `field_wifi.sh`
+  must (1) `nmcli dev set wlan0 managed no` and (2) `iw dev wlan0 set type
+  __ap` BEFORE hostapd starts — hostapd's own set-type never sticks and
+  without it keys/beacons are refused. `iw dev wlan0 info` is the only
+  board-side proof that matters: `type AP` + `channel 6 (2437 MHz)`, plus a
+  hostapd log that does NOT loop. Recovery without reboot
+  (`field_wifi.sh recover`): rmmod bcmdhd_sdio → drop_caches (CMA) →
+  unbind/rebind `fe2d0000.mmc` (dwmmc_rockchip; re-runs the sdio-pwrseq
+  gpio85 power-on) → modprobe. Watch for a stuck polkit auth overlay too —
+  a wedged gnome-shell agent respawns `polkit-agent-helper-1` at 100% CPU;
+  restart polkitd + NetworkManager to clear the pending request.
 - **Alignment math**: K is measured (checkerboard, distortion ZEROED — the
   paper board's waviness, not the lens); R is refined in **canvas space**
   with K fixed (`refine_rotation.py`). The 2-view bundle is degenerate on
