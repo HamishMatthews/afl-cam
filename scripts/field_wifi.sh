@@ -82,7 +82,8 @@ start_hostapd() {
     sudo_cmd iw dev wlan0 set type __ap
     sudo_cmd ip link set wlan0 up
     sleep 1
-    sudo_cmd nohup hostapd "$HOSTAPD_CONF" > /tmp/hostapd.log 2>&1 &
+    # redirect inside sudo: the log file is root-owned after the first run
+    sudo_cmd bash -c "rm -f /tmp/hostapd.log; nohup hostapd '$HOSTAPD_CONF' > /tmp/hostapd.log 2>&1" &
     sleep 3
     if pgrep -f "hostapd .*afl-cam" > /dev/null; then
         log "hostapd up"
