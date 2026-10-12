@@ -60,7 +60,9 @@ trap restore EXIT
 trap 'exit 130' INT TERM
 
 sudo -n systemctl stop afl-camd
-AFL_CAM_PORT=$PORT AFL_CAM_CTL_SOCK=$SOCK \
+# a re-align from the tests writes to a scratch dir, never calibration/
+mkdir -p rig-artifacts/realign
+AFL_CAM_PORT=$PORT AFL_CAM_CTL_SOCK=$SOCK AFL_CAM_ALIGN_OUT="$TREE/rig-artifacts/realign" \
     .venv/bin/python -m afl_cam.cli daemon > rig-daemon.log 2>&1 &
 DPID=$!
 

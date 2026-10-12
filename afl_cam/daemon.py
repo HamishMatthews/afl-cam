@@ -34,9 +34,16 @@ Endpoints (default port 80, AFL_CAM_PORT overrides)::
     GET  /api/recordings/<id>/thumb.jpg
     DELETE /api/recordings/<id>
     POST /api/schedule              {"start_at": epoch_ms, "stop_after": s}
+    POST /api/realign               re-align the cameras (closes the pipeline)
+    GET  /api/realign               re-align progress + full log + scores
+    GET  /api/realign/seam.jpg      seam crop from the last re-align
+    GET  /api/selftest              pre-game checks (cameras, alignment, …)
+    GET  /api/framing               seam + horizon positions for the preview
+    GET  /manifest.webmanifest, /icon-*.png   PWA (Add to Home Screen)
 
 State machine: idle → starting → standby → recording → finalizing →
-standby, plus error. Threading: one tick loop owns ALL state transitions;
+standby, plus error, and realigning (pipeline closed while the re-align
+chain owns the cameras; back to idle when it finishes). Threading: one tick loop owns ALL state transitions;
 HTTP threads only validate + queue intents (start/stop/…), which the tick
 loop executes. The ctl socket reader runs in its own thread and publishes
 cam2stitch status into a locked slot.
@@ -54,6 +61,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -62,10 +70,13 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
+from . import framing, selftest
 from .config import (
-    AUDIO_DEVICES, CAMERAS, DB_PATH, ENCODE_CODEC, OUTPUTS_DIR, ROOT_DIR,
-    STITCH_BITRATE_KBPS, STITCH_PARAMS_DIR, STITCH_RECORDER_BIN, STITCH_SHADER,
-    build_cam2stitch, rediscover_cameras, vk_env,
+    ALIGN_PYTHON, ALIGN_SCRIPT, AUDIO_DEVICES, CAMERAS, DB_PATH,
+    ENCODE_CODEC, OUTPUTS_DIR, ROOT_DIR, STITCH_BITRATE_KBPS,
+    STITCH_CANVAS_WIDTH, STITCH_PARAMS_DIR, STITCH_RECORDER_BIN,
+    STITCH_SHADER, _discover_cameras, build_cam2stitch, rediscover_cameras,
+    vk_env,
 )
 from .db import RecordingDB
 from .sessions import new_session_dir, remove_session_dir, session_dir_is_safe
@@ -94,6 +105,18 @@ WHEP_PORT = 8889
 HLS_PORT = 8888
 RESOLUTION = {"width": 3840, "height": 2160, "fps": 30}   # stitch pipeline
 HEVC = ENCODE_CODEC != "h264"
+# Re-align target: the live map set. The rig test points it at a scratch
+# dir (calibration/ is shared by every test run and must not be written).
+ALIGN_OUT = Path(os.environ.get("AFL_CAM_ALIGN_OUT") or STITCH_PARAMS_DIR)
+SCORE_SCRIPT = ROOT_DIR / "scripts" / "stitch_score.py"
+REALIGN_TIMEOUT_S = 900
+MAP_FILES = ("params.bin", "map0.bin", "map1.bin", "w0.bin", "w1.bin")
+PWA_FILES = {
+    "/manifest.webmanifest": ("manifest.webmanifest",
+                              "application/manifest+json"),
+    "/icon-180.png": ("icon-180.png", "image/png"),
+    "/icon-512.png": ("icon-512.png", "image/png"),
+}
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -193,6 +216,8 @@ class StitchSupervisor(threading.Thread):
             str(STITCH_SHADER),
         ]
         LIVE_SNAP_DIR.mkdir(parents=True, exist_ok=True)
+        if not self.daemon.pipeline_wanted():
+            return False            # closed while discovering (re-align)
         try:
             os.unlink(CTL_SOCK)
         except OSError:
@@ -709,6 +734,147 @@ class WSClient:
         return data
 
 
+# --------------------------------------------------------------- realign --
+
+class RealignJob(threading.Thread):
+    """Runs the re-align chain (scripts/recapture_alignment.py) while the
+    daemon holds the pipeline closed, keeping its output for the phone,
+    then scores the new stills against the old and the new map set (the
+    before/after the Setup view shows). The daemon owns the state; this
+    thread only runs processes and records what they said."""
+
+    LOG_LINES = 500
+    SCORE_KEYS = ("misalign_median", "misalign_p95", "misalign_tiles",
+                  "luma_ratio", "luma_step")
+
+    def __init__(self, daemon: "CamDaemon", out_dir: Path = None):
+        super().__init__(name="realign", daemon=True)
+        self.daemon = daemon
+        self.out_dir = Path(out_dir or ALIGN_OUT)
+        self.crop = LIVE_SNAP_DIR / "realign_seam.jpg"
+        self.started_at = time.time()
+        self.finished_at: Optional[float] = None
+        self.ok: Optional[bool] = None
+        self.error: Optional[str] = None
+        self.before: Optional[dict] = None
+        self.after: Optional[dict] = None
+        self._lines: list = []
+        self._lock = threading.Lock()
+
+    def say(self, line: str):
+        line = line.rstrip()
+        log.info("realign: %s", line)
+        with self._lock:
+            self._lines.append(line)
+            del self._lines[:-self.LOG_LINES]
+
+    def lines(self) -> list:
+        with self._lock:
+            return list(self._lines)
+
+    def summary(self, tail: int = 12) -> dict:
+        return {
+            "running": self.is_alive() and self.finished_at is None,
+            "ok": self.ok,
+            "error": self.error,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "before": self.before,
+            "after": self.after,
+            "has_crop": bool(self.ok and self.crop.is_file()),
+            "log_tail": self.lines()[-tail:],
+        }
+
+    def run(self):
+        try:
+            self._run()
+        except Exception as e:          # never leave the daemon parked
+            log.exception("realign crashed")
+            self.ok, self.error = False, f"re-align crashed: {e}"
+        if self.error:
+            self.say("✗ " + self.error)
+        self.finished_at = time.time()
+        self.daemon.on_realign_done(self)
+
+    def _run(self):
+        LIVE_SNAP_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            self.crop.unlink()
+        except OSError:
+            pass
+        # keep the current map set: "before" scores the NEW stills on it
+        with tempfile.TemporaryDirectory(prefix="realign-before-",
+                                         dir=LIVE_SNAP_DIR) as before:
+            before = Path(before)
+            have_before = self._snapshot_maps(STITCH_PARAMS_DIR, before)
+            self.say("capturing stills and fitting the alignment "
+                     "(about 2 minutes)…")
+            rc = self._stream([ALIGN_PYTHON, "-u", str(ALIGN_SCRIPT),
+                               str(self.out_dir), "--canvas-width",
+                               str(STITCH_CANVAS_WIDTH)])
+            if rc != 0:
+                self.ok = False
+                self.error = (f"re-align failed (exit {rc}) — the previous "
+                              "alignment is still in use")
+                return
+            self.say("scoring the new alignment…")
+            self.after = self._score(self.out_dir, self.crop)
+            if have_before:
+                self.before = self._score(before, None)
+        self.ok = True
+        self.say("✓ alignment updated — the next recording uses it")
+
+    @staticmethod
+    def _snapshot_maps(src: Path, dst: Path) -> bool:
+        try:
+            for name in MAP_FILES:
+                shutil.copy2(src / name, dst / name)
+        except OSError:
+            return False
+        return True
+
+    def _stream(self, cmd: list) -> int:
+        """Run cmd, forwarding each output line to the log as it comes."""
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", bufsize=1, env=env,
+                cwd=str(ROOT_DIR))
+        except OSError as e:
+            self.say(f"cannot run {Path(cmd[0]).name}: {e}")
+            return -1
+        killer = threading.Timer(REALIGN_TIMEOUT_S, proc.kill)
+        killer.start()
+        try:
+            for line in proc.stdout:
+                if line.strip():
+                    self.say(line)
+            return proc.wait()
+        finally:
+            killer.cancel()
+
+    def _score(self, maps: Path, crop: Optional[Path]) -> Optional[dict]:
+        """scripts/stitch_score.py on the stills the re-align left in
+        out_dir, against the map set in `maps`."""
+        cmd = [ALIGN_PYTHON, str(SCORE_SCRIPT),
+               str(self.out_dir / "cam0.rgb"), str(self.out_dir / "cam1.rgb"),
+               "--maps", str(maps)]
+        if crop is not None:
+            cmd += ["--crop", str(crop)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=300, cwd=str(ROOT_DIR))
+            score = json.loads(proc.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            self.say(f"scoring failed: {e}")
+            return None
+        if proc.returncode != 0 or not isinstance(score, dict):
+            self.say(f"scoring failed: {proc.stderr.strip()[-200:]}")
+            return None
+        return {k: score.get(k) for k in self.SCORE_KEYS}
+
+
 # ------------------------------------------------------------------ http --
 
 class _Handler(BaseHTTPRequestHandler):
@@ -825,8 +991,23 @@ class _Handler(BaseHTTPRequestHandler):
             # would fail at the ground (the AP has no internet)
             return self._serve_file(WEB_UI_DIR / "hls.min.js",
                                     "text/javascript")
+        if path in PWA_FILES:
+            name, ctype = PWA_FILES[path]
+            return self._serve_file(WEB_UI_DIR / name, ctype)
         if path == "/api/status":
             return self._json(self.daemon.snapshot())
+        if path == "/api/realign":
+            return self._json({"ok": True, **self.daemon.realign_status(full=True)})
+        if path == "/api/realign/seam.jpg":
+            job = self.daemon.realign
+            if job is None or not job.ok:
+                return self._err("not found", status=404)
+            return self._serve_file(job.crop, "image/jpeg")
+        if path == "/api/selftest":
+            return self._json({"ok": True, **self.daemon.selftest()})
+        if path == "/api/framing":
+            return self._json({"ok": True,
+                               "framing": framing.framing(STITCH_PARAMS_DIR)})
         if path == "/api/events":
             return self._upgrade_ws()
         if path == "/api/recordings":
@@ -912,6 +1093,11 @@ class _Handler(BaseHTTPRequestHandler):
             return self._set_time(body)
         if path == "/api/schedule":
             return self._schedule(body)
+        if path == "/api/realign":
+            if not self._authed():
+                return self._err("forbidden", status=403)
+            ok, msg = self.daemon.intent_realign()
+            return self._json({"ok": ok, "error": msg})
         if path == "/api/release":
             self.daemon.release_for_ui()
             return self._ok()
@@ -1035,6 +1221,8 @@ class CamDaemon:
         self._clock_synced = False
         self._pending_start = False
         self._pending_stop = False
+        self._pending_realign = False
+        self.realign: Optional[RealignJob] = None
         self._idle_sigterm = False    # we asked the pipeline down (not a crash)
         self._hold_until = 0.0        # UI handover: don't respawn until then
         self._sigterm_sent_at = 0.0   # SIGTERM'd; SIGKILL if it doesn't exit
@@ -1142,6 +1330,8 @@ class CamDaemon:
             return False
         if time.time() < self._hold_until:
             return False           # UI handover in progress
+        if self.state == "realigning":
+            return False           # the re-align chain owns the cameras
         if self.state != "idle":
             return True
         if self._pending_start or self._ws:
@@ -1155,20 +1345,32 @@ class CamDaemon:
         phone page and resumes automatically on the next wake once the
         UI has closed."""
         log.info("release: closing the pipeline for the desktop UI")
-        self._idle_sigterm = True
         self._last_http = 0.0       # this request must not wake it back up
         self._set_state("idle")
         self._hold_until = time.time() + 15
-        self._sigterm_sent_at = time.time()
+        self._close_pipeline()
+
+    def _close_pipeline(self):
+        """Close cam2stitch and wait until the cameras are free. The
+        caller has already moved the state somewhere pipeline_wanted()
+        says no to, so the supervisor does not respawn it."""
         proc = self.supervisor.proc
+        if proc is None and not self.supervisor._adopted:
+            return                  # nothing running
+        self._idle_sigterm = True
+        self._sigterm_sent_at = time.time()
         self._sigterm_target = proc
-        if proc is None and self.supervisor._adopted:
-            # adopted (foreign) pipeline: ask it over the ctl socket
+        if proc is None:
+            # adopted (foreign) pipeline: ask it over the ctl socket, then
+            # wait for the socket to go away (it closes with the cameras)
             try:
                 self.supervisor.command("QUIT", timeout=3)
             except Exception:
                 pass
-        elif proc is not None:
+            deadline = time.time() + 10
+            while time.time() < deadline and self.supervisor._probe_socket():
+                time.sleep(0.2)
+        else:
             # Wait here so the caller knows the cameras are free: cam2stitch
             # can deadlock in its exit path and must be SIGKILLed — the
             # tick has the same enforcement as a safety net (2026-10-11).
@@ -1176,7 +1378,7 @@ class CamDaemon:
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                log.warning("release: pipeline didn't exit in 5s — SIGKILL")
+                log.warning("pipeline didn't exit in 5s — SIGKILL")
                 proc.kill()
                 try:
                     proc.wait(timeout=2)
@@ -1214,6 +1416,8 @@ class CamDaemon:
                 return False, "already recording"
             if self.state == "finalizing":
                 return False, "finalizing the previous recording — retry in a moment"
+            if self.state == "realigning" or self._pending_realign:
+                return False, "re-aligning the cameras — wait for it to finish"
             self._pending_start = True
         # the tick loop executes; a cold pipeline takes a few seconds to
         # spawn, so wait for the state to settle
@@ -1225,6 +1429,44 @@ class CamDaemon:
         if self.state in ("starting", "standby") and self._pending_start:
             return False, "pipeline still coming up — retry in a moment"
         return False, self.error or "start failed — see board log"
+
+    def intent_realign(self) -> tuple[bool, str]:
+        """Queue a re-align; the tick loop closes the pipeline and starts
+        it. Progress is in the snapshot's "realign" block."""
+        with self._intents_lock:
+            if self.state == "realigning" or self._pending_realign:
+                return False, "already re-aligning"
+            if self.state in ("recording", "finalizing") or self.session:
+                return False, "stop the recording before re-aligning"
+            self._pending_realign = True
+        return True, ""
+
+    def realign_status(self, full: bool = False) -> dict:
+        job = self.realign
+        if job is None:
+            return {"running": self._pending_realign, "ok": None}
+        out = job.summary()
+        out["running"] = out["running"] or self._pending_realign
+        if full:
+            out["log"] = job.lines()
+        return out
+
+    def on_realign_done(self, job: "RealignJob"):
+        # the tick loop moves realigning -> idle once the thread is gone
+        log.info("realign finished: %s", "ok" if job.ok else job.error)
+
+    def selftest(self) -> dict:
+        soc, nvme = self._temperatures()
+        guides = framing.framing(STITCH_PARAMS_DIR)
+        checks = [
+            selftest.cameras(_discover_cameras() or {},
+                             self.supervisor.get_status()),
+            selftest.alignment(guides and guides.get("aligned_at")),
+            selftest.storage(self._storage_minutes()),
+            selftest.temperature(soc, nvme, TEMP_STOP_C),
+            selftest.clock(self._clock_synced),
+        ]
+        return {"level": selftest.overall(checks), "checks": checks}
 
     def intent_stop(self) -> tuple[bool, str]:
         with self._intents_lock:
@@ -1299,6 +1541,14 @@ class CamDaemon:
                 if self.session is not None:
                     # finalize what was written (per-packet flushes)
                     self.on_stitch_exit()
+
+            # re-align: close the pipeline, hand the cameras to the chain
+            if self._pending_realign and self.session is None \
+                    and self.state in ("idle", "starting", "standby", "error"):
+                self._begin_realign()
+            elif self.state == "realigning" and self.realign is not None \
+                    and not self.realign.is_alive():
+                self._set_state("idle")    # next wake reopens the pipeline
 
             # pending start
             if self._pending_start and self.state == "standby":
@@ -1379,6 +1629,13 @@ class CamDaemon:
 
             time.sleep(0.1)
         log.info("tick loop stopped")
+
+    def _begin_realign(self):
+        self._pending_realign = False
+        self._set_state("realigning")
+        self._close_pipeline()
+        self.realign = RealignJob(self)
+        self.realign.start()
 
     def _set_state(self, state: str, error: Optional[str] = None):
         if self.state != state:
@@ -1773,6 +2030,8 @@ class CamDaemon:
             return
         self._btn_last_edge = now
         log.info("gpio button pressed — toggle")
+        if self.state == "realigning":
+            return
         if self.state == "recording":
             self._pending_stop = True
         else:
@@ -1814,6 +2073,7 @@ class CamDaemon:
                 "cam1": bool(self.session and len(self.session.audio) > 1),
             } if recording else {"cam0": False, "cam1": False},
             "schedule": self.schedule,
+            "realign": self.realign_status(),
             "last_recording": self.last_recording,
             "clock": {"synced": self._clock_synced},
             "preview": {

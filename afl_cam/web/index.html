@@ -6,6 +6,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="afl-cam">
+<meta name="theme-color" content="#0d1117">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
 <title>afl-cam</title>
 <style>
   :root {
@@ -70,8 +73,45 @@
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     color: var(--dim); font-size: 14px; text-align: center; padding: 0 24px;
   }
-  #guide { position: absolute; top: 8%; height: 84%; left: 50%; width: 1px; background: rgba(255,255,255,.35); }
-  #guide::before { content: "seam"; position: absolute; top: -14px; left: -14px; font-size: 9px; color: rgba(255,255,255,.5); }
+  /* framing guides: positions come from /api/framing (canvas fractions) */
+  #guides { position: absolute; inset: 0; pointer-events: none; }
+  #g-overlap { position: absolute; top: 0; bottom: 0; background: rgba(88,166,255,.10);
+    border-left: 1px dashed rgba(88,166,255,.5); border-right: 1px dashed rgba(88,166,255,.5); display: none; }
+  #g-seam { position: absolute; top: 8%; height: 84%; left: 50%; width: 1px; background: rgba(255,255,255,.35); }
+  #g-seam::before { content: "seam"; position: absolute; top: -14px; left: -14px; font-size: 9px; color: rgba(255,255,255,.5); }
+  #g-horizon { position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed rgba(210,153,34,.8); display: none; }
+  #g-horizon::before { content: "horizon"; position: absolute; left: 6px; top: -14px; font-size: 9px; color: rgba(210,153,34,.9); }
+  body.setup #g-overlap.known, body.setup #g-horizon.known { display: block; }
+
+  /* ---- tabs ---- */
+  #tabs { display: flex; gap: 6px; max-width: 860px; margin: 12px auto 0; padding: 0 16px; }
+  #tabs button {
+    flex: 1; padding: 9px 0; font: inherit; font-size: 14px; font-weight: 600;
+    background: var(--panel); color: var(--dim); border: 1px solid var(--line); border-radius: 999px;
+  }
+  #tabs button.on { color: var(--ink); background: var(--panel2); border-color: var(--blue); }
+  body:not(.setup) .tab-setup, body.setup .tab-record { display: none !important; }
+
+  /* ---- setup ---- */
+  .card { padding: 12px 16px; }
+  .card h2 { font-size: 15px; margin: 2px 0 6px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .mini-btn { margin-left: auto; }
+  .card p { color: var(--dim); font-size: 13px; margin: 4px 0 10px; }
+  .check { display: grid; grid-template-columns: 22px 92px 1fr; gap: 6px; padding: 6px 0;
+    border-top: 1px solid var(--line); font-size: 14px; }
+  .check .n { font-weight: 600; }
+  .check .d { color: var(--dim); }
+  .lv-ok { color: var(--green); } .lv-warn { color: var(--amber); } .lv-fail { color: var(--red); }
+  #ra-log { background: #000; color: #c9d1d9; font: 11px/1.4 ui-monospace, Menlo, monospace;
+    padding: 8px 10px; border-radius: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap;
+    margin: 10px 0 0; display: none; }
+  #ra-score { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; display: none; }
+  #ra-score td, #ra-score th { padding: 5px 4px; border-top: 1px solid var(--line); text-align: right;
+    font-variant-numeric: tabular-nums; }
+  #ra-score th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  #ra-score td:first-child, #ra-score th:first-child { text-align: left; }
+  #ra-crop { width: 100%; border-radius: 8px; margin-top: 10px; display: none; }
+  #ra-state { font-size: 13px; }
 
   /* ---- schedule ---- */
   #sched { padding: 12px 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -121,15 +161,19 @@
   <span id="chip" class="state-chip">…</span>
 </header>
 <div id="banner"></div>
+<nav id="tabs">
+  <button id="tab-record" class="on">Record</button>
+  <button id="tab-setup">Setup</button>
+</nav>
 
 <main>
-  <section id="rec">
+  <section id="rec" class="tab-record">
     <div id="elapsed">0:00:00</div>
     <button id="recBtn" disabled>…</button>
     <div id="hint"></div>
   </section>
 
-  <section id="stats">
+  <section id="stats" class="tab-record">
     <div class="stat" id="st-storage"><div class="v">–</div><div class="k">minutes left</div></div>
     <div class="stat" id="st-temp"><div class="v">–</div><div class="k">board °C</div></div>
     <div class="stat" id="st-fps"><div class="v">–</div><div class="k">cam fps</div></div>
@@ -139,11 +183,37 @@
 
   <section id="preview">
     <video id="vid" playsinline muted autoplay></video>
-    <div id="guide"></div>
+    <div id="guides">
+      <div id="g-overlap"></div>
+      <div id="g-horizon"></div>
+      <div id="g-seam"></div>
+    </div>
     <div id="preview-state">preview connecting…</div>
   </section>
 
-  <section id="sched">
+  <section id="selftest" class="card tab-setup">
+    <h2>Pre-game check <span id="st-level"></span><button class="mini-btn" id="st-run">Run again</button></h2>
+    <div id="st-list"><div class="empty">checking…</div></div>
+  </section>
+
+  <section id="realign" class="card tab-setup">
+    <h2>Re-align cameras <button class="mini-btn" id="ra-run">Re-align</button></h2>
+    <p>Run this after the rig has been knocked or re-aimed. It closes the preview, captures a
+      still from each camera and refits the stitch (about 2 minutes). Stand someone in the
+      overlap at playing distance so the fit has something to lock onto. The guides on the
+      preview show the overlap (blue), the seam and the horizon.</p>
+    <div id="ra-state"></div>
+    <table id="ra-score">
+      <tr><th></th><th>before</th><th>after</th></tr>
+      <tr><td>ghosting, median px</td><td id="ra-b-med">–</td><td id="ra-a-med">–</td></tr>
+      <tr><td>ghosting, p95 px</td><td id="ra-b-p95">–</td><td id="ra-a-p95">–</td></tr>
+      <tr><td>exposure ratio</td><td id="ra-b-luma">–</td><td id="ra-a-luma">–</td></tr>
+    </table>
+    <img id="ra-crop" alt="seam crop after re-align">
+    <pre id="ra-log"></pre>
+  </section>
+
+  <section id="sched" class="tab-record">
     <label>Start at</label>
     <input type="time" id="sched-time">
     <label>Stop after</label>
@@ -154,7 +224,7 @@
     <span id="sched-status"></span>
   </section>
 
-  <section id="recs">
+  <section id="recs" class="tab-record">
     <h2>Recordings</h2>
     <div id="rec-list"><div class="empty">loading…</div></div>
   </section>
@@ -186,7 +256,7 @@ function applyStatus(s) {
   const chip = $("chip");
   chip.textContent = s.state;
   chip.className = "state-chip" + (s.recording ? " state-recording" :
-    s.state === "finalizing" ? " state-finalizing" :
+    s.state === "finalizing" || s.state === "realigning" ? " state-finalizing" :
     s.state === "error" ? " state-error" : "");
 
   const btn = $("recBtn");
@@ -205,6 +275,7 @@ function applyStatus(s) {
   $("hint").textContent = s.state === "idle" ? "pipeline asleep — press RECORD (cameras take a few seconds to wake)"
     : s.state === "starting" ? "cameras waking up…"
     : s.state === "finalizing" ? "saving the last recording…"
+    : s.state === "realigning" ? "re-aligning the cameras — recording is off until it finishes"
     : s.state === "standby" && !s.recording ? "standby — framing live" : "";
 
   $("st-storage").querySelector(".v").textContent = s.storage ? s.storage.minutes_left : "–";
@@ -228,6 +299,7 @@ function applyStatus(s) {
     $("st-skew").querySelector(".v").textContent =
       st.skew_avg_us >= 0 ? Math.round(st.skew_avg_us / 1000) + "ms" : "–";
   }
+  applyRealign(s.realign);
   const lr = s.last_recording;
   $("st-last").querySelector(".v").textContent = lr ? (lr.ok ? "✓" : "✗") : "–";
 
@@ -351,6 +423,112 @@ $("sched-clear").addEventListener("click", async () => {
   $("sched-status").textContent = "";
 });
 
+/* ---------- setup: tabs, framing guides, self-test, re-align ---------- */
+function showTab(setup) {
+  document.body.classList.toggle("setup", setup);
+  $("tab-record").classList.toggle("on", !setup);
+  $("tab-setup").classList.toggle("on", setup);
+  try { localStorage.setItem("aflTab", setup ? "setup" : "record"); } catch (e) {}
+  if (setup) { runSelftest(); loadFraming(); }
+}
+$("tab-record").addEventListener("click", () => showTab(false));
+$("tab-setup").addEventListener("click", () => showTab(true));
+
+function loadFraming() {
+  fetch("/api/framing").then(r => r.json()).then(j => {
+    const f = j.framing;
+    if (!f) return;
+    const pct = v => (v * 100).toFixed(2) + "%";
+    if (f.canvas) $("vid").style.aspectRatio = f.canvas[0] + " / " + f.canvas[1];
+    if (f.seam != null) $("g-seam").style.left = pct(f.seam);
+    const ov = $("g-overlap");
+    if (f.overlap) {
+      ov.style.left = pct(f.overlap[0]);
+      ov.style.width = pct(f.overlap[1] - f.overlap[0]);
+      ov.classList.add("known");
+    }
+    const hz = $("g-horizon");
+    if (f.horizon != null) { hz.style.top = pct(f.horizon); hz.classList.add("known"); }
+    else hz.classList.remove("known");
+  }).catch(() => {});
+}
+
+const LV_ICON = {ok: "✓", warn: "!", fail: "✗"};
+const LV_TEXT = {ok: "all good", warn: "check the warnings", fail: "fix before the game"};
+function runSelftest() {
+  $("st-run").disabled = true;
+  fetch("/api/selftest").then(r => r.json()).then(j => {
+    $("st-level").textContent = LV_TEXT[j.level] || "";
+    $("st-level").className = "lv-" + j.level;
+    $("st-list").innerHTML = (j.checks || []).map(c => `
+      <div class="check"><span class="lv-${c.level}">${LV_ICON[c.level] || "?"}</span>
+        <span class="n">${c.name}</span><span class="d">${esc(c.detail)}</span></div>`).join("");
+  }).catch(() => { $("st-list").innerHTML = '<div class="empty">check failed — network?</div>'; })
+    .finally(() => { $("st-run").disabled = false; });
+}
+$("st-run").addEventListener("click", runSelftest);
+function esc(t) { const d = document.createElement("div"); d.textContent = t == null ? "" : t; return d.innerHTML; }
+
+let raWasRunning = false, raLogFor = null;
+function fmtScore(sc, key, digits) {
+  return sc && sc[key] != null ? Number(sc[key]).toFixed(digits) : "–";
+}
+function applyRealign(ra) {
+  if (!ra) return;
+  const running = !!ra.running;
+  const busy = running || (S && (S.recording || S.state === "finalizing"));
+  $("ra-run").disabled = !!busy;
+  const st = $("ra-state");
+  if (running) {
+    st.className = "lv-warn";
+    st.textContent = "re-aligning… " + (ra.started_at ? Math.round(Date.now() / 1000 - ra.started_at) + " s" : "");
+  } else if (ra.ok === true) {
+    st.className = "lv-ok"; st.textContent = "✓ alignment updated — the next recording uses it";
+  } else if (ra.ok === false) {
+    st.className = "lv-fail"; st.textContent = "✗ " + (ra.error || "re-align failed");
+  } else { st.textContent = ""; }
+  const logEl = $("ra-log");
+  if (ra.log_tail && ra.log_tail.length && running) {
+    logEl.style.display = "block";
+    logEl.textContent = ra.log_tail.join("\n");
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  const scored = ra.before || ra.after;
+  $("ra-score").style.display = scored ? "table" : "none";
+  $("ra-b-med").textContent = fmtScore(ra.before, "misalign_median", 1);
+  $("ra-a-med").textContent = fmtScore(ra.after, "misalign_median", 1);
+  $("ra-b-p95").textContent = fmtScore(ra.before, "misalign_p95", 1);
+  $("ra-a-p95").textContent = fmtScore(ra.after, "misalign_p95", 1);
+  $("ra-b-luma").textContent = fmtScore(ra.before, "luma_ratio", 2);
+  $("ra-a-luma").textContent = fmtScore(ra.after, "luma_ratio", 2);
+  if (!running && ra.finished_at && raLogFor !== ra.finished_at) {
+    // finished (or finished before this page saw it run): the full log
+    // and the new guides
+    raLogFor = ra.finished_at;
+    fetch("/api/realign").then(r => r.json()).then(j => {
+      if (j.log) { logEl.style.display = "block"; logEl.textContent = j.log.join("\n"); logEl.scrollTop = logEl.scrollHeight; }
+    }).catch(() => {});
+    loadFraming();
+  }
+  const crop = $("ra-crop");
+  if (ra.has_crop && !running) {
+    if (raWasRunning || !crop.src) crop.src = "/api/realign/seam.jpg?t=" + (ra.finished_at || Date.now());
+    crop.style.display = "block";
+  } else if (running) { crop.style.display = "none"; }
+  raWasRunning = running;
+}
+$("ra-run").addEventListener("click", async () => {
+  if (!confirm("Re-align now? The preview stops for about 2 minutes.")) return;
+  $("ra-run").disabled = true;
+  $("ra-log").textContent = ""; $("ra-log").style.display = "block";
+  try {
+    const r = await fetch("/api/realign", {method: "POST",
+      headers: {"Content-Type": "application/json", ...AUTH}, body: "{}"});
+    const j = await r.json();
+    if (!j.ok) { $("ra-state").className = "lv-fail"; $("ra-state").textContent = j.error || "could not start"; $("ra-run").disabled = false; }
+  } catch (e) { $("ra-state").textContent = "network error"; $("ra-run").disabled = false; }
+});
+
 /* ---------- recordings ---------- */
 function fmtBytes(b) {
   if (!b) return "?";
@@ -433,6 +611,8 @@ async function del(id, btn) {
 applyStatus({state: "connecting", recording: false, error: null,
   storage: {minutes_left: 0}, temp: {}, stitch: null,
   elapsed_hms: "0:00:00", clock: {synced: true}});
+try { if (localStorage.getItem("aflTab") === "setup") showTab(true); } catch (e) {}
+loadFraming();
 connectWS();
 pollFallback();
 startPreview();
