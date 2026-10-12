@@ -1,4 +1,4 @@
-# Field desk test — afl-cam iPhone control (iphone-control-plan.md §3)
+# Field desk test — afl-cam iPhone control (docs/archive/iphone-control-plan.md §3)
 
 Everything in this list needs the rig + an iPhone + 30 minutes on a desk.
 The board-side pieces are already built and verified from a laptop browser
