@@ -38,6 +38,10 @@ fi
 cd "$TREE"
 # calibration/ is board-local (gitignored): share the rig's frozen alignment
 [ -e calibration ] || ln -s "$RIG_HOME/calibration" calibration
+# match the field venv: system python3 with system site-packages (gi comes
+# from apt's python3-gi, not PyPI); uv would otherwise pick its own CPython
+export UV_PYTHON=${UV_PYTHON:-/usr/bin/python3}
+[ -d .venv ] || uv venv --system-site-packages --quiet
 uv sync --quiet
 
 DPID=""
