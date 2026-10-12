@@ -43,40 +43,6 @@ def cmd_devices(_args):
         sys.exit(1)
 
 
-def cmd_check_aim(_args):
-    """Capture one frame per camera and report the current overlap."""
-    import cv2
-    from .stitcher import Stitcher, _find_translation
-
-    frames = {}
-    for cam_key in ("cam0", "cam1"):
-        img = capture_frame(cam_key)
-        if img is None:
-            print(f"Camera {cam_key} not present (or busy — close the preview/recording app first)")
-            continue
-        frames[cam_key] = img
-
-    if len(frames) < 2:
-        print("Need both cameras to measure overlap")
-        return 1
-
-    st = Stitcher()
-    res = _find_translation(frames["cam0"], frames["cam1"], st._enhance)
-    if res is None:
-        print("Could not estimate alignment - cameras may point at very different scenes")
-        return 1
-    dx, dy = res
-    overlap = (3840 - dx) / 3840 * 100
-    print(f"Overlap: {overlap:.1f}%  (dx={dx:.0f}px, dy={dy:.0f}px)")
-    if 20 <= overlap <= 40:
-        print("✓ Good - quality stitching will work")
-    elif overlap < 20:
-        print("✗ Too little overlap - aim the cameras more toward each other (target 25-30%)")
-    else:
-        print("✗ Too much overlap - aim the cameras more apart (target 25-30%)")
-    return 0
-
-
 def _start_session_recording(db, cameras, res_key, duration_sec):
     """Create a session (folder + DB row) and start recording on the cameras.
 
@@ -353,9 +319,10 @@ def cmd_stitch(args):
         return _cmd_stitch_sessions(args)
 
     import cv2
-    from .stitcher import Stitcher, next_output_dir
+    from .stitcher import VideoStitcher
 
-    out_dir = next_output_dir()
+    out_dir = CAPTURES_DIR / "stills" / time.strftime("%Y%m%d_%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir}/\n")
 
     # Capture or load
@@ -390,12 +357,12 @@ def cmd_stitch(args):
         _copy_into(left_path, out_dir / "cam0.jpg")
         _copy_into(right_path, out_dir / "cam1.jpg")
 
-    # Stitch
-    s = Stitcher()
-    pano = s.stitch(img0, img1)
-    if pano is None:
-        print("ERROR: stitching failed")
+    # Stitch with the frozen rig alignment (same maths as the live stitch)
+    vs = VideoStitcher(output_width=0)
+    if not vs.calibrate(img0, img1):
+        print("ERROR: stitching failed (no frozen alignment and the bundle failed)")
         sys.exit(1)
+    pano = vs.stitch(img0, img1)
 
     out_path = out_dir / "panorama.jpg"
     cv2.imwrite(str(out_path), pano, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -524,8 +491,6 @@ def _cmd_stitch_sessions(args) -> int:
 
 def cmd_stitch_video(args):
     """Record both cameras into a session folder, then stitch the video."""
-    from .stitcher import stitch_video_files
-
     db = RecordingDB(DB_PATH)
 
     print(f"Recording {args.duration}s from both cameras @ {args.res}…")
@@ -592,9 +557,6 @@ def main():
     # daemon (field control)
     sub.add_parser("daemon", help="Run the afl-camd field daemon "
                                   "(iPhone control + web UI + API)")
-
-    # check-aim
-    sub.add_parser("check-aim", help="Measure current camera overlap for stitching")
 
     # record
     p = sub.add_parser("record", help="Record footage")
@@ -678,7 +640,6 @@ def main():
         "list-devices": cmd_list_devices,
         "ui": cmd_ui,
         "daemon": cmd_daemon,
-        "check-aim": cmd_check_aim,
         "record": cmd_record,
         "preview": cmd_preview,
         "list": cmd_list,

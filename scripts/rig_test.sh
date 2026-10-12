@@ -73,4 +73,4 @@ done
 if [ $# -eq 0 ] && [ -z "${RIG_SLOW:-}" ]; then
     set -- -m "not slow"
 fi
-AFL_CAM_TEST_BASE="http://127.0.0.1:$PORT" uv run pytest tests/ -v "$@"
+AFL_CAM_TEST_BASE="http://127.0.0.1:$PORT" uv run pytest tests/rig -v "$@"

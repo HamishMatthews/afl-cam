@@ -3,7 +3,6 @@
 import logging
 import os
 import subprocess
-import sys
 import time
 import types
 from pathlib import Path
@@ -11,6 +10,8 @@ from typing import Callable, Dict, List, Optional, Tuple, Any
 
 import cv2
 import numpy as np
+
+from .pairing import pair_frames
 
 log = logging.getLogger(__name__)
 
@@ -60,20 +61,9 @@ def _load_frozen_cams() -> Optional[List[Any]]:
     return cams
 
 
-def next_output_dir() -> Path:
-    """Return the next auto-numbered output directory."""
-    _OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    highest = 0
-    for child in _OUTPUTS_DIR.iterdir():
-        if child.is_dir() and child.name.isdigit():
-            highest = max(highest, int(child.name))
-    out = _OUTPUTS_DIR / f"{highest + 1:03d}"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
 class Stitcher:
-    """Stitch two side-by-side camera frames into a panorama."""
+    """Per-camera calibration, undistortion and contrast enhancement shared
+    by the video stitcher and the alignment scripts."""
 
     def __init__(self, calib_dir: Optional[Path] = None, *,
                  clahe_clip: float = 3.0, clahe_tile: int = 8,
@@ -91,16 +81,6 @@ class Stitcher:
             if calib_file.exists():
                 self._calib[cam] = np.load(str(calib_file))
                 log.info(f"Loaded calibration: {calib_file.name} (rms={self._calib[cam]['rms']:.3f})")
-
-    def stitch(self, left: np.ndarray, right: np.ndarray) -> Optional[np.ndarray]:
-        left, right = self._undistort_pair(left, right)
-        for label, l, r in [("enhanced", self._enhance(left), self._enhance(right)),
-                            ("raw", left, right)]:
-            pano = self._run_stitcher(l, r, label)
-            if pano is not None:
-                return pano
-        log.error("All stitching attempts failed. Quality alignment requires 25-30% camera overlap.")
-        return None
 
     def _undistort_pair(self, left: np.ndarray, right: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         if "cam0" in self._calib:
@@ -126,22 +106,6 @@ class Stitcher:
         h, w = size
         new_mtx, _ = cv2.getOptimalNewCameraMatrix(calib["mtx"], calib["dist"], (w, h), 1, (w, h))
         return cv2.initUndistortRectifyMap(calib["mtx"], calib["dist"], None, new_mtx, (w, h), cv2.CV_32FC1)
-
-    def _run_stitcher(self, left: np.ndarray, right: np.ndarray, label: str) -> Optional[np.ndarray]:
-        in_w = left.shape[1]
-        for seed in (0, 42):
-            cv2.setRNGSeed(seed)
-            for mode, name in [(cv2.Stitcher_PANORAMA, "PANORAMA"), (cv2.Stitcher_SCANS, "SCANS")]:
-                stitcher = cv2.Stitcher.create(mode)
-                stitcher.setRegistrationResol(self._registration_resol)
-                stitcher.setSeamEstimationResol(self._seam_resol)
-                stitcher.setCompositingResol(-1)
-                stitcher.setPanoConfidenceThresh(self._pano_confidence)
-                status, pano = stitcher.stitch([left, right])
-                if status == cv2.Stitcher_OK and pano.shape[1] >= in_w:
-                    log.info(f"[{label}] {name}: {pano.shape[1]}x{pano.shape[0]} (seed {seed})")
-                    return pano
-        return None
 
 
 class VideoStitcher:
@@ -453,166 +417,27 @@ def _build_uint8_weights(mask0: np.ndarray, mask1: np.ndarray, blend_px: int) ->
     return w0, w1
 
 
-def _ncc_fallback(img0: np.ndarray, img1: np.ndarray, enhance_fn: Callable) -> Optional[Tuple[float, float]]:
-    """Dense NCC search for weak-texture scenes where SIFT matching fails.
-
-    Pyramid search: coarse sweep at ~1/8 resolution, then two refinement
-    levels that zoom in around the best offset.  Returns the full-resolution
-    offset of the best match.
-    """
-
-    def _strips(g0, g1, dx, dy):
-        ow = g0.shape[1] - dx
-        if dy >= 0:
-            a = g0[dy:, dx:]
-            b = g1[:g0.shape[0] - dy, :ow]
-        else:
-            a = g0[:g0.shape[0] + dy, dx:]
-            b = g1[-dy:, :ow]
-        if a.shape[0] < 40 or a.shape[0] != b.shape[0]:
-            return None
-        a = a - a.mean()
-        b = b - b.mean()
-        return float((a * b).sum()
-                     / max(np.sqrt((a * a).sum() * (b * b).sum()), 1e-9))
-
-    def _gray(img, width):
-        # Plain grayscale — CLAHE helps SIFT features but hurts NCC
-        # correlation on weak-texture scenes.
-        h = int(img.shape[0] * width / img.shape[1]) // 2 * 2
-        return cv2.cvtColor(
-            cv2.resize(img, (width, h), interpolation=cv2.INTER_AREA),
-            cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-    best_dx = best_dy = 0
-    best_score = -1.0
-    # Level 0: coarse sweep at 480 wide, step 4
-    g0 = _gray(img0, 480)
-    g1 = _gray(img1, 480)
-    for dx in range(g0.shape[1] // 8, g0.shape[1] - g0.shape[1] // 10, 4):
-        for dy in range(-g0.shape[0] // 5, g0.shape[0] // 5 + 1, 4):
-            score = _strips(g0, g1, dx, dy)
-            if score is not None and score > best_score:
-                best_dx, best_dy, best_score = dx, dy, score
-
-    # Level 1: refine at 960 wide, step 2, ±16 around the coarse peak
-    g0 = _gray(img0, 960)
-    g1 = _gray(img1, 960)
-    c_dx, c_dy = best_dx * 2, best_dy * 2
-    best_dx, best_dy, best_score = c_dx, c_dy, -1.0
-    for dx in range(c_dx - 16, c_dx + 17, 2):
-        for dy in range(c_dy - 16, c_dy + 17, 2):
-            score = _strips(g0, g1, dx, dy)
-            if score is not None and score > best_score:
-                best_dx, best_dy, best_score = dx, dy, score
-
-    # Level 2: refine at 1920 wide, step 1, ±6 around the refined peak
-    g0 = _gray(img0, 1920)
-    g1 = _gray(img1, 1920)
-    c_dx, c_dy = best_dx * 2, best_dy * 2
-    best_dx, best_dy, best_score = c_dx, c_dy, -1.0
-    for dx in range(c_dx - 6, c_dx + 7):
-        for dy in range(c_dy - 6, c_dy + 7):
-            score = _strips(g0, g1, dx, dy)
-            if score is not None and score > best_score:
-                best_dx, best_dy, best_score = dx, dy, score
-
-    full_dx = best_dx * (img0.shape[1] / 1920)
-    full_dy = best_dy * (img0.shape[1] / 1920)
-    if best_score < 0.4:
-        return None
-    log.info("translation fallback: dx=%d dy=%d (NCC=%.3f)",
-             int(full_dx), int(full_dy), best_score)
-    return float(full_dx), float(full_dy)
-
-
-def _find_translation(img0: np.ndarray, img1: np.ndarray, enhance_fn: Callable, scale: float = 0.5) -> Optional[Tuple[float, float]]:
-    s0 = cv2.resize(img0, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    s1 = cv2.resize(img1, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-
-    gray0 = cv2.cvtColor(enhance_fn(s0), cv2.COLOR_BGR2GRAY)
-    gray1 = cv2.cvtColor(enhance_fn(s1), cv2.COLOR_BGR2GRAY)
-
-    sift = cv2.SIFT_create(nfeatures=4000, contrastThreshold=0.03)
-    kp0, des0 = sift.detectAndCompute(gray0, None)
-    kp1, des1 = sift.detectAndCompute(gray1, None)
-
-    if des0 is None or des1 is None or len(kp0) < 10 or len(kp1) < 10:
-        return _ncc_fallback(img0, img1, enhance_fn)
-
-    flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=8), dict(checks=80))
-    matches = flann.knnMatch(des0, des1, k=2)
-    good = [pair[0] for pair in matches if len(pair) == 2 and pair[0].distance < 0.7 * pair[1].distance]
-
-    if len(good) < 20:
-        return _ncc_fallback(img0, img1, enhance_fn)
-
-    pts0 = np.float32([kp0[m.queryIdx].pt for m in good]) / scale
-    pts1 = np.float32([kp1[m.trainIdx].pt for m in good]) / scale
-
-    dx = pts0[:, 0] - pts1[:, 0]
-    dy = pts0[:, 1] - pts1[:, 1]
-    med_dx, med_dy = np.median(dx), np.median(dy)
-    mad_dx = np.median(np.abs(dx - med_dx))
-
-    mask = (np.abs(dx - med_dx) < max(3 * mad_dx, 100)) & (np.abs(dy - med_dy) < 40)
-    if mask.sum() < 10:
-        return _ncc_fallback(img0, img1, enhance_fn)
-
-    return float(np.median(dx[mask])), float(np.median(dy[mask]))
-
-
-def stitch_pair(left: np.ndarray, right: np.ndarray, calib_dir: Optional[Path] = None) -> Optional[np.ndarray]:
-    """One-shot still-image stitch."""
-    return Stitcher(calib_dir=calib_dir).stitch(left, right)
-
-
 class StitchError(RuntimeError):
     """Raised when session stitching fails (alignment, encoding, IO)."""
 
 
-class _FFmpegVAAPIEncoder:
-    """Intel VAAPI H.264 encode (Linux) via an ffmpeg pipe."""
-
-    def __init__(self, out_path: Path, fps: int, width: int, height: int, qp: int = 25):
-        self._out_path = out_path
-        self._proc = subprocess.Popen([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-vaapi_device", "/dev/dri/renderD128",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-framerate", str(fps),
-            "-i", "pipe:0", "-vf", "format=nv12,hwupload",
-            "-c:v", "h264_vaapi", "-qp", str(qp), str(out_path)
-        ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def write(self, frame_bgr: np.ndarray) -> None:
-        if self._proc.stdin:
-            try:
-                self._proc.stdin.write(frame_bgr.tobytes())
-            except BrokenPipeError:
-                pass
-
-    def close(self) -> Path:
-        if self._proc.stdin:
-            self._proc.stdin.close()
-        rc = self._proc.wait()
-        if rc != 0:
-            detail = self._proc.stderr.read().decode(errors="replace").strip()
-            raise RuntimeError(f"ffmpeg VAAPI encoder exited with code {rc}: {detail}")
-        return self._out_path
-
-
-class _FFmpegVideoToolboxEncoder:
-    """Apple VideoToolbox H.264 encode (macOS, M-series hardware) via an ffmpeg pipe."""
+class _FFmpegEncoder:
+    """BGR frames → H.264 via an ffmpeg pipe: h264_rkmpp on the RK3588
+    (ffmpeg-rockchip build), libx264 elsewhere (re-stitching off the board)."""
 
     def __init__(self, out_path: Path, fps: int, width: int, height: int, bitrate: str = "30M"):
         self._out_path = out_path
+        # The rockchip fork's default pix-fmt negotiation picks nv16 and
+        # stalls on a software 422 conversion — force nv12
+        # (orange_pi_5_max_setup.md §5).
+        codec = (["-c:v", "h264_rkmpp", "-b:v", bitrate]
+                 if Path("/dev/mpp_service").exists()
+                 else ["-c:v", "libx264", "-preset", "fast", "-crf", "18"])
         self._proc = subprocess.Popen([
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{width}x{height}", "-framerate", str(fps),
-            "-i", "pipe:0", "-vf", "format=nv12",
-            "-c:v", "h264_videotoolbox", "-b:v", bitrate, str(out_path)
+            "-i", "pipe:0", "-vf", "format=nv12", *codec, str(out_path)
         ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def write(self, frame_bgr: np.ndarray) -> None:
@@ -628,187 +453,22 @@ class _FFmpegVideoToolboxEncoder:
         rc = self._proc.wait()
         if rc != 0:
             detail = self._proc.stderr.read().decode(errors="replace").strip()
-            raise RuntimeError(f"ffmpeg VideoToolbox encoder exited with code {rc}: {detail}")
-        return self._out_path
-
-
-class _FFmpegMPPEncoder:
-    """Rockchip MPP H.264 encode (RK3588) via the ffmpeg-rockchip build."""
-
-    def __init__(self, out_path: Path, fps: int, width: int, height: int, bitrate: str = "30M"):
-        self._out_path = out_path
-        # The fork's default pix-fmt negotiation picks nv16 and stalls on a
-        # software 422 conversion — force nv12 (see orange_pi_5_max_setup.md §5).
-        self._proc = subprocess.Popen([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-framerate", str(fps),
-            "-i", "pipe:0", "-vf", "format=nv12",
-            "-c:v", "h264_rkmpp", "-b:v", bitrate, str(out_path)
-        ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def write(self, frame_bgr: np.ndarray) -> None:
-        if self._proc.stdin:
-            try:
-                self._proc.stdin.write(frame_bgr.tobytes())
-            except BrokenPipeError:
-                pass
-
-    def close(self) -> Path:
-        if self._proc.stdin:
-            self._proc.stdin.close()
-        rc = self._proc.wait()
-        if rc != 0:
-            detail = self._proc.stderr.read().decode(errors="replace").strip()
-            raise RuntimeError(f"ffmpeg MPP encoder exited with code {rc}: {detail}")
+            raise RuntimeError(f"ffmpeg encoder exited with code {rc}: {detail}")
         return self._out_path
 
 
 def _open_encoder(out_path: Path, fps: int, width: int, height: int):
-    """One hardware encoder per OS/hardware.
-
-    RK3588 → h264_rkmpp (rockchip ffmpeg build), Intel Linux → VAAPI,
-    macOS → VideoToolbox.
-    """
     import shutil
     if shutil.which("ffmpeg") is None:
-        raise StitchError(
-            "ffmpeg not found — install it (sudo apt install ffmpeg, "
-            "or brew install ffmpeg on macOS)")
-    if sys.platform == "darwin":
-        return _FFmpegVideoToolboxEncoder(out_path, fps, width, height)
-    if Path("/dev/mpp_service").exists():
-        return _FFmpegMPPEncoder(out_path, fps, width, height)
-    return _FFmpegVAAPIEncoder(out_path, fps, width, height)
-
-
-def _detect_clap(wav_path: Path) -> Optional[float]:
-    """Find the first sharp transient (clap) in a WAV. Returns seconds or None."""
-    import wave
-
-    try:
-        with wave.open(str(wav_path), "rb") as wf:
-            rate = wf.getframerate()
-            nch = wf.getnchannels()
-            n = wf.getnframes()
-            raw = wf.readframes(n)
-    except (wave.Error, EOFError, OSError):
-        return None
-    if n < rate // 4:
-        return None
-
-    data = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-    if data.size == 0:
-        return None
-    mono = data.reshape(-1, nch).mean(axis=1) if nch > 1 else data
-    # High-frequency emphasis: abs frame difference
-    diff = np.abs(np.diff(mono))
-    win = max(rate // 200, 16)  # 5 ms windows
-    rms = np.convolve(diff, np.ones(win, dtype=np.float32) / win, mode="valid")
-    noise = float(np.median(rms))
-    threshold = max(12.0 * noise, 500.0)
-    over = rms > threshold
-    # Require a SUSTAINED transient (>= 3 consecutive windows) to reject
-    # isolated noise spikes, and skip the first 0.25 s of startup noise.
-    start_idx = int(0.25 * rate)
-    for i in range(start_idx, len(over) - 2):
-        if over[i] and over[i + 1] and over[i + 2]:
-            return float(i / rate)
-    return None
-
-
-def _audio_frame_lag(wav0: Path, wav1: Path, fps: int) -> Optional[int]:
-    """Frame offset between two recordings from their clap timestamps.
-
-    Returns the number of frames to skip in cam1 so that cam0[i] pairs with
-    cam1[i + offset], or None if either clap is not detectable.
-    """
-    t0 = _detect_clap(wav0)
-    t1 = _detect_clap(wav1)
-    if t0 is None or t1 is None:
-        return None
-    lag_frames = int(round((t1 - t0) * fps))
-    log.info("clap sync: cam0 clap at %.3fs, cam1 at %.3fs → offset %+d frames",
-             t0, t1, lag_frames)
-    return lag_frames
-
-
-def _moving_average(a: np.ndarray, n: int) -> np.ndarray:
-    ret = np.cumsum(a, axis=0, dtype=float)
-    ret[n:] = ret[n:] - ret[:-n]
-    return ret[n - 1:] / n
-
-
-def _estimate_frame_lag(cap0, cap1, overlap_dx: int, max_lag: int = 45) -> Tuple[int, float]:
-    w, h = 256, 144
-    sx0 = int(overlap_dx * w / 3840)
-    sw = w - sx0
-    if sw < 20:
-        return 0, 0.0
-
-    def _signature(cap, x0: int, x1: int) -> np.ndarray:
-        cap.seek_to(0)
-        sig = []
-        prev = None
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            g = cv2.cvtColor(cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)[:, x0:x1]
-            bright = float(g.mean())
-            motion = float(np.abs(g.astype(np.float32) - prev).mean()) if prev is not None else 0.0
-            sig.append((bright, motion))
-            prev = g.astype(np.float32)
-        return np.asarray(sig, dtype=np.float32)
-
-    s0 = _signature(cap0, sx0, w)
-    s1 = _signature(cap1, 0, sw)
-    n = min(len(s0), len(s1))
-    if n < 10:
-        return 0, 0.0
-
-    s0, s1 = s0[:n], s1[:n]
-    for s in (s0, s1):
-        # _moving_average is a trailing mean of the last 15 samples;
-        # ma[j] corresponds to s[j + 14].
-        ma = _moving_average(s, 15)
-        s[14:] -= ma
-        s -= s.mean(axis=0)
-        s /= (s.std(axis=0) + 1e-6)
-
-    best_lag, best_score = 0, -1.0
-    for lag in range(-max_lag, max_lag + 1):
-        a, b = (s0[:n - lag], s1[lag:]) if lag >= 0 else (s0[-lag:], s1[:n + lag])
-        if len(a) < 10:
-            continue
-        score = float((a * b).sum() / len(a))
-        if score > best_score:
-            best_lag, best_score = lag, score
-
-    return best_lag, best_score
-
-
-class _CVFrameReader:
-    """Uniform reader interface over cv2.VideoCapture (AVI/MJPEG recordings)."""
-
-    def __init__(self, path: Path):
-        self._cap = cv2.VideoCapture(str(path))
-
-    def read(self):
-        return self._cap.read()
-
-    def seek_to(self, n: int):
-        self._cap.set(cv2.CAP_PROP_POS_FRAMES, n)
-
-    def release(self):
-        self._cap.release()
+        raise StitchError("ffmpeg not found — install it (sudo apt install ffmpeg)")
+    return _FFmpegEncoder(out_path, fps, width, height)
 
 
 class _H264FrameReader:
     """Decode a raw .h264 elementary stream into BGR frames via an ffmpeg pipe.
 
     Raw ES has no container index, so seek_to(n) restarts the decoder and
-    skips n frames — fine for the small clap-sync offsets used here.
+    skips n frames (the stitcher only reads forward).
     """
 
     def __init__(self, path: Path):
@@ -878,10 +538,10 @@ class _H264FrameReader:
 
 
 def _open_video_reader(path: Path):
-    """Reader for a recording: ffmpeg pipe for .mp4/.h264, OpenCV for .avi."""
-    if path.suffix.lower() in (".h264", ".mp4"):
-        return _H264FrameReader(path)
-    return _CVFrameReader(path)
+    """Reader for a recording (.h264 elementary stream or .mp4)."""
+    if path.suffix.lower() not in (".h264", ".mp4"):
+        raise StitchError(f"unsupported recording format: {path.name}")
+    return _H264FrameReader(path)
 
 
 def _load_pts(path: Path) -> Optional[np.ndarray]:
@@ -900,116 +560,79 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
                        fps: int = 30, mode: str = "quality",
                        output_width: int = 3840,
                        progress: Optional[Callable[[str], None]] = None) -> dict:
-    """Stitch a recorded cam0/cam1 pair (.h264 native or .avi legacy) into out_dir."""
+    """Stitch a separate-mode cam0/cam1 recording pair into out_dir.
+
+    Frames are paired by the .pts sidecars cam2h264 writes next to each
+    recording (kernel-monotonic capture timestamps — the USB-camera
+    equivalent of hardware sync), with the same nearest-of-two pairing the
+    live recorder uses.
+    """
 
     def _report(msg: str):
         log.info(f"stitch: {msg}")
         if progress:
             progress(msg)
 
+    pts0 = _load_pts(cam0_path.with_suffix(".pts"))
+    pts1 = _load_pts(cam1_path.with_suffix(".pts"))
+    if pts0 is None or pts1 is None:
+        raise StitchError("Missing .pts timestamp sidecars — only recordings "
+                          "made by the native recorder can be stitched.")
+
+    # pair every cam0 frame with the nearest cam1 frame, trimmed to the
+    # window where BOTH cameras are live (each runs its own rate under
+    # auto-exposure) — no frozen duplicated frames at either end.
+    s0, e_cut, pair = pair_frames(pts0, pts1)
+    n_out = max(0, e_cut - s0)
+    if n_out < 1:
+        raise StitchError("The two recordings do not overlap in time.")
+    _report(f"frame sync: pts sidecar — trimmed {s0} frames at start "
+            f"({(pts1[0] - pts0[s0]) / 1e6:+.2f}s between first frames)")
+    # The output container is CFR at the MEDIAN paired rate — real-life
+    # playback speed in a plain regular container.
+    out_fps = fps
+    if n_out > 1:
+        paired_ts = (pts0[s0:e_cut] + pts1[pair[s0:e_cut]]) // 2
+        out_fps = int(max(1, min(60, round(
+            1e6 / float(np.median(np.diff(paired_ts)))))))
+        _report(f"frame sync: output CFR at measured {out_fps} fps "
+                f"({n_out} frames in the overlap window)")
+
     cap0 = _open_video_reader(cam0_path)
     cap1 = _open_video_reader(cam1_path)
 
-    ok0, f0_raw = cap0.read()
-    ok1, f1_raw = cap1.read()
-    if not ok0 or not ok1:
-        raise StitchError("Could not read first frames from recordings.")
+    # skip cam0 to the overlap start; cam1 is streamed forward on demand
+    for _ in range(s0):
+        if not cap0.read()[0]:
+            raise StitchError("cam0 recording is shorter than its .pts sidecar.")
 
-    # PTS-sidecar pairing first: each recorder stamps frames with the SHARED
-    # kernel clock (monotonic) at capture time — the USB-camera equivalent of
-    # hardware sync. Frame-accurate for both start offset AND dropped frames.
-    pts0 = _load_pts(cam0_path.with_suffix(".pts"))
-    pts1 = _load_pts(cam1_path.with_suffix(".pts"))
-    pair = None
-    out_fps = fps
-    if pts0 is not None and pts1 is not None:
-        # pair every cam0 frame with the cam1 frame whose kernel timestamp
-        # is nearest, and TRIM to the overlap window: the stitch starts where
-        # BOTH cameras are live (no frozen duplicated frames at the start).
-        s0 = int(np.searchsorted(pts0, pts1[0]))
-        # Also trim the END to the overlap window: the stitch stops where
-        # EITHER camera ends (each runs its own rate under auto-exposure, so
-        # they finish at different real times — no frozen trailing frames).
-        e_cut = int(np.searchsorted(pts0, pts1[-1], side="right"))
-        n_out = max(0, e_cut - s0)
-        pair = np.searchsorted(pts1, pts0)
-        pair = np.clip(pair, 0, len(pts1) - 1)
-        lo = np.clip(pair - 1, 0, len(pts1) - 1)
-        pair = np.where(np.abs(pts1[lo] - pts0) < np.abs(pts1[pair] - pts0), lo, pair)
-        pair = pair[s0:]
-        advance1 = s0
-        _report(f"frame sync: pts sidecar — trimmed {s0} frames at start "
-                f"({(pts1[0] - pts0[s0]) / 1e6:+.2f}s between first frames)")
-        # The output container is CFR at the MEDIAN paired rate (measured
-        # from the sidecars BEFORE encoding) — real-life playback speed, and
-        # a plain regular container that every player reads reliably.
-        if n_out > 1:
-            paired_ts = (pts0[s0:s0 + n_out] + pts1[pair[:n_out]]) // 2
-            out_fps = int(max(1, min(60, round(
-                1e6 / float(np.median(np.diff(paired_ts)))))))
-            _report(f"frame sync: output CFR at measured {out_fps} fps "
-                    f"({n_out} frames in the overlap window)")
+    j_cur = -1
+    cam1_last = None
 
-    if pair is None:
-        advance1 = 0
-        # Prefer clap-based sync when audio tracks exist — the clap transient
-        # is a millisecond-precise marker shared by both recordings.
-        wav0 = out_dir / "cam0.wav"
-        wav1 = out_dir / "cam1.wav"
-        if wav0.exists() and wav1.exists():
-            audio_lag = _audio_frame_lag(wav0, wav1, fps)
-            if audio_lag is not None and abs(audio_lag) <= 90:
-                advance1 = audio_lag
-                _report(f"frame sync: clap offset {advance1:+d} frames")
-        if advance1 == 0:
-            offset = _find_translation(f0_raw, f1_raw, Stitcher()._enhance)
-            if offset is not None:
-                overlap_dx = int(round(offset[0]))
-                if overlap_dx > 200:
-                    advance1, lag_score = _estimate_frame_lag(cap0, cap1, overlap_dx)
-                    if lag_score > 0.3:
-                        _report(f"frame sync: cam1 offset {advance1:+d} frames (corr {lag_score:.2f})")
-                    else:
-                        _report("frame sync: unreliable, assuming 0 offset")
-                        advance1 = 0
-            else:
-                _report("frame sync: cannot locate overlap, assuming 0 offset")
-
-    if pair is not None:
-        cap0.seek_to(0)
-        cap1.seek_to(0)
-    else:
-        cap0.seek_to(max(0, -advance1))
-        cap1.seek_to(max(0, advance1))
+    def cam1_frame(j: int):
+        nonlocal j_cur, cam1_last
+        while j_cur < j:
+            ok1, f1 = cap1.read()
+            if not ok1 or f1 is None:
+                break  # cam1 ended: reuse its last frame
+            cam1_last = f1
+            j_cur += 1
+        return cam1_last
 
     ok0, f0 = cap0.read()
-    ok1, f1 = cap1.read()
-    if not ok0 or not ok1:
-        raise StitchError("Could not read synchronised frames.")
+    f1 = cam1_frame(int(pair[s0]))
+    if not ok0 or f1 is None:
+        raise StitchError("Could not read the first synchronised frames.")
 
     cv2.imwrite(str(out_dir / "cam0.jpg"), f0, [cv2.IMWRITE_JPEG_QUALITY, 92])
     cv2.imwrite(str(out_dir / "cam1.jpg"), f1, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
     _report("computing alignment")
     vs = VideoStitcher(mode=mode, output_width=output_width)
-
     if not vs.calibrate(f0, f1):
-        offset = _find_translation(f0, f1, Stitcher()._enhance)
-        if offset is not None:
-            overlap_pct = (f0.shape[1] - offset[0]) / f0.shape[1] * 100
-            if overlap_pct < 20:
-                raise StitchError(
-                    f"Calibration failed - camera overlap is only {overlap_pct:.0f}%. "
-                    "Aim the cameras so they overlap by ~25-30% "
-                    "(run 'afl-cam check-aim' to see the current value).")
-            raise StitchError(
-                f"Calibration failed - overlap is fine ({overlap_pct:.0f}%) but the "
-                "scene has too few matchable features (dark / low texture?). "
-                "For night recordings raise EXPOSURE_TIME in afl_cam/config.py.")
         raise StitchError(
-            "Calibration failed - the scene has too few matchable features. "
-            "Aim the cameras at a textured scene with good lighting and "
-            "~25-30% overlap.")
+            "Calibration failed — no frozen alignment and the scene has too "
+            "few matchable features. Run the re-align workflow first.")
 
     if vs.reference_pano is not None:
         cv2.imwrite(str(out_dir / "panorama.jpg"), vs.reference_pano, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -1025,56 +648,22 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
 
     idx, t0 = 0, time.time()
     last_report = 0.0
-    pair_idx = 0
-    cam1_last = None
-    j_cur = -1
-    skip_left = advance1 if pair is not None else 0
-    consumed = 0
     out_pts = []  # kernel timestamp of each output frame (midpoint of the pair)
-
-    while True:
-        ok0, frame0 = cap0.read()
-        if not ok0 or frame0 is None:
-            break
-        consumed += 1
-        if skip_left > 0:
-            skip_left -= 1
-            continue
-
-        if pair is not None:
-            # stream cam1 forward to the frame whose kernel timestamp is
-            # closest to cam0's current frame (skip/duplicate as needed)
-            j = int(pair[pair_idx]) if pair_idx < len(pair) else int(pair[-1])
-            pair_idx += 1
-            if j == j_cur:
-                frame1 = cam1_last
-            else:
-                while j_cur < j:
-                    ok1, f1 = cap1.read()
-                    if not ok1 or f1 is None:
-                        j_cur = j  # cam1 ended: reuse its last frame
-                        break
-                    cam1_last = f1
-                    j_cur += 1
-                frame1 = cam1_last
-            if frame1 is None:
+    frame0 = f0
+    for i in range(s0, e_cut):
+        if i > s0:
+            ok0, frame0 = cap0.read()
+            if not ok0 or frame0 is None:
                 break
-        else:
-            ok1, frame1 = cap1.read()
-            if not ok1 or frame1 is None:
-                break
+        j = int(pair[i])
+        frame1 = cam1_frame(j)
 
         pano = vs.stitch(frame0, frame1)
         if pano.shape[:2] != (oh, ow):
             pano = cv2.resize(pano, (ow, oh))
-
         enc.write(pano)
         idx += 1
-
-        if pair is not None:
-            out_pts.append(int((pts0[s0 + consumed - 1] + pts1[j]) // 2))
-            if idx >= n_out:
-                break
+        out_pts.append(int((pts0[i] + pts1[j]) // 2))
 
         if time.time() - last_report > 2.5:
             _report(f"frame {idx} ({idx / (time.time() - t0):.1f} fps)")
@@ -1088,20 +677,17 @@ def stitch_video_files(cam0_path: Path, cam1_path: Path, out_dir: Path,
     if idx == 0:
         raise StitchError("No frames written. Recordings may be empty.")
 
-    if pair is not None and out_path is not None and out_pts:
-        # Diagnostic sidecar: the kernel timestamp of each output frame
-        # (midpoint of the source pair). The container itself is CFR at the
-        # measured rate — no VFR, no post-retime.
-        pts_path = out_dir / "stitch_video.pts"
-        with open(pts_path, "w") as fh:
-            fh.write("\n".join(str(t) for t in out_pts) + "\n")
-        _report(f"output: {idx} frames at {out_fps} fps "
-                f"({(out_pts[-1] - out_pts[0]) / 1e6:.2f}s real span)")
+    # Diagnostic sidecar: the kernel timestamp of each output frame
+    # (midpoint of the source pair).
+    with open(out_dir / "stitch_video.pts", "w") as fh:
+        fh.write("\n".join(str(t) for t in out_pts) + "\n")
+    _report(f"output: {idx} frames at {out_fps} fps "
+            f"({(out_pts[-1] - out_pts[0]) / 1e6:.2f}s real span)")
 
     return {
         "video_path": out_path,
         "frame_count": idx,
         "elapsed": elapsed,
         "output_shape": (ow, oh),
-        "frame_lag": advance1,
+        "frame_lag": s0,
     }

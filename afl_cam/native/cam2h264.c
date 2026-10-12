@@ -79,147 +79,6 @@ static void write_preview(const char *preview_path, const void *jpeg, size_t siz
         rename(tmp, preview_path);
 }
 
-/* ---- downscaled JPEG preview snapshots (MPP jpegenc, MAIN THREAD only) ----
- * The decoded NV12 is box-downscaled to ~960x540 and hardware JPEG-encoded
- * every AFL_CAM_PREVIEW_SECS; the UI (and the field-remote web page) poll
- * the file. jpegenc lives on the recording thread — never on a worker. */
-typedef struct {
-    MppCtx ctx;
-    MppApi *mpi;
-    MppBufferGroup grp;
-    MppBuffer in_buf;
-    MppBuffer out_buf;
-    MppFrame in_frame;
-    RK_U32 w, h, hstride, vstride;
-    int ok;
-} snap_t;
-
-static int snap_init(snap_t *s, int w, int h)
-{
-    memset(s, 0, sizeof *s);
-    s->w = w; s->h = h;
-    s->hstride = MPP_ALIGN(w, 16);
-    s->vstride = MPP_ALIGN(h, 16);
-    if (mpp_create(&s->ctx, &s->mpi)) return -1;
-    if (mpp_init(s->ctx, MPP_CTX_ENC, MPP_VIDEO_CodingMJPEG)) return -1;
-    MppEncCfg cfg = NULL;
-    mpp_enc_cfg_init(&cfg);
-    mpp_enc_cfg_set_s32(cfg, "prep:width", (RK_S32)s->w);
-    mpp_enc_cfg_set_s32(cfg, "prep:height", (RK_S32)s->h);
-    mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", (RK_S32)s->hstride);
-    mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", (RK_S32)s->vstride);
-    mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
-    mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingMJPEG);
-    mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor", 80);
-    if (s->mpi->control(s->ctx, MPP_ENC_SET_CFG, cfg)) return -1;
-    if (mpp_buffer_group_get_internal(&s->grp, MPP_BUFFER_TYPE_DRM)) return -1;
-    /* full 2x allocation: the vepu JPEG engine may read the UV plane past
-     * the 1.5x NV12 size — diagnostics proved the standard offset's UV is
-     * never read (2026-09-07) */
-    if (mpp_buffer_group_limit_config(s->grp, 4 * 1024 * 1024, 4)) return -1;
-    if (mpp_buffer_get(s->grp, &s->in_buf, (size_t)s->hstride * s->vstride * 2)) return -1;
-    if (mpp_buffer_get(s->grp, &s->out_buf, s->hstride * s->vstride * 2)) return -1;
-    mpp_frame_init(&s->in_frame);
-    mpp_frame_set_width(s->in_frame, s->w);
-    mpp_frame_set_height(s->in_frame, s->h);
-    mpp_frame_set_hor_stride(s->in_frame, s->hstride);
-    mpp_frame_set_ver_stride(s->in_frame, s->vstride);
-    mpp_frame_set_fmt(s->in_frame, MPP_FMT_YUV420SP);
-    mpp_frame_set_buffer(s->in_frame, s->in_buf);
-    s->ok = 1;
-    return 0;
-}
-
-static void snap_write(snap_t *s, const RK_U8 *nv12, RK_U32 sw, RK_U32 sh,
-                       RK_U32 shstride, RK_U32 svstride, const char *path)
-{
-    if (!s->ok || !nv12)
-        return;
-    if (getenv("AFL_CAM_SNAP_DEBUG"))
-        fprintf(stderr, "snap: sw=%u sh=%u shstride=%u svstride=%u\n",
-                sw, sh, shstride, svstride);
-    /* fresh frame each snapshot — a reused frame's stale KEY_OUTPUT_PACKET
-     * meta double-releases the output buffer (pool corruption, aliased
-     * packets: "worker: dropping bad packet") */
-    mpp_frame_deinit(&s->in_frame);
-    mpp_frame_init(&s->in_frame);
-    mpp_frame_set_width(s->in_frame, s->w);
-    mpp_frame_set_height(s->in_frame, s->h);
-    mpp_frame_set_hor_stride(s->in_frame, s->hstride);
-    mpp_frame_set_ver_stride(s->in_frame, s->vstride);
-    mpp_frame_set_fmt(s->in_frame, MPP_FMT_YUV420SP);
-    mpp_frame_set_buffer(s->in_frame, s->in_buf);
-
-    RK_U8 *dst = (RK_U8 *)mpp_buffer_get_ptr(s->in_buf);
-    const RK_U8 *srcUV = nv12 + (size_t)svstride * sh;
-
-    /* box-downscale Y (any src/dst ratio) */
-    for (RK_U32 oy = 0; oy < s->h; oy++) {
-        RK_U32 y0 = oy * sh / s->h, y1 = (oy + 1) * sh / s->h;
-        if (y1 <= y0) y1 = y0 + 1;
-        RK_U8 *row = dst + oy * s->hstride;
-        for (RK_U32 ox = 0; ox < s->w; ox++) {
-            RK_U32 x0 = ox * sw / s->w, x1 = (ox + 1) * sw / s->w;
-            if (x1 <= x0) x1 = x0 + 1;
-            RK_U32 acc = 0;
-            for (RK_U32 y = y0; y < y1; y++)
-                for (RK_U32 x = x0; x < x1; x++)
-                    acc += nv12[y * shstride + x];
-            row[ox] = (RK_U8)(acc / ((y1 - y0) * (x1 - x0)));
-        }
-    }
-    /* chroma: src NV12-interleaved at sw/2 x sh/2; dst at s->w/2 x s->h/2 */
-    RK_U8 *dstUV = dst + s->hstride * s->vstride;
-    for (RK_U32 oy = 0; oy < s->h / 2; oy++) {
-        RK_U32 y0 = oy * (sh / 2) / (s->h / 2), y1 = (oy + 1) * (sh / 2) / (s->h / 2);
-        if (y1 <= y0) y1 = y0 + 1;
-        for (RK_U32 ox = 0; ox < s->w / 2; ox++) {
-            RK_U32 x0 = ox * (sw / 2) / (s->w / 2), x1 = (ox + 1) * (sw / 2) / (s->w / 2);
-            if (x1 <= x0) x1 = x0 + 1;
-            RK_U32 accU = 0, accV = 0;
-            for (RK_U32 y = y0; y < y1; y++)
-                for (RK_U32 x = x0; x < x1; x++) {
-                    accU += srcUV[y * shstride + x * 2];
-                    accV += srcUV[y * shstride + x * 2 + 1];
-                }
-            dstUV[(oy * (s->w / 2) + ox) * 2] = (RK_U8)(accU / ((y1 - y0) * (x1 - x0)));
-            dstUV[(oy * (s->w / 2) + ox) * 2 + 1] = (RK_U8)(accV / ((y1 - y0) * (x1 - x0)));
-        }
-    }
-    /* DIAGNOSTICS: AFL_CAM_SNAP_GREYALL greys the ENTIRE buffer (finds
-     * where vepu reads the chroma); AFL_CAM_SNAP_TESTRED puts a known
-     * pattern at the standard offset */
-    if (getenv("AFL_CAM_SNAP_GREYALL"))
-        memset(dst, 128, (size_t)s->hstride * s->vstride * 2);
-
-    MppPacket enc_pkt = NULL;
-    mpp_packet_init_with_buffer(&enc_pkt, s->out_buf);
-    mpp_packet_set_length(enc_pkt, 0);
-    {
-        MppMeta m = mpp_frame_get_meta(s->in_frame);
-        if (m)
-            mpp_meta_set_packet(m, KEY_OUTPUT_PACKET, enc_pkt);
-    }
-    mpp_packet_deinit(&enc_pkt);
-
-    mpp_buffer_sync_begin(s->in_buf);
-    mpp_buffer_sync_end(s->in_buf);
-
-    if (s->mpi->encode_put_frame(s->ctx, s->in_frame))
-        return;
-    MppPacket pkt = NULL;
-    if (s->mpi->encode_get_packet(s->ctx, &pkt) || !pkt)
-        return;
-    void *ptr = mpp_packet_get_pos(pkt);
-    size_t len = mpp_packet_get_length(pkt);
-    if (ptr && len)
-        write_preview(path, ptr, len);
-    mpp_packet_deinit(&pkt);
-}
-
-
-
-
 /* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
  * for the auto-settle-then-lock exposure loop. */
 static double frame_luma(MppFrame frame)
@@ -471,14 +330,6 @@ int main(int argc, char **argv)
     MppBuffer frm_buf = NULL;
     MppBufferGroup pkt_grp = NULL;
     MppFrame out_frame = NULL;
-
-    /* preview snapshot (MPP jpegenc, main thread — see snap_write) */
-    snap_t snap;
-    int pv_w = 960, pv_h = 540;
-    if (getenv("AFL_CAM_PREVIEW_WIDTH")) pv_w = atoi(getenv("AFL_CAM_PREVIEW_WIDTH"));
-    if (getenv("AFL_CAM_PREVIEW_HEIGHT")) pv_h = atoi(getenv("AFL_CAM_PREVIEW_HEIGHT"));
-    if (snap_init(&snap, pv_w, pv_h))
-        fprintf(stderr, "preview: jpegenc init failed — no snapshots\n");
 
     /* MPP encoder */
     MppCtx enc_ctx = NULL;
@@ -775,7 +626,7 @@ int main(int argc, char **argv)
         /* live-preview snapshot: raw UVC JPEG payload straight to disk
          * (full 4K, colors exact — the camera's own JPEG). The jpegenc
          * downscale path is parked: vepu's 420SP UV offset proved opaque
-         * and RGB888 is rejected (2026-09-07, see snap_write). */
+         * and RGB888 is rejected (2026-09-07). */
         if (now_us() - last_snap_us >= snap_interval_us) {
             write_preview(preview_path, v4l2_bufs[vbuf.index].start, jpeg_size);
             last_snap_us = now_us();

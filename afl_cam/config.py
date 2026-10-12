@@ -175,11 +175,8 @@ STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "80000")
 # The native recorders write the raw UVC JPEG payload to
 # <session>/camN_preview.jpg this often; the UI (and the field-remote web
 # page) poll those files for a live preview while recording. 1 fps: the
-# payloads are full 4K (~600 KB) — a downscaled jpegenc variant is parked
-# in the C (vepu UV offset issue, 2026-09-07).
+# payloads are full 4K (~600 KB).
 PREVIEW_INTERVAL_SECS = float(os.environ.get("AFL_CAM_PREVIEW_SECS", "1.0"))
-PREVIEW_SNAP_WIDTH = int(os.environ.get("AFL_CAM_PREVIEW_WIDTH", "960"))
-PREVIEW_SNAP_HEIGHT = int(os.environ.get("AFL_CAM_PREVIEW_HEIGHT", "540"))
 
 # Exposure for the MPP recorder: 0 = auto-settle-then-lock (the recorder
 # matches the auto exposure's brightness with a locked manual value after

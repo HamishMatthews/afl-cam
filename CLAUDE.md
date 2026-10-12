@@ -214,12 +214,11 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   median (was 13–70 px before the canvas-space refinement). Near-field grass
   (~19 px bottom band) is genuine parallax — physics, not a bug.
 - Re-align button works end-to-end and streams logs; dump writes are atomic.
-- Live preview while recording (2026-09-07): the recorders box-downscale the
-  decoded NV12 to 960×540 and MPP-jpegenc it (main thread only) to
-  `<session>/camN_preview.jpg` every `AFL_CAM_PREVIEW_SECS` (default 0.2 s =
-  5 fps, atomic tmp+rename); the UI polls at 200 ms and the field-remote
-  page polls over HTTP. 10 fps is one env var away; true smooth preview
-  would need a second low-res MPP encode + HLS (phase 3, not built).
+- Live preview while recording: the recorders write the raw 4K UVC JPEG
+  payload to `<session>/camN_preview.jpg` every `AFL_CAM_PREVIEW_SECS`
+  (atomic tmp+rename; config default 1 s) for the GTK UI. The phone uses the
+  stitched H.264 preview (cam2stitch daemon mode → MediaMTX) instead. (The
+  old MPP-jpegenc downscale was never wired up and is removed.)
 - Encode defaults (2026-09-07): **HEVC** 60 Mbps per camera, 80 Mbps for the
   stitched canvas (`AFL_CAM_CODEC=h264` to revert; measured via `cam2h264
   --bench` — dual-concurrent 4K30 HEVC@60M sustains ~49 fps each on the

@@ -39,7 +39,7 @@
  * thread only PARSES and sets pending flags — every application action
  * (file open/close, encoder put/drain, IDR) runs on the MAIN thread.
  * While not recording the master encoder put/drain is skipped (idle VPU;
- * AFL_CAM_STANDBY_ENC=keep keeps encoding and drops the output instead).
+ * puts resume on REC_START with a forced IDR).
  *
  * PREVIEW encode (iphone-control-plan.md §4): with AFL_CAM_PREVIEW_UDP set,
  * a second rkvenc session (H.264 Constrained Baseline, ~1600x572 CBR) encodes
@@ -152,147 +152,6 @@ static void write_preview(const char *preview_path, const void *jpeg, size_t siz
     else
         rename(tmp, preview_path);
 }
-
-/* ---- downscaled JPEG preview snapshots (MPP jpegenc, MAIN THREAD only) ----
- * Called from the pairing loop with the decoded NV12 pointers; box-downscale
- * to ~960x540 + hardware JPEG-encode every AFL_CAM_PREVIEW_SECS. jpegenc
- * lives on the main thread — never on a worker or capture thread. */
-typedef struct {
-    MppCtx ctx;
-    MppApi *mpi;
-    MppBufferGroup grp;
-    MppBuffer in_buf;
-    MppBuffer out_buf;
-    MppFrame in_frame;
-    RK_U32 w, h, hstride, vstride;
-    int ok;
-} snap_t;
-
-static int snap_init(snap_t *s, int w, int h)
-{
-    memset(s, 0, sizeof *s);
-    s->w = w; s->h = h;
-    s->hstride = MPP_ALIGN(w, 16);
-    s->vstride = MPP_ALIGN(h, 16);
-    if (mpp_create(&s->ctx, &s->mpi)) return -1;
-    if (mpp_init(s->ctx, MPP_CTX_ENC, MPP_VIDEO_CodingMJPEG)) return -1;
-    MppEncCfg cfg = NULL;
-    mpp_enc_cfg_init(&cfg);
-    mpp_enc_cfg_set_s32(cfg, "prep:width", (RK_S32)s->w);
-    mpp_enc_cfg_set_s32(cfg, "prep:height", (RK_S32)s->h);
-    mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", (RK_S32)s->hstride);
-    mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", (RK_S32)s->vstride);
-    mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
-    mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingMJPEG);
-    mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor", 80);
-    if (s->mpi->control(s->ctx, MPP_ENC_SET_CFG, cfg)) return -1;
-    if (mpp_buffer_group_get_internal(&s->grp, MPP_BUFFER_TYPE_DRM)) return -1;
-    /* full 2x allocation: the vepu JPEG engine may read the UV plane past
-     * the 1.5x NV12 size — diagnostics proved the standard offset's UV is
-     * never read (2026-09-07) */
-    if (mpp_buffer_group_limit_config(s->grp, 4 * 1024 * 1024, 4)) return -1;
-    if (mpp_buffer_get(s->grp, &s->in_buf, (size_t)s->hstride * s->vstride * 2)) return -1;
-    if (mpp_buffer_get(s->grp, &s->out_buf, s->hstride * s->vstride * 2)) return -1;
-    mpp_frame_init(&s->in_frame);
-    mpp_frame_set_width(s->in_frame, s->w);
-    mpp_frame_set_height(s->in_frame, s->h);
-    mpp_frame_set_hor_stride(s->in_frame, s->hstride);
-    mpp_frame_set_ver_stride(s->in_frame, s->vstride);
-    mpp_frame_set_fmt(s->in_frame, MPP_FMT_YUV420SP);
-    mpp_frame_set_buffer(s->in_frame, s->in_buf);
-    s->ok = 1;
-    return 0;
-}
-
-static void snap_write(snap_t *s, const RK_U8 *nv12, RK_U32 sw, RK_U32 sh,
-                       RK_U32 shstride, RK_U32 svstride, const char *path)
-{
-    if (!s->ok || !nv12)
-        return;
-    if (getenv("AFL_CAM_SNAP_DEBUG"))
-        fprintf(stderr, "snap: sw=%u sh=%u shstride=%u svstride=%u\n",
-                sw, sh, shstride, svstride);
-    /* fresh frame each snapshot — a reused frame's stale KEY_OUTPUT_PACKET
-     * meta double-releases the output buffer (pool corruption, aliased
-     * packets: "worker: dropping bad packet") */
-    mpp_frame_deinit(&s->in_frame);
-    mpp_frame_init(&s->in_frame);
-    mpp_frame_set_width(s->in_frame, s->w);
-    mpp_frame_set_height(s->in_frame, s->h);
-    mpp_frame_set_hor_stride(s->in_frame, s->hstride);
-    mpp_frame_set_ver_stride(s->in_frame, s->vstride);
-    mpp_frame_set_fmt(s->in_frame, MPP_FMT_YUV420SP);
-    mpp_frame_set_buffer(s->in_frame, s->in_buf);
-
-    RK_U8 *dst = (RK_U8 *)mpp_buffer_get_ptr(s->in_buf);
-    const RK_U8 *srcUV = nv12 + (size_t)svstride * sh;
-
-    /* box-downscale Y (any src/dst ratio) */
-    for (RK_U32 oy = 0; oy < s->h; oy++) {
-        RK_U32 y0 = oy * sh / s->h, y1 = (oy + 1) * sh / s->h;
-        if (y1 <= y0) y1 = y0 + 1;
-        RK_U8 *row = dst + oy * s->hstride;
-        for (RK_U32 ox = 0; ox < s->w; ox++) {
-            RK_U32 x0 = ox * sw / s->w, x1 = (ox + 1) * sw / s->w;
-            if (x1 <= x0) x1 = x0 + 1;
-            RK_U32 acc = 0;
-            for (RK_U32 y = y0; y < y1; y++)
-                for (RK_U32 x = x0; x < x1; x++)
-                    acc += nv12[y * shstride + x];
-            row[ox] = (RK_U8)(acc / ((y1 - y0) * (x1 - x0)));
-        }
-    }
-    /* chroma: src NV12-interleaved at sw/2 x sh/2; dst at s->w/2 x s->h/2 */
-    RK_U8 *dstUV = dst + s->hstride * s->vstride;
-    for (RK_U32 oy = 0; oy < s->h / 2; oy++) {
-        RK_U32 y0 = oy * (sh / 2) / (s->h / 2), y1 = (oy + 1) * (sh / 2) / (s->h / 2);
-        if (y1 <= y0) y1 = y0 + 1;
-        for (RK_U32 ox = 0; ox < s->w / 2; ox++) {
-            RK_U32 x0 = ox * (sw / 2) / (s->w / 2), x1 = (ox + 1) * (sw / 2) / (s->w / 2);
-            if (x1 <= x0) x1 = x0 + 1;
-            RK_U32 accU = 0, accV = 0;
-            for (RK_U32 y = y0; y < y1; y++)
-                for (RK_U32 x = x0; x < x1; x++) {
-                    accU += srcUV[y * shstride + x * 2];
-                    accV += srcUV[y * shstride + x * 2 + 1];
-                }
-            dstUV[(oy * (s->w / 2) + ox) * 2] = (RK_U8)(accU / ((y1 - y0) * (x1 - x0)));
-            dstUV[(oy * (s->w / 2) + ox) * 2 + 1] = (RK_U8)(accV / ((y1 - y0) * (x1 - x0)));
-        }
-    }
-    /* DIAGNOSTICS: AFL_CAM_SNAP_GREYALL greys the ENTIRE buffer (finds
-     * where vepu reads the chroma); AFL_CAM_SNAP_TESTRED puts a known
-     * pattern at the standard offset */
-    if (getenv("AFL_CAM_SNAP_GREYALL"))
-        memset(dst, 128, (size_t)s->hstride * s->vstride * 2);
-
-    MppPacket enc_pkt = NULL;
-    mpp_packet_init_with_buffer(&enc_pkt, s->out_buf);
-    mpp_packet_set_length(enc_pkt, 0);
-    {
-        MppMeta m = mpp_frame_get_meta(s->in_frame);
-        if (m)
-            mpp_meta_set_packet(m, KEY_OUTPUT_PACKET, enc_pkt);
-    }
-    mpp_packet_deinit(&enc_pkt);
-
-    mpp_buffer_sync_begin(s->in_buf);
-    mpp_buffer_sync_end(s->in_buf);
-
-    if (s->mpi->encode_put_frame(s->ctx, s->in_frame))
-        return;
-    MppPacket pkt = NULL;
-    if (s->mpi->encode_get_packet(s->ctx, &pkt) || !pkt)
-        return;
-    void *ptr = mpp_packet_get_pos(pkt);
-    size_t len = mpp_packet_get_length(pkt);
-    if (ptr && len)
-        write_preview(path, ptr, len);
-    mpp_packet_deinit(&pkt);
-}
-
-
-
 
 /* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
  * for the auto-settle-then-lock exposure loop (copied from cam2h264.c). */
@@ -1436,14 +1295,7 @@ static void *encode_worker(void *arg) {
          * design was clean for hours, while encoder calls from this worker
          * thread produced intermittent phantom/corrupt packets. */
         void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[0]);
-        if (it.slot == -2) {
-            /* CAM2STITCH_NOGPU diagnostic: grey frame */
-            memset(enc_ptr, 128, (size_t)w->ehs * w->evs);
-            memset((char *)enc_ptr + (size_t)w->ehs * w->evs, 128,
-                   (size_t)w->ehs * w->evs / 2);
-        } else {
-            repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
-        }
+        repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
         /* preview downscale (daemon mode): one extra SSBO read pass */
         if (w->pv)
             pv_downscale_ssbo(w->pv, w->g, it.slot);
@@ -1803,7 +1655,7 @@ static void *capture_thread(void *arg) {
         /* live-preview snapshot: raw UVC JPEG payload straight to disk
          * (full 4K, colors exact — the camera's own JPEG). The jpegenc
          * downscale path is parked: vepu's 420SP UV offset proved opaque
-         * and RGB888 is rejected (2026-09-07, see snap_write). */
+         * and RGB888 is rejected (2026-09-07). */
         if (now_us() - c->last_snap >= c->snap_interval_us) {
             write_preview(c->preview_path, c->bufs[vbuf.index].start, jpeg_size);
             c->last_snap = now_us();
@@ -2293,11 +2145,6 @@ int main(int argc, char **argv) {
 
     /* daemon mode: afl-camd supervises us — standby until REC_START */
     int daemon_mode = getenv("AFL_CAM_CTL_SOCK") != NULL;
-    /* standby master encode: "skip" (default) idles the VPU — puts resume
-     * on REC_START with a forced IDR; "keep" encodes continuously and
-     * drops the output (diagnostic fallback) */
-    int keep_enc = getenv("AFL_CAM_STANDBY_ENC") &&
-                   !strcmp(getenv("AFL_CAM_STANDBY_ENC"), "keep");
     const char *snap_dir = getenv("AFL_CAM_PREVIEW_DIR");
 
     RK_S32 ret = 0;
@@ -2312,17 +2159,7 @@ int main(int argc, char **argv) {
 
     /* ---- GPU init BEFORE the cameras: fail fast if Vulkan is broken ---- */
     gpu_t g = {0};
-    int nogpu = getenv("CAM2STITCH_NOGPU") != NULL;
-    if (nogpu) {
-        /* still parse the canvas dims so the encoder config is valid */
-        float *pf0 = params_data;
-        g.canvas_w = (uint32_t)pf0[0]; g.canvas_h = (uint32_t)pf0[1];
-        g.src_w = (uint32_t)pf0[2]; g.src_h = (uint32_t)pf0[3];
-        g.tight_size = (size_t)g.canvas_w * g.canvas_h * 3 / 2;
-        fprintf(stderr, "CAM2STITCH_NOGPU: skipping GPU init (diagnostic)\n");
-    } else {
-        gpu_init(&g, spv_path, params_data, w0d, w1d, m0d, m1d);
-    }
+    gpu_init(&g, spv_path, params_data, w0d, w1d, m0d, m1d);
     void *tight = malloc(g.tight_size);
     if (!tight) { fprintf(stderr, "tight alloc failed\n"); return 1; }
 
@@ -2361,17 +2198,6 @@ int main(int argc, char **argv) {
         if (dec_init(c) < 0) { fprintf(stderr, "%s: dec init failed\n", c->dev); return 1; }
     }
     cma_print("after cameras");
-
-    /* preview snapshot encoders (MPP jpegenc, main thread only) */
-    snap_t snaps[2];
-    {
-        int pv_w = 960, pv_h = 540;
-        if (getenv("AFL_CAM_PREVIEW_WIDTH")) pv_w = atoi(getenv("AFL_CAM_PREVIEW_WIDTH"));
-        if (getenv("AFL_CAM_PREVIEW_HEIGHT")) pv_h = atoi(getenv("AFL_CAM_PREVIEW_HEIGHT"));
-        for (int i = 0; i < 2; i++)
-            if (snap_init(&snaps[i], pv_w, pv_h))
-                fprintf(stderr, "preview: jpegenc init failed — no snapshots\n");
-    }
 
     /* ---- encoder (composite canvas) ---- */
     MppCtx enc_ctx = NULL;
@@ -2673,101 +2499,69 @@ int main(int argc, char **argv) {
         mpp_buffer_sync_ro_begin(cams[0].ring.slots[f0_idx].buf);
         mpp_buffer_sync_ro_begin(cams[1].ring.slots[pair_idx].buf);
 
-        /* (snapshots handled in the capture threads — raw UVC payloads) */
-
-        if (nogpu) {
-            /* diagnostic: straight to the worker as a grey frame */
-            pthread_mutex_lock(&w.q->mu);
-            w.q->items[w.q->tail % 16] = (work_item){ 0, mid, 0 };
-            w.q->tail++; w.q->count++;
-            pthread_cond_signal(&w.q->cv);
-            pthread_mutex_unlock(&w.q->mu);
-            pthread_mutex_lock(&w.ack_mu);
-            while (!w.ack_done[0])
-                pthread_cond_wait(&w.ack_cv, &w.ack_mu);
-            w.ack_done[0] = 0;
-            pthread_mutex_unlock(&w.ack_mu);
-            if ((w.recording || keep_enc) && !w.stopping) {
-                mpp_frame_set_pts(enc_in[0], mid);
+        gpu_slot_t *s = &g.slots[g.k];
+        int k = g.k;
+        /* GPU job for frame i-3 is done → its packed SSBO is readable */
+        CHECK(vkWaitForFences(g.dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
+        CHECK(vkResetFences(g.dev, 1, &s->fence));
+        {
+            VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                       .memory = s->ssbo_mem, .offset = 0, .size = g.ssbo_size };
+            vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
+        }
+        /* the slot's previous result (frame i-3) — hand it to the
+         * worker for repack, then wait before the GPU overwrites it */
+        int64_t put_pts = pend_pts[k];
+        pthread_mutex_lock(&w.q->mu);
+        w.q->items[w.q->tail % 16] = (work_item){ k, put_pts, 0 };
+        w.q->tail++; w.q->count++;
+        pthread_cond_signal(&w.q->cv);
+        pthread_mutex_unlock(&w.q->mu);
+        /* the worker must finish repacking slot k's SSBO before the GPU
+         * overwrites it with this frame's job (usually already done) */
+        pthread_mutex_lock(&w.ack_mu);
+        while (!w.ack_done[k])
+            pthread_cond_wait(&w.ack_cv, &w.ack_mu);
+        w.ack_done[k] = 0;
+        pthread_mutex_unlock(&w.ack_mu);
+        /* copy this frame's pair into staging + submit */
+        size_t nv12 = (size_t)g.src_w * g.src_h * 3 / 2;
+        memcpy((char *)s->staging_map + s->stage_off[0], y0_ptr, nv12);
+        memcpy((char *)s->staging_map + s->stage_off[2], y1_ptr, nv12);
+        {
+            VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                       .memory = s->staging_mem, .offset = 0, .size = g.stage_size };
+            vkFlushMappedMemoryRanges(g.dev, 1, &mr);
+        }
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .commandBufferCount = 1, .pCommandBuffers = &s->cb };
+        CHECK(vkQueueSubmit(g.queue, 1, &si, s->fence));
+        pend_pts[k] = mid;
+        g.k = (g.k + 1) % RING_SLOTS;
+        /* encode frame i-3 (repacked by the worker into enc_in[0]) on
+         * the MAIN thread — the proven-clean sync path. The drain
+         * returns immediately: the encoder finished ~30ms ago. */
+        if (put_pts >= 0) {
+            if (w.recording && !w.stopping) {
+                mpp_frame_set_pts(enc_in[0], put_pts);
                 worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
-                worker_drain(&w, mid);
+                worker_drain(&w, put_pts);
             }
-            if (w.recording && w.stopping) {
-                int got = worker_drain(&w, mid);
-                if (got == 0) {
-                    if (++w.empty_drains >= 3)
-                        ctl_finish_stop(ctl, &w, pv_ok ? &pv : NULL);
-                } else {
-                    w.empty_drains = 0;
-                }
-            }
+            /* stitched preview (daemon): every canvas frame, on the
+             * main thread — UDP best-effort + proxy while recording */
             if (pv_ok)
-                pv_put_drain(&pv, mid);
-        } else {
-            gpu_slot_t *s = &g.slots[g.k];
-            int k = g.k;
-            /* GPU job for frame i-3 is done → its packed SSBO is readable */
-            CHECK(vkWaitForFences(g.dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
-            CHECK(vkResetFences(g.dev, 1, &s->fence));
-            {
-                VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                                           .memory = s->ssbo_mem, .offset = 0, .size = g.ssbo_size };
-                vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
-            }
-            /* the slot's previous result (frame i-3) — hand it to the
-             * worker for repack, then wait before the GPU overwrites it */
-            int64_t put_pts = pend_pts[k];
-            pthread_mutex_lock(&w.q->mu);
-            w.q->items[w.q->tail % 16] = (work_item){ k, put_pts, 0 };
-            w.q->tail++; w.q->count++;
-            pthread_cond_signal(&w.q->cv);
-            pthread_mutex_unlock(&w.q->mu);
-            /* the worker must finish repacking slot k's SSBO before the GPU
-             * overwrites it with this frame's job (usually already done) */
-            pthread_mutex_lock(&w.ack_mu);
-            while (!w.ack_done[k])
-                pthread_cond_wait(&w.ack_cv, &w.ack_mu);
-            w.ack_done[k] = 0;
-            pthread_mutex_unlock(&w.ack_mu);
-            /* copy this frame's pair into staging + submit */
-            size_t nv12 = (size_t)g.src_w * g.src_h * 3 / 2;
-            memcpy((char *)s->staging_map + s->stage_off[0], y0_ptr, nv12);
-            memcpy((char *)s->staging_map + s->stage_off[2], y1_ptr, nv12);
-            {
-                VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                                           .memory = s->staging_mem, .offset = 0, .size = g.stage_size };
-                vkFlushMappedMemoryRanges(g.dev, 1, &mr);
-            }
-            VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                                .commandBufferCount = 1, .pCommandBuffers = &s->cb };
-            CHECK(vkQueueSubmit(g.queue, 1, &si, s->fence));
-            pend_pts[k] = mid;
-            g.k = (g.k + 1) % RING_SLOTS;
-            /* encode frame i-3 (repacked by the worker into enc_in[0]) on
-             * the MAIN thread — the proven-clean sync path. The drain
-             * returns immediately: the encoder finished ~30ms ago. */
-            if (put_pts >= 0) {
-                if ((w.recording || keep_enc) && !w.stopping) {
-                    mpp_frame_set_pts(enc_in[0], put_pts);
-                    worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
-                    worker_drain(&w, put_pts);
-                }
-                /* stitched preview (daemon): every canvas frame, on the
-                 * main thread — UDP best-effort + proxy while recording */
-                if (pv_ok)
-                    pv_put_drain(&pv, put_pts);
-            }
-            if (w.recording && w.stopping) {
-                /* draining the encoder tail: no new puts. Outside the
-                 * put_pts guard so a stop inside the first 3 frames also
-                 * drains and closes (put_pts < 0 there). */
-                int got = worker_drain(&w, put_pts);
-                if (got == 0) {
-                    if (++w.empty_drains >= 3)
-                        ctl_finish_stop(ctl, &w, pv_ok ? &pv : NULL);
-                } else {
-                    w.empty_drains = 0;
-                }
+                pv_put_drain(&pv, put_pts);
+        }
+        if (w.recording && w.stopping) {
+            /* draining the encoder tail: no new puts. Outside the
+             * put_pts guard so a stop inside the first 3 frames also
+             * drains and closes (put_pts < 0 there). */
+            int got = worker_drain(&w, put_pts);
+            if (got == 0) {
+                if (++w.empty_drains >= 3)
+                    ctl_finish_stop(ctl, &w, pv_ok ? &pv : NULL);
+            } else {
+                w.empty_drains = 0;
             }
         }
         ring_release(&cams[0].ring, f0_idx);
