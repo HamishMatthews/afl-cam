@@ -55,3 +55,10 @@ jobs:
           name: rig-daemon-log
           path: rig-daemon.log
           if-no-files-found: ignore
+      - name: Stitch score
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stitch-score
+          path: rig-artifacts/stitch-score/
+          if-no-files-found: ignore
