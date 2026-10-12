@@ -108,13 +108,20 @@ vec3 sample_cam(sampler2D y_tex, sampler2D uv_tex, vec2 s, vec2 src_dims) {
     return nv12_to_rgb(y, uv);
 }
 
+// per-camera exposure gain, params [5]/[6] (seam_refine.py matches the two
+// cameras' brightness); 0 = unset (older params.bin) = 1.0
+float cam_gain(int cam) {
+    float g = P.f[5 + cam];
+    return g > 0.0 ? g : 1.0;
+}
+
 // blended RGB at one canvas pixel (pixel-corner coords p)
 vec3 blend_at(vec2 p, vec2 src_dims, vec2 canvas_dims) {
     vec2 uv_c = (p + vec2(0.5)) / canvas_dims;
     vec2 s0 = fetch_map(map0, 0, p);
     vec2 s1 = fetch_map(map1, 1, p);
-    return sample_cam(y0, uv0, s0, src_dims) * texture(w0, uv_c).r +
-           sample_cam(y1, uv1, s1, src_dims) * texture(w1, uv_c).r;
+    return clamp(sample_cam(y0, uv0, s0, src_dims) * cam_gain(0), 0.0, 1.0) * texture(w0, uv_c).r +
+           clamp(sample_cam(y1, uv1, s1, src_dims) * cam_gain(1), 0.0, 1.0) * texture(w1, uv_c).r;
 }
 
 void main() {

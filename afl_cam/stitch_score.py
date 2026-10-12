@@ -38,14 +38,17 @@ def load_still(path: Path, src) -> np.ndarray:
 
 
 def warp_views(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps):
-    """Each camera warped alone into the full canvas, plus its valid mask."""
+    """Each camera warped alone (with its exposure gain) into the full
+    canvas, plus its valid mask."""
     cw, ch = live.canvas
     views, masks = [], []
-    for cam, frame in zip(live.cams, (f0, f1)):
+    for i, (cam, frame) in enumerate(zip(live.cams, (f0, f1))):
         mh, mw = cam.map.shape[:2]
         x0, y0 = cam.off
         warp = cv2.remap(frame, cam.map[:, :, 0], cam.map[:, :, 1], cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if live.gain(i) != 1.0:     # as the shader renders it
+            warp = cv2.convertScaleAbs(warp, alpha=live.gain(i))
         view = np.zeros((ch, cw) + frame.shape[2:], frame.dtype)
         view[y0:y0 + mh, x0:x0 + mw] = warp
         mask = np.zeros((ch, cw), bool)

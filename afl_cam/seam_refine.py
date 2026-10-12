@@ -8,8 +8,9 @@ ruler), fits a smooth model of it over the overlap, and warps each camera's
 map by half of it in opposite directions so the views meet. The correction
 fades out away from the overlap so the rest of each view is untouched.
 
-Only the map files change (same format, same shader): live and offline
-stitching both pick it up.
+It also matches the two cameras' brightness over the overlap with a
+per-camera gain (params.bin [5..6], applied by the shader). Only the map
+files change: live and offline stitching both pick it up.
 """
 
 from typing import Optional, Tuple
@@ -114,5 +115,19 @@ def refine(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps, rounds: i
         if res is None or res["n_tiles"] < 8:
             break
         cur = apply_field(cur, fit_field(res["tiles"], box), box)
+    cur = match_exposure(f0, f1, cur)
     after = stitch_score.score(f0, f1, cur)
     return cur, before, after
+
+
+def match_exposure(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps,
+                   max_gain: float = 1.5) -> stitch_maps.LiveMaps:
+    """Set the per-camera gains so both cameras are equally bright over the
+    overlap, meeting in the middle (cam0 x sqrt(r), cam1 / sqrt(r)) so
+    neither view is pushed far into clipping."""
+    plain = live.with_gains(1.0, 1.0)
+    r = stitch_score.score(f0, f1, plain)["luma_ratio"]   # cam1 / cam0
+    if not r:
+        return live
+    g = float(np.clip(np.sqrt(r), 1 / max_gain, max_gain))
+    return live.with_gains(g, 1 / g)
