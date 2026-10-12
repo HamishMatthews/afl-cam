@@ -64,6 +64,14 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   AFL_CAM_IDLE_SECS), REST + WebSocket API, web UI, finalize (master mux
   with hvc1 tag + proxy faststart + thumbnail), phone clock sync, auto-stop
   (temp/storage), schedule, GPIO button/LED.
+- `afl_cam/resume.py` — recording that survives a crash: the record intent
+  (`outputs/_live/intent.json`, heartbeat 5 s) outlives a cam2stitch crash,
+  a daemon restart and a reboot; the daemon seals the dead run's files as
+  `stitch.NNN.*` and REC_STARTs the same folder again. Finalize muxes each
+  segment and concatenates; gaps go in `segments.json`. Only an explicit
+  stop, the schedule or an auto-stop clears it; a boot more than
+  `AFL_CAM_RESUME_MAX_GAP_S` (900) after the last heartbeat finalizes
+  instead of resuming.
 - `afl_cam/web/index.html` — the phone page: status/REC/elapsed, WHEP
   preview with HLS fallback, schedule, recordings browser (play/save/delete),
   and a Setup tab: pre-game self-test (`afl_cam/selftest.py`), re-align with

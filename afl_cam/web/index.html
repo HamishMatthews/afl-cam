@@ -260,7 +260,8 @@ function applyStatus(s) {
     s.state === "error" ? " state-error" : "");
 
   const btn = $("recBtn");
-  if (s.recording) {
+  const rs = s.resume || {};
+  if (s.recording || rs.pending) {
     btn.textContent = "■ STOP RECORDING";
     btn.classList.add("stop");
     btn.disabled = false;
@@ -277,6 +278,9 @@ function applyStatus(s) {
     : s.state === "finalizing" ? "saving the last recording…"
     : s.state === "realigning" ? "re-aligning the cameras — recording is off until it finishes"
     : s.state === "standby" && !s.recording ? "standby — framing live" : "";
+  if (rs.pending) $("hint").textContent = "pipeline restarted — the recording resumes on its own";
+  else if (rs.armed) $("hint").textContent = "recording will resume if anything restarts" +
+    (rs.restarts ? ` · resumed ${rs.restarts}×` : "");
 
   $("st-storage").querySelector(".v").textContent = s.storage ? s.storage.minutes_left : "–";
   const tc = s.temp || {};
@@ -552,6 +556,7 @@ function loadRecordings() {
           <div class="badges">
             ${r.has_master ? '<span class="badge ok">master</span>' : '<span class="badge">master –</span>'}
             ${r.has_proxy ? '<span class="badge ok">proxy</span>' : '<span class="badge">proxy –</span>'}
+            ${r.resumed ? `<span class="badge">resumed ${r.resumed.restarts}× · ${Math.round(r.resumed.lost_s)} s gap</span>` : ""}
             ${r.error ? '<span class="badge" style="color:var(--red)">error</span>' : ""}
           </div>
         </div>
