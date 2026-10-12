@@ -7,10 +7,10 @@
 # so uncommitted edits are tested) to ~/afl-cam-test/<worktree> on the board
 # and runs scripts/rig_test.sh there. Parallel sessions are safe: each
 # worktree gets its own dir and the board queues them on the rig lock.
-# AFL_CAM_PI overrides the ssh host (default: the board's tailscale name).
+# AFL_CAM_PI overrides the ssh target (default: hamish@ the board's tailscale name).
 set -euo pipefail
 
-HOST=${AFL_CAM_PI:-orangepi5-max}
+HOST=${AFL_CAM_PI:-hamish@orangepi5-max}
 cd "$(git rev-parse --show-toplevel)"
 NAME=$(basename "$PWD")-$(git rev-parse --abbrev-ref HEAD | tr '/' '-')
 DEST="afl-cam-test/$NAME"

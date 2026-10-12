@@ -37,7 +37,7 @@ Jobs run one at a time, so parallel PRs queue for the cameras.
 
 ## 3. ssh for local sessions
 
-`remote_rig_test.sh` uses `ssh orangepi5-max` (override with `AFL_CAM_PI`).
+`remote_rig_test.sh` uses `ssh hamish@orangepi5-max` (override with `AFL_CAM_PI`).
 With Tailscale on both machines, either enable Tailscale SSH on the board
 (`sudo tailscale set --ssh`) or put your dev machine's public key in
 `~/.ssh/authorized_keys`. On Windows run it from Git Bash or WSL.
