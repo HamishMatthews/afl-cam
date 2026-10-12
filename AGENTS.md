@@ -42,8 +42,11 @@ widening yours. If you stop, say where you got to in a comment and swap
 
 ## Testing
 
+- **Everyone, first**: `uv run pytest tests/unit` — hardware-free, seconds,
+  runs anywhere (needs ffmpeg). The `unit` workflow runs it on every PR.
+  Add a unit test with every change that can be tested off the board.
 - **Cloud sessions** (no board access): push the branch and open the PR.
-  `rig-test` runs on the board automatically and reports on the PR; fix
+  `rig-test` (the board suite, `tests/rig`) runs on the board automatically and reports on the PR; fix
   what it reports. Label the PR `rig:slow` to include the record cycle.
 - **Local sessions**: `scripts/remote_rig_test.sh` ships your worktree
   (uncommitted edits included) to the board over Tailscale ssh and runs

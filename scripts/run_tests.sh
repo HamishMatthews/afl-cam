@@ -6,4 +6,4 @@
 #   scripts/run_tests.sh -m slow      everything, including the record cycle
 set -e
 cd "$(dirname "$0")/.."
-exec uv run pytest tests/ -v "$@"
+exec uv run pytest tests/rig -v "$@"
