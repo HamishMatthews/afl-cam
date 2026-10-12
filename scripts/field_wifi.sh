@@ -19,12 +19,11 @@
 #   field_wifi.sh stop    — leave field mode, restore the home WiFi.
 set -u
 NM="nmcli"
-SUDO_PASS="${AFL_CAM_SUDO_PASS:-123}"
 
-# passwordless first (root under systemd, or a NOPASSWD rule), else the
-# board's documented sudo password (CLAUDE.md convention)
+# passwordless first (root under systemd, or a NOPASSWD rule), else prompt
+# the operator interactively. No password lives in the repo.
 sudo_cmd() {
-    sudo -n "$@" 2>/dev/null || echo "$SUDO_PASS" | sudo -S -p '' "$@"
+    sudo -n "$@" 2>/dev/null || sudo "$@"
 }
 
 AP_PROFILE="afl-cam-ap"          # legacy NM profile — no longer activated
