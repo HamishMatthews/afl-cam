@@ -8,23 +8,35 @@ import numpy as np
 from afl_cam import framing, stitch_maps
 
 SW, SH, CW, CH, OFF1 = 64, 48, 96, 48, 32
+CUT = 48        # canvas column of the hard cut
 
 
-def write_set(tmp_path, scale=30.0, tl_y=20.0):
-    ramp = np.clip((56 - np.arange(CW)) * 255 / 16, 0, 255).astype(np.uint8)
-    w0 = np.zeros((CH, CW), np.uint8)
-    w0[:, :SW] = ramp[:SW]
-    w1 = np.zeros((CH, CW), np.uint8)
-    w1[:, OFF1:] = 255 - ramp[OFF1:]
-    m = np.zeros((SH, SW, 2), np.float32)
+def write_set(tmp_path, scale=30.0, tl_y=20.0, hard_cut=False):
+    """cam0 has no source in its last 4 columns (out of frame), cam1 none in
+    its first 2: the cameras overlap on canvas columns 34..59."""
+    if hard_cut:    # what seam refinement can leave: 0/255, no ramp
+        w0 = np.zeros((CH, CW), np.uint8)
+        w0[:, :CUT] = 255
+        w1 = np.zeros((CH, CW), np.uint8)
+        w1[:, CUT:] = 255
+    else:
+        ramp = np.clip((56 - np.arange(CW)) * 255 / 16, 0, 255).astype(np.uint8)
+        w0 = np.zeros((CH, CW), np.uint8)
+        w0[:, :SW] = ramp[:SW]
+        w1 = np.zeros((CH, CW), np.uint8)
+        w1[:, OFF1:] = 255 - ramp[OFF1:]
+    m0 = np.zeros((SH, SW, 2), np.float32)
+    m0[:, -4:, 0] = SW + 5
+    m1 = np.zeros((SH, SW, 2), np.float32)
+    m1[:, :2, 0] = -1
     params = np.zeros(stitch_maps.PARAMS_FLOATS, np.float32)
     params[4] = scale
     for cam in (0, 1):
         params[8 + stitch_maps.CAM_BLOCK * cam + 10] = tl_y
     stitch_maps.write(tmp_path, stitch_maps.LiveMaps(
         canvas=(CW, CH), src=(SW, SH), params=params,
-        cams=[stitch_maps.CameraMap(m, (0, 0), w0),
-              stitch_maps.CameraMap(m, (OFF1, 0), w1)]))
+        cams=[stitch_maps.CameraMap(m0, (0, 0), w0),
+              stitch_maps.CameraMap(m1, (OFF1, 0), w1)]))
     return w0, w1
 
 
@@ -32,13 +44,20 @@ def test_seam_overlap_and_horizon(tmp_path):
     w0, w1 = write_set(tmp_path)
     f = framing.framing(tmp_path)
     assert f["canvas"] == [CW, CH]
+    assert f["overlap"] == [round(34 / CW, 4), round(59 / CW, 4)]     # where both maps have pixels
     both = np.nonzero((w0[0] > 0) & (w1[0] > 0))[0]
-    assert f["overlap"] == [round(both[0] / CW, 4), round(both[-1] / CW, 4)]
     seam = next(x for x in both if w1[0, x] >= w0[0, x])
     assert f["seam"] == round(seam / CW, 4)
-    assert both[0] < seam < both[-1]
+    assert f["overlap"][0] < f["seam"] < f["overlap"][1]
     assert f["horizon"] == round((30 * math.pi / 2 - 20) / CH, 4)
     assert f["aligned_at"] > 0
+
+
+def test_a_hard_cut_still_has_a_seam_and_an_overlap(tmp_path):
+    write_set(tmp_path, hard_cut=True)      # no row has both weights non-zero
+    f = framing.framing(tmp_path)
+    assert f["seam"] == round(CUT / CW, 4)
+    assert f["overlap"] == [round(34 / CW, 4), round(59 / CW, 4)]
 
 
 def test_horizon_off_canvas_is_omitted(tmp_path):

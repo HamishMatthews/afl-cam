@@ -26,8 +26,8 @@ def test_framing_guides_from_the_live_maps():
     f = get("/api/framing")["framing"]
     assert f is not None, "no live map set on the rig"
     assert f["canvas"][0] > 0 and f["canvas"][1] > 0
-    lo, hi = f["overlap"]
-    assert 0 < lo < f["seam"] < hi < 1, f
+    lo, hi = f["overlap"]       # where both cameras have pixels at the horizon row
+    assert 0 < lo <= f["seam"] <= hi < 1, f
     assert f["horizon"] is None or 0 <= f["horizon"] < 1
 
 
