@@ -1,4 +1,4 @@
-"""afl-camd — the field recording daemon (iphone-control-plan.md).
+"""afl-camd — the field recording daemon (docs/archive/iphone-control-plan.md).
 
 One supervised pipeline + one API + one web page, GoPro-style. Stdlib
 only (no cv2/gi) so it runs headless under systemd.
@@ -561,7 +561,7 @@ def mux_master(raw: Path, pts: Path, out: Path,
     at the measured rate.
 
     HEVC masters carry the hvc1 tag — without it iPhone/QuickTime refuse
-    to play the file (iphone-control-plan.md §4)."""
+    to play the file (docs/archive/iphone-control-plan.md §4)."""
     fps = _pts_median_fps(pts, 30.0)
     args = ["-f", "hevc" if HEVC else "h264",
             "-r", f"{fps:.4f}", "-i", str(raw),
@@ -1064,7 +1064,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._json({"ok": False, "error": msg}, status=status)
 
     def _authed(self) -> bool:
-        """Optional per-device token (iphone-control-plan.md §5): when
+        """Optional per-device token (docs/archive/iphone-control-plan.md §5): when
         AFL_CAM_TOKEN is set, mutating endpoints require it."""
         if not AUTH_TOKEN:
             return True

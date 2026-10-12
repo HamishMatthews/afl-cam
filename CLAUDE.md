@@ -9,7 +9,7 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
 
 ## Running things
 
-- Field daemon: `uv run afl-cam daemon` — afl-camd (iphone-control-plan.md):
+- Field daemon: `uv run afl-cam daemon` — afl-camd (docs/archive/iphone-control-plan.md):
   supervises a long-running cam2stitch, serves the web UI + REST + WS API
   (port 80, falls back to 8080; `AFL_CAM_PORT` overrides), session
   finalize, clock sync, auto-stop, schedule, GPIO. Installed as a systemd
@@ -55,7 +55,9 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   files while recording.
 - `afl_cam/native/stitch_nv12.comp` (+ `.spv`) — map-texture shader, BT.601
   limited (jpegd outputs Y 16–235 exactly, `RANGE_FULL=0`), 4-Y-bytes-per-uint
-  SSBO packing.
+  SSBO packing; per-camera exposure gain from params.bin [5..6] (set by
+  seam_refine, 0 = 1.0). Rebuild the .spv with `glslangValidator -V
+  stitch_nv12.comp -o stitch_nv12.spv` (byte-reproducible).
 - `afl_cam/native/cam2h264.c` — per-camera recorder (separate mode).
 - `afl_cam/daemon.py` — afl-camd (stdlib only): supervises cam2stitch
   (spawn/restart/adopt a live socket from a previous run/idle-close on
@@ -94,7 +96,9 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   `dump_camera_params.py --r1` (final, atomic writes).
 - `afl_cam/seam_refine.py` + `scripts/refine_seam.py` — fits the measured
   overlap misalignment (parallax) as a smooth field and warps both maps by
-  half of it, fading out away from the overlap; last step of the re-align
+  half of it, fading out away from the overlap, matches exposure, and
+  re-cuts the blend as a 64 px ramp along the min-difference seam path;
+  last step of the re-align
   chain, writes only if the stitch score improves (`.prev` maps kept).
 - `afl_cam/stitch_score.py` + `scripts/stitch_score.py` — THE stitch
   quality score (overlap misalignment median/p95 px, exposure step, seam
@@ -210,7 +214,7 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   http://aflcam.local/. The daemon holds the cameras only when a phone is
   connected (idle closes them after AFL_CAM_IDLE_SECS).
 - **afl-camd field daemon built and verified end-to-end from a laptop**
-  (iphone-control-plan.md build order steps 2–6): cam2stitch daemon mode
+  (docs/archive/iphone-control-plan.md build order steps 2–6): cam2stitch daemon mode
   (standby/record toggle + ctl socket + stitched H.264 preview + proxy),
   MediaMTX v1.21.2 (RTSP in :8554, WHEP :8889, HLS :8888), afl-camd
   (supervise/adopt/idle-close, REST + WebSocket, finalize with hvc1 master
@@ -255,6 +259,6 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
 
 - `orange_pi_5_max_setup.md` — board setup history (packages, MPP, libmali,
   IRQ pinning, verification cheat-sheet).
-- `hardware_stitch_plan.md` / `live_stitch_plan.md` — original design plans.
+- `docs/archive/hardware_stitch_plan.md` / `docs/archive/live_stitch_plan.md` — original design plans.
 - Session memory (auto-loaded): hardware topology, NVMe thermal crisis,
   alignment crisis + fixes, MPP quirks.

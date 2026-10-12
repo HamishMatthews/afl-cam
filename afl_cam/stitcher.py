@@ -103,6 +103,7 @@ class VideoStitcher:
         self._overlap_c0: Optional[Tuple[int, int, int, int]] = None
         self._overlap_c1: Optional[Tuple[int, int, int, int]] = None
 
+        self._gains: Tuple[float, float] = (1.0, 1.0)
         self._dx: float = 0.0
         self._dy: float = 0.0
 
@@ -194,6 +195,7 @@ class VideoStitcher:
                           & (cam.map[:, :, 0] >= 0)).astype(np.uint8) * 255)
             maps.append(cv2.convertMaps(cam.map[:, :, 0], cam.map[:, :, 1], cv2.CV_16SC2))
         self._map0, self._map1 = maps
+        self._gains = (live.gain(0), live.gain(1))
         self._roi0, self._roi1 = rois
         self._mask0, self._mask1 = masks
         self._output_shape = (ch, cw)
@@ -277,6 +279,9 @@ class VideoStitcher:
     def _stitch_quality(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
         warp0 = cv2.remap(left, self._map0[0], self._map0[1], cv2.INTER_LINEAR)
         warp1 = cv2.remap(right, self._map1[0], self._map1[1], cv2.INTER_LINEAR)
+        if self._gains != (1.0, 1.0):   # live map set's exposure match, as the shader
+            warp0 = cv2.convertScaleAbs(warp0, alpha=self._gains[0])
+            warp1 = cv2.convertScaleAbs(warp1, alpha=self._gains[1])
 
         r0 = self._roi0
         cv2.copyTo(warp0, self._mask0, self._out_buffer[r0[0]:r0[1], r0[2]:r0[3]])

@@ -1,3 +1,5 @@
+> **Historical**: original concept and MVP strategy (Intel NUC 7 era); superseded by the Orange Pi 5 Max build. The single source of truth is [CLAUDE.md](../../CLAUDE.md).
+
 A portable, battery-powered camera system to record amateur Australian Rules Football (AFL) matches autonomously. The system mounts on a 3m telescopic pole or grandstand, 5m off the boundary line, capturing end-to-end action across the oval. Recorded footage is processed post-match to stitch and track the play for team analysis, with future potential for live streaming and productisation.
 # Problem Statement
 

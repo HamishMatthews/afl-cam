@@ -178,7 +178,7 @@ def cmd_list_devices(_args):
 
 
 def cmd_daemon(_args):
-    """Run the afl-camd field daemon (iPhone control, iphone-control-plan.md).
+    """Run the afl-camd field daemon (iPhone control, docs/archive/iphone-control-plan.md).
 
     Supervises the always-on cam2stitch pipeline, serves the web UI + REST
     + WebSocket API (default port 80), manages sessions/finalize, clock
