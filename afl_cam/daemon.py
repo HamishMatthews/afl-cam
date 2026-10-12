@@ -88,6 +88,7 @@ AUTH_TOKEN = os.environ.get("AFL_CAM_TOKEN", "")
 GPIO_BTN = os.environ.get("AFL_CAM_GPIO_BTN", "")
 GPIO_LED = os.environ.get("AFL_CAM_GPIO_LED", "")
 WEB_UI = Path(__file__).resolve().parent / "web" / "index.html"
+WEB_UI_DIR = WEB_UI.parent
 LIVE_SNAP_DIR = OUTPUTS_DIR / "_live"    # camN_preview.jpg snapshots land here
 WHEP_PORT = 8889
 HLS_PORT = 8888
@@ -819,6 +820,11 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/":
             return self._index()
+        if path == "/hls.min.js":
+            # bundled hls.js — Chrome/Firefox need MSE to play HLS; a CDN
+            # would fail at the ground (the AP has no internet)
+            return self._serve_file(WEB_UI_DIR / "hls.min.js",
+                                    "text/javascript")
         if path == "/api/status":
             return self._json(self.daemon.snapshot())
         if path == "/api/events":
@@ -909,7 +915,27 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/release":
             self.daemon.release_for_ui()
             return self._ok()
+        parts = path.split("/")
+        if len(parts) == 5 and parts[1:3] == ["api", "recordings"] \
+                and parts[3].isdigit() and parts[4] == "proxy":
+            return self._make_proxy(int(parts[3]))
         self._err("not found", status=404)
+
+    def _make_proxy(self, sid: int):
+        """Generate an iPhone-playable proxy for a session that lacks one
+        (desktop-UI recordings are in the same DB but have no proxy).
+        Runs in the background; the phone polls the recordings list."""
+        folder = self.daemon.session_folder(sid)
+        if folder is None:
+            return self._err("not found", status=404)
+
+        def work():
+            ok = self.daemon.make_proxy_for_session(sid)
+            log.info("proxy for session %d: %s", sid,
+                     "ready" if ok else "failed")
+
+        threading.Thread(target=work, daemon=True).start()
+        return self._json({"ok": True, "started": True})
 
     def do_DELETE(self):
         self.daemon.touch()
@@ -1012,6 +1038,9 @@ class CamDaemon:
         self._idle_sigterm = False    # we asked the pipeline down (not a crash)
         self._hold_until = 0.0        # UI handover: don't respawn until then
         self._sigterm_sent_at = 0.0   # SIGTERM'd; SIGKILL if it doesn't exit
+        self._sigterm_target = None   # WHICH process we SIGTERM'd — the
+                                      # enforcement must never SIGKILL a
+                                      # fresh spawn (2026-10-12: it did)
         self._starting_since = 0.0
         self._intents_lock = threading.Lock()
         self._requests: dict = {}    # request_id -> outcome (idempotency)
@@ -1132,6 +1161,7 @@ class CamDaemon:
         self._hold_until = time.time() + 15
         self._sigterm_sent_at = time.time()
         proc = self.supervisor.proc
+        self._sigterm_target = proc
         if proc is None and self.supervisor._adopted:
             # adopted (foreign) pipeline: ask it over the ctl socket
             try:
@@ -1152,6 +1182,8 @@ class CamDaemon:
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
+        self._sigterm_sent_at = 0.0
+        self._sigterm_target = None
 
     def request_new(self, request_id: str) -> bool:
         with self._intents_lock:
@@ -1313,21 +1345,25 @@ class CamDaemon:
                 self._idle_sigterm = True
                 self._set_state("idle")
                 self._sigterm_sent_at = now
+                self._sigterm_target = self.supervisor.proc
                 if self.supervisor.proc is not None:
                     self.supervisor.proc.send_signal(15)
 
             # enforce pipeline death: cam2stitch can deadlock in its exit
             # path (all threads in futex waits after closing the cameras —
             # seen 2026-10-11). Cameras are already free at that point, so
-            # a SIGKILL is clean. Without this, the open ctl socket makes
-            # the supervisor wait forever and the cameras never hand over.
-            if self._sigterm_sent_at and self.supervisor.proc is not None \
+            # a SIGKILL is clean. The target check is critical: without it
+            # the enforcement kills a FRESH pipeline spawned after the hold
+            # (2026-10-12: every handover was followed by rc=-9 churn).
+            if self._sigterm_target is not None \
+                    and self._sigterm_target is self.supervisor.proc \
                     and self.supervisor.proc.poll() is None \
                     and now - self._sigterm_sent_at > 5:
                 log.warning("pipeline didn't exit %.0fs after SIGTERM — "
                             "SIGKILL", now - self._sigterm_sent_at)
                 self.supervisor.proc.kill()
                 self._sigterm_sent_at = 0.0
+                self._sigterm_target = None
 
             # hardware button (GPIO, optional): toggle record
             self._poll_button()
@@ -1602,6 +1638,40 @@ class CamDaemon:
         if not folder.is_absolute():
             folder = ROOT_DIR / folder
         return folder if session_dir_is_safe(folder) else None
+
+    def make_proxy_for_session(self, session_id: int) -> bool:
+        """Ensure <folder>/proxy.mp4 exists (iPhone-playable): remux the
+        stitched master, or fall back to the first camera raw + pts.
+        Desktop-UI recordings land in the same DB but never get a proxy."""
+        folder = self.session_folder(session_id)
+        if folder is None:
+            return False
+        proxy = folder / "proxy.mp4"
+        if proxy.is_file() and proxy.stat().st_size > 0:
+            return True
+        stitch = folder / "stitch.mp4"
+        if stitch.is_file():
+            ok, err = _run_ffmpeg(["-i", str(stitch), "-c", "copy",
+                                   "-movflags", "+faststart", str(proxy)])
+            if ok:
+                return True
+            log.error("proxy: stitch remux failed: %s", err)
+        for raw in sorted(folder.glob("*.raw.h264")) \
+                + sorted(folder.glob("*.raw.hevc")):
+            pts = raw.with_suffix("").with_suffix(".pts")
+            if not pts.is_file():
+                continue
+            fps = _pts_median_fps(pts, 15.0)
+            args = ["-f", "hevc" if raw.suffix == ".hevc" else "h264",
+                    "-r", f"{fps:.4f}", "-i", str(raw), "-c", "copy"]
+            if raw.suffix == ".hevc":
+                args += ["-tag:v", "hvc1"]
+            ok, err = _run_ffmpeg(args + ["-movflags", "+faststart",
+                                          str(proxy)])
+            if ok:
+                return True
+            log.error("proxy: %s mux failed: %s", raw.name, err)
+        return False
 
     def recordings(self) -> list[dict]:
         out = []
