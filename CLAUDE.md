@@ -70,6 +70,10 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   `realigning`), framing guides (seam, overlap, horizon from the live maps,
   `afl_cam/framing.py`), PWA manifest + icons. The rig test re-aligns into
   `AFL_CAM_ALIGN_OUT` (scratch), never `calibration/`.
+  Record tab has a Live stitch / Separate switch: separate mode closes
+  cam2stitch and runs one cam2h264 per camera (`SeparateRecorder`),
+  proxy.mp4 = hard link to cam0.mp4; "Stitch" on a separate session runs
+  `python -m afl_cam.restitch <id>` (niced subprocess, stitch_video.mp4).
 - `deploy/mediamtx.yml` + `deploy/systemd/*` + `scripts/install_field_services.sh`
   — MediaMTX (:8554 RTSP in, :8889 WHEP, :8888 HLS) and afl-camd units.
 - `afl_cam/config.py` — camera discovery, `STITCH_PARAMS_DIR`

@@ -192,29 +192,9 @@ def ensure_cam2h264() -> Optional[Path]:
     Returns the binary path, or None if the build fails (gcc/librockchip_mpp
     missing — see orange_pi_5_max_setup.md).
     """
-    import subprocess
+    from .config import build_cam2h264
 
-    from .config import NATIVE_RECORDER_BIN, NATIVE_RECORDER_SRC
-
-    if NATIVE_RECORDER_BIN.exists() and NATIVE_RECORDER_SRC.exists() and \
-            NATIVE_RECORDER_BIN.stat().st_mtime >= NATIVE_RECORDER_SRC.stat().st_mtime:
-        return NATIVE_RECORDER_BIN
-
-    cmd = [
-        "gcc", "-O2", "-I/usr/local/include/rockchip",
-        "-o", str(NATIVE_RECORDER_BIN), str(NATIVE_RECORDER_SRC),
-        "-L/usr/local/lib", "-lrockchip_mpp", "-lpthread",
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.error("cam2h264 build failed: %s", e)
-        return None
-    if result.returncode != 0:
-        log.error("cam2h264 build failed: %s", result.stderr.strip())
-        return None
-    log.info("Built native recorder: %s", NATIVE_RECORDER_BIN)
-    return NATIVE_RECORDER_BIN
+    return build_cam2h264()
 
 
 class CameraRecorderMPP:

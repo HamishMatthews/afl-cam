@@ -248,6 +248,30 @@ def build_cam2stitch() -> Path | None:
         return None
     return STITCH_RECORDER_BIN
 
+def build_cam2h264() -> Path | None:
+    """Compile the per-camera recorder (separate mode) if missing or stale
+    (stdlib-only, like build_cam2stitch — the daemon needs it too)."""
+    import subprocess
+
+    if NATIVE_RECORDER_BIN.exists() and NATIVE_RECORDER_SRC.exists() and \
+            NATIVE_RECORDER_BIN.stat().st_mtime >= NATIVE_RECORDER_SRC.stat().st_mtime:
+        return NATIVE_RECORDER_BIN
+    cmd = [
+        "gcc", "-O2", "-I/usr/local/include/rockchip",
+        "-o", str(NATIVE_RECORDER_BIN), str(NATIVE_RECORDER_SRC),
+        "-L/usr/local/lib", "-lrockchip_mpp", "-lpthread",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"afl-cam: cam2h264 build failed: {e}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(f"afl-cam: cam2h264 build failed: "
+              f"{result.stderr.strip()[-400:]}", file=sys.stderr)
+        return None
+    return NATIVE_RECORDER_BIN
+
 # SQLite pragmas
 DB_PRAGMAS = {
     "journal_mode": "WAL",

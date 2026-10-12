@@ -39,7 +39,15 @@ Endpoints (default port 80, AFL_CAM_PORT overrides)::
     GET  /api/realign/seam.jpg      seam crop from the last re-align
     GET  /api/selftest              pre-game checks (cameras, alignment, …)
     GET  /api/framing               seam + horizon positions for the preview
+    POST /api/mode                  {"mode": "live"|"separate"} (not while recording)
+    POST /api/recordings/<id>/stitch   re-stitch a separate-mode session
+    GET  /api/live/cam0.jpg|cam1.jpg   separate-mode recording snapshots
     GET  /manifest.webmanifest, /icon-*.png   PWA (Add to Home Screen)
+
+Recording modes: "live" (default) — cam2stitch records the stitched
+panorama; "separate" — the pipeline closes and one cam2h264 per camera
+records the raw views (the offline stitch test bed), re-stitched later on
+request (afl_cam/restitch.py, a subprocess: it needs OpenCV).
 
 State machine: idle → starting → standby → recording → finalizing →
 standby, plus error, and realigning (pipeline closed while the re-align
@@ -61,6 +69,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -73,10 +82,11 @@ from urllib.parse import urlsplit
 from . import framing, selftest
 from .config import (
     ALIGN_PYTHON, ALIGN_SCRIPT, AUDIO_DEVICES, CAMERAS, DB_PATH,
-    ENCODE_CODEC, OUTPUTS_DIR, ROOT_DIR, STITCH_BITRATE_KBPS,
+    ENCODE_CODEC, EXPOSURE_TIME, NATIVE_BITRATE_KBPS, OUTPUTS_DIR,
+    PREVIEW_INTERVAL_SECS, ROOT_DIR, STITCH_BITRATE_KBPS,
     STITCH_CANVAS_WIDTH, STITCH_PARAMS_DIR, STITCH_RECORDER_BIN,
-    STITCH_SHADER, _discover_cameras, build_cam2stitch, rediscover_cameras,
-    vk_env,
+    STITCH_SHADER, _discover_cameras, build_cam2h264, build_cam2stitch,
+    rediscover_cameras, vk_env,
 )
 from .db import RecordingDB
 from .sessions import new_session_dir, remove_session_dir, session_dir_is_safe
@@ -111,6 +121,8 @@ ALIGN_OUT = Path(os.environ.get("AFL_CAM_ALIGN_OUT") or STITCH_PARAMS_DIR)
 SCORE_SCRIPT = ROOT_DIR / "scripts" / "stitch_score.py"
 REALIGN_TIMEOUT_S = 900
 MAP_FILES = ("params.bin", "map0.bin", "map1.bin", "w0.bin", "w1.bin")
+MODES = ("live", "separate")
+MASTER_NAMES = ("stitch.mp4", "stitch_video.mp4")   # live, re-stitched
 PWA_FILES = {
     "/manifest.webmanifest": ("manifest.webmanifest",
                               "application/manifest+json"),
@@ -543,8 +555,10 @@ def _run_ffmpeg(args: list[str], timeout: int = 300) -> tuple[bool, str]:
     return result.returncode == 0, result.stderr.strip()
 
 
-def mux_master(raw: Path, pts: Path, out: Path) -> bool:
-    """stitch.raw.h264 → stitch.mp4 as CFR at the measured rate.
+def mux_master(raw: Path, pts: Path, out: Path,
+               faststart: bool = False) -> bool:
+    """stitch.raw.h264 (or a separate-mode camN.raw.h264) → .mp4 as CFR
+    at the measured rate.
 
     HEVC masters carry the hvc1 tag — without it iPhone/QuickTime refuse
     to play the file (iphone-control-plan.md §4)."""
@@ -554,6 +568,8 @@ def mux_master(raw: Path, pts: Path, out: Path) -> bool:
             "-c", "copy"]
     if HEVC:
         args += ["-tag:v", "hvc1"]
+    if faststart:
+        args += ["-movflags", "+faststart"]
     args.append(str(out))
     ok, err = _run_ffmpeg(args)
     if ok and out.exists() and out.stat().st_size > 0:
@@ -591,6 +607,8 @@ class Finalizer(threading.Thread):
         self.session = session
 
     def run(self):
+        if self.session.kind == "separate":
+            return self._run_separate()
         s = self.session
         dir_ = s.dir
         raw = dir_ / "stitch.raw.h264"
@@ -620,16 +638,151 @@ class Finalizer(threading.Thread):
         log.info("finalize: session %d %s (master=%s proxy=%s %.0fs)",
                  s.session_id, dir_.name, master_ok, proxy_ok, s.duration)
 
+    def _run_separate(self):
+        """Per-camera files: mux each (cam0 faststart), proxy.mp4 is a hard
+        link to cam0.mp4 (no second copy of a 4K file), thumbnail."""
+        s = self.session
+        dir_ = s.dir
+        ok = {}
+        db = RecordingDB(DB_PATH)
+        try:
+            for cam, row_id in s.recording_ids.items():
+                raw = dir_ / f"{cam}.raw.h264"
+                out = dir_ / f"{cam}.mp4"
+                ok[cam] = raw.exists() and mux_master(
+                    raw, dir_ / f"{cam}.pts", out, faststart=cam == "cam0")
+                if ok[cam]:
+                    raw.unlink(missing_ok=True)
+                    db.update_complete(row_id, s.duration, out.stat().st_size)
+                else:
+                    db.update_error(row_id, "mux failed or no frames")
+            proxy_ok = False
+            if ok.get("cam0"):
+                try:
+                    os.link(dir_ / "cam0.mp4", dir_ / "proxy.mp4")
+                    proxy_ok = True
+                except OSError as e:
+                    log.error("finalize: proxy link failed: %s", e)
+            if proxy_ok:
+                make_thumb(dir_ / "proxy.mp4", dir_ / "thumb.jpg")
+            db.update_session_stitch_status(s.session_id, "none")
+        finally:
+            db.close()
+        both = all(ok.get(c) for c in ("cam0", "cam1"))
+        self.daemon.on_finalized(s, both, proxy_ok)
+        log.info("finalize: separate session %d %s (%s, %.0fs)",
+                 s.session_id, dir_.name, ok, s.duration)
+
+
+class SeparateRecorder:
+    """Separate mode: one cam2h264 per camera, raw views on disk (no stitch
+    at record time). SIGINT stops them gracefully (flush + close)."""
+
+    def __init__(self, dir_: Path, devices: dict):
+        self.dir = dir_
+        self.devices = devices
+        self.procs: dict = {}
+
+    def start(self) -> Optional[str]:
+        """Start both recorders; an error message if either fails."""
+        binary = build_cam2h264()
+        if binary is None:
+            return "per-camera recorder failed to build — see board log"
+        env = dict(os.environ, AFL_CAM_CODEC=ENCODE_CODEC,
+                   AFL_CAM_BITRATE_KBPS=str(NATIVE_BITRATE_KBPS),
+                   AFL_CAM_PREVIEW_SECS=str(PREVIEW_INTERVAL_SECS))
+        for cam in ("cam0", "cam1"):
+            cmd = [str(binary), self.devices[cam],
+                   str(self.dir / f"{cam}.raw.h264"), "0",
+                   str(RESOLUTION["width"]), str(RESOLUTION["height"]),
+                   str(RESOLUTION["fps"]), str(EXPOSURE_TIME), "0"]
+            try:
+                with open(self.dir / f"{cam}.rec.log", "w") as logf:
+                    self.procs[cam] = subprocess.Popen(
+                        cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
+            except OSError as e:
+                self.stop()
+                return f"{cam} recorder failed to start: {e}"
+        # a recorder that can't open its camera exits within a second
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            dead = self.dead()
+            if dead:
+                self.stop()
+                return f"{dead} recorder exited at start — camera busy?"
+            time.sleep(0.1)
+        return None
+
+    def dead(self) -> Optional[str]:
+        for cam, proc in self.procs.items():
+            if proc.poll() is not None:
+                return cam
+        return None
+
+    def stop(self, timeout: float = 15):
+        for proc in self.procs.values():
+            if proc.poll() is None:
+                try:
+                    proc.send_signal(2)          # SIGINT: flush + close
+                except OSError:
+                    pass
+        deadline = time.time() + timeout
+        for proc in self.procs.values():
+            try:
+                proc.wait(timeout=max(0.1, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                log.warning("separate: recorder ignored SIGINT — killing")
+                proc.kill()
+
+
+class RestitchJob(threading.Thread):
+    """Re-stitch one separate-mode session (afl_cam/restitch.py in a
+    niced subprocess), keeping its latest progress line for the phone."""
+
+    def __init__(self, session_id: int):
+        super().__init__(name="restitch", daemon=True)
+        self.session_id = session_id
+        self.progress = "starting…"
+        self.ok: Optional[bool] = None
+        self.finished_at: Optional[float] = None
+
+    def summary(self) -> dict:
+        return {"session_id": self.session_id,
+                "running": self.finished_at is None,
+                "progress": self.progress, "ok": self.ok}
+
+    def run(self):
+        cmd = ["nice", "-n", "10", sys.executable, "-m", "afl_cam.restitch",
+               str(self.session_id)]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", bufsize=1, cwd=str(ROOT_DIR),
+                env=dict(os.environ, PYTHONUNBUFFERED="1"))
+            for line in proc.stdout:
+                if line.strip():
+                    self.progress = line.strip()[-160:]
+                    log.info("restitch %d: %s", self.session_id, self.progress)
+            self.ok = proc.wait() == 0
+        except OSError as e:
+            self.progress, self.ok = f"failed to run: {e}", False
+        self.finished_at = time.time()
+
 
 class Session:
     """Bookkeeping for one recording (folder, DB rows, audio procs)."""
 
     def __init__(self, dir_: Path, session_id: int, recording_id: int,
-                 audio: list):
+                 audio: list, kind: str = "live",
+                 recorder: Optional[SeparateRecorder] = None,
+                 recording_ids: Optional[dict] = None):
         self.dir = dir_
         self.session_id = session_id
         self.recording_id = recording_id
         self.audio = audio
+        self.kind = kind                      # live | separate
+        self.recorder = recorder              # separate mode only
+        self.recording_ids = recording_ids or {}
         self.start = time.time()
         self.duration = 0.0
 
@@ -1005,6 +1158,11 @@ class _Handler(BaseHTTPRequestHandler):
             return self._serve_file(job.crop, "image/jpeg")
         if path == "/api/selftest":
             return self._json({"ok": True, **self.daemon.selftest()})
+        if path in ("/api/live/cam0.jpg", "/api/live/cam1.jpg"):
+            snap = self.daemon.live_snapshot(path[-8:-4])
+            if snap is None:
+                return self._err("not found", status=404)
+            return self._serve_file(snap, "image/jpeg")
         if path == "/api/framing":
             return self._json({"ok": True,
                                "framing": framing.framing(STITCH_PARAMS_DIR)})
@@ -1048,8 +1206,10 @@ class _Handler(BaseHTTPRequestHandler):
         if name == "thumb.jpg":
             return self._serve_file(folder / "thumb.jpg", "image/jpeg")
         if name == "master.mp4":
-            return self._serve_file(folder / "stitch.mp4", "video/mp4",
-                                    range_ok=True)
+            master = session_master(folder)
+            if master is None:
+                return self._err("not found", status=404)
+            return self._serve_file(master, "video/mp4", range_ok=True)
         return self._err("not found", status=404)
 
     def _upgrade_ws(self):
@@ -1093,6 +1253,11 @@ class _Handler(BaseHTTPRequestHandler):
             return self._set_time(body)
         if path == "/api/schedule":
             return self._schedule(body)
+        if path == "/api/mode":
+            if not self._authed():
+                return self._err("forbidden", status=403)
+            ok, msg = self.daemon.set_mode((body or {}).get("mode"))
+            return self._json({"ok": ok, "error": msg})
         if path == "/api/realign":
             if not self._authed():
                 return self._err("forbidden", status=403)
@@ -1105,6 +1270,12 @@ class _Handler(BaseHTTPRequestHandler):
         if len(parts) == 5 and parts[1:3] == ["api", "recordings"] \
                 and parts[3].isdigit() and parts[4] == "proxy":
             return self._make_proxy(int(parts[3]))
+        if len(parts) == 5 and parts[1:3] == ["api", "recordings"] \
+                and parts[3].isdigit() and parts[4] == "stitch":
+            if not self._authed():
+                return self._err("forbidden", status=403)
+            ok, msg = self.daemon.start_restitch(int(parts[3]))
+            return self._json({"ok": ok, "error": msg})
         self._err("not found", status=404)
 
     def _make_proxy(self, sid: int):
@@ -1207,6 +1378,15 @@ class _Server(ThreadingHTTPServer):
 
 # ---------------------------------------------------------------- daemon --
 
+def session_master(folder: Path) -> Optional[Path]:
+    """The session's stitched video: the live master, else a re-stitch."""
+    for name in MASTER_NAMES:
+        path = folder / name
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+    return None
+
+
 class CamDaemon:
     """State machine + API. The tick loop is the single state owner."""
 
@@ -1223,6 +1403,9 @@ class CamDaemon:
         self._pending_stop = False
         self._pending_realign = False
         self.realign: Optional[RealignJob] = None
+        self.mode = "live"            # live | separate (resets on restart)
+        self._cameras_busy: Optional[str] = None   # separate recorders own them
+        self.restitch: Optional[RestitchJob] = None
         self._idle_sigterm = False    # we asked the pipeline down (not a crash)
         self._hold_until = 0.0        # UI handover: don't respawn until then
         self._sigterm_sent_at = 0.0   # SIGTERM'd; SIGKILL if it doesn't exit
@@ -1332,6 +1515,8 @@ class CamDaemon:
             return False           # UI handover in progress
         if self.state == "realigning":
             return False           # the re-align chain owns the cameras
+        if self._cameras_busy:
+            return False           # separate-mode recorders own them
         if self.state != "idle":
             return True
         if self._pending_start or self._ws:
@@ -1429,6 +1614,39 @@ class CamDaemon:
         if self.state in ("starting", "standby") and self._pending_start:
             return False, "pipeline still coming up — retry in a moment"
         return False, self.error or "start failed — see board log"
+
+    def set_mode(self, mode) -> tuple[bool, str]:
+        if mode not in MODES:
+            return False, f"mode must be one of {', '.join(MODES)}"
+        with self._intents_lock:
+            if self.session is not None or self.state in (
+                    "recording", "finalizing") or self._pending_start:
+                return False, "can't change mode while recording"
+            self.mode = mode
+        log.info("mode: %s", mode)
+        return True, ""
+
+    def start_restitch(self, session_id: int) -> tuple[bool, str]:
+        if self.restitch is not None and self.restitch.is_alive():
+            return False, "a re-stitch is already running"
+        if self.session is not None:
+            return False, "stop the recording before re-stitching"
+        folder = self.session_folder(session_id)
+        if folder is None:
+            return False, "no such recording"
+        if not ((folder / "cam0.mp4").is_file() and (folder / "cam1.mp4").is_file()):
+            return False, "not a separate-mode recording (needs cam0 + cam1)"
+        self.restitch = RestitchJob(session_id)
+        self.restitch.start()
+        return True, ""
+
+    def live_snapshot(self, cam: str) -> Optional[Path]:
+        """Latest 4K snapshot a separate-mode recorder wrote."""
+        s = self.session
+        if s is None or s.kind != "separate":
+            return None
+        path = s.dir / f"{cam}_preview.jpg"
+        return path if path.is_file() else None
 
     def intent_realign(self) -> tuple[bool, str]:
         """Queue a re-align; the tick loop closes the pipeline and starts
@@ -1532,6 +1750,8 @@ class CamDaemon:
                 self.supervisor.kill_pipeline()
                 self._starting_since = now
             elif self.state in ("standby", "recording", "finalizing") \
+                    and not self._cameras_busy \
+                    and not (self.session and self.session.kind == "separate") \
                     and self.supervisor.status_ts \
                     and now - self.supervisor.status_ts > 10:
                 log.error("watchdog: stitch status stalled %.0fs — "
@@ -1541,6 +1761,20 @@ class CamDaemon:
                 if self.session is not None:
                     # finalize what was written (per-packet flushes)
                     self.on_stitch_exit()
+
+            # separate mode: the recorders take the cameras from the
+            # pipeline (no need to wait for standby)
+            if self._pending_start and self.mode == "separate" \
+                    and self.session is None and not self._pending_realign \
+                    and self.state in ("idle", "starting", "standby", "error"):
+                self._execute_start_separate()
+            if self.state == "recording" and self.session is not None \
+                    and self.session.kind == "separate":
+                dead = self.session.recorder.dead()
+                if dead:
+                    log.error("separate: %s recorder died — finalizing", dead)
+                    self.error = f"{dead} recorder stopped unexpectedly"
+                    self._execute_stop()
 
             # re-align: close the pipeline, hand the cameras to the chain
             if self._pending_realign and self.session is None \
@@ -1652,6 +1886,8 @@ class CamDaemon:
             self.broadcast(json.dumps(self.snapshot()))
 
     def _execute_start(self):
+        if self.mode == "separate":
+            return self._execute_start_separate()
         self._pending_start = False
         self._idle_sigterm = False
         self.error = None
@@ -1680,20 +1916,7 @@ class CamDaemon:
             log.error("session setup failed: %s", e)
             self._set_state("error", error=f"session setup failed: {e}")
             return
-        # audio: camera mics (clap fallback / audio track)
-        audio = []
-        for cam in ("cam0", "cam1"):
-            dev = AUDIO_DEVICES.get(cam)
-            if not dev:
-                continue
-            try:
-                proc = subprocess.Popen(
-                    ["arecord", "-q", "-D", dev, "-f", "S16_LE",
-                     "-c", "2", "-r", "44100", str(dir_ / f"{cam}.wav")],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                audio.append(proc)
-            except OSError:
-                pass
+        audio = self._start_audio(dir_)
         try:
             reply = self.supervisor.command(f"REC_START {dir_}")
         except RuntimeError as e:
@@ -1708,6 +1931,67 @@ class CamDaemon:
         self.session = Session(dir_, session_id, row_id, audio)
         self._set_state("recording")
         log.info("recording: session %d -> %s", session_id, dir_.name)
+
+    def _execute_start_separate(self):
+        """Separate mode: close the pipeline, then one cam2h264 per camera
+        into a new session folder (cam0/cam1.raw.h264 + .pts)."""
+        self._pending_start = False
+        self.error = None
+        self._cameras_busy = "separate"
+        self._close_pipeline()
+        devs = _rediscover_with_kick()
+        if not devs.get("cam0") or not devs.get("cam1"):
+            self._cameras_busy = None
+            self._set_state("error", error="separate mode needs both cameras")
+            return
+        dir_ = new_session_dir()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            session_id = self.db.add_session(
+                created_at=now, folder=str(dir_.relative_to(ROOT_DIR)))
+            row_ids = {cam: self.db.add(
+                camera=cam, device_path=devs[cam], resolution="4K separate",
+                file_path=str((dir_ / f"{cam}.mp4").relative_to(ROOT_DIR)),
+                status="recording", session_id=session_id, created_at=now,
+                codec="HEVC" if HEVC else "H264", container="mp4")
+                for cam in ("cam0", "cam1")}
+        except Exception as e:
+            log.error("session setup failed: %s", e)
+            self._cameras_busy = None
+            self._set_state("error", error=f"session setup failed: {e}")
+            return
+        recorder = SeparateRecorder(dir_, devs)
+        err = recorder.start()
+        if err:
+            log.error("separate: %s", err)
+            for row_id in row_ids.values():
+                self.db.update_error(row_id, err)
+            self._cameras_busy = None
+            self._set_state("error", error=err)
+            return
+        audio = self._start_audio(dir_)
+        self.session = Session(dir_, session_id, row_ids["cam0"], audio,
+                               kind="separate", recorder=recorder,
+                               recording_ids=row_ids)
+        self._set_state("recording")
+        log.info("recording (separate): session %d -> %s",
+                 session_id, dir_.name)
+
+    def _start_audio(self, dir_: Path) -> list:
+        """Camera mics (clap fallback / audio track)."""
+        audio = []
+        for cam in ("cam0", "cam1"):
+            dev = AUDIO_DEVICES.get(cam)
+            if not dev:
+                continue
+            try:
+                audio.append(subprocess.Popen(
+                    ["arecord", "-q", "-D", dev, "-f", "S16_LE",
+                     "-c", "2", "-r", "44100", str(dir_ / f"{cam}.wav")],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            except OSError:
+                pass
+        return audio
 
     def _attach_recording(self, st: dict):
         """Daemon restarted while cam2stitch was recording: rebuild the
@@ -1745,6 +2029,14 @@ class CamDaemon:
         if self.state != "recording" or self.session is None:
             return
         s = self.session
+        if s.kind == "separate":
+            s.duration = time.time() - s.start
+            s.recorder.stop()
+            s.stop_audio()
+            self.session = None
+            self._set_state("finalizing")
+            Finalizer(self, s).start()
+            return
         st = self.supervisor.get_status()
         if st and st.get("rec_elapsed_s"):
             s.duration = float(st["rec_elapsed_s"])
@@ -1777,7 +2069,11 @@ class CamDaemon:
             "thumb": f"/api/recordings/{session.session_id}/thumb.jpg"
             if proxy_ok else None,
         }
-        if self.state == "finalizing":
+        if session.kind == "separate":
+            self._cameras_busy = None
+            if self.state == "finalizing":
+                self._set_state("idle")    # the next wake reopens the pipeline
+        elif self.state == "finalizing":
             self._set_state("standby")
 
     def on_stitch_exit(self):
@@ -1936,7 +2232,9 @@ class CamDaemon:
             for s in self.db.list_sessions(limit=200):
                 folder = self.session_folder(s["id"])
                 proxy = folder / "proxy.mp4" if folder else None
-                master = folder / "stitch.mp4" if folder else None
+                master = session_master(folder) if folder else None
+                separate = bool(folder and (folder / "cam0.mp4").is_file()
+                                and (folder / "cam1.mp4").is_file())
                 out.append({
                     "id": s["id"],
                     "created_at": s.get("created_at"),
@@ -1946,8 +2244,8 @@ class CamDaemon:
                      else 0),
                     "has_proxy": bool(proxy and proxy.is_file()
                                       and proxy.stat().st_size > 0),
-                    "has_master": bool(master and master.is_file()
-                                       and master.stat().st_size > 0),
+                    "has_master": master is not None,
+                    "kind": "separate" if separate else "live",
                     "thumb": f"/api/recordings/{s['id']}/thumb.jpg"
                     if proxy and (folder / "thumb.jpg").is_file() else None,
                     "stitch_status": s.get("stitch_status"),
@@ -2074,6 +2372,9 @@ class CamDaemon:
             } if recording else {"cam0": False, "cam1": False},
             "schedule": self.schedule,
             "realign": self.realign_status(),
+            "mode": self.mode,
+            "session_kind": self.session.kind if self.session else None,
+            "restitch": self.restitch.summary() if self.restitch else None,
             "last_recording": self.last_recording,
             "clock": {"synced": self._clock_synced},
             "preview": {
