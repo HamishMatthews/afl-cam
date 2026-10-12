@@ -1,0 +1,8 @@
+# LF everywhere: this repo runs on Linux (the board), and a CRLF checkout on
+# Windows breaks every shell script shipped to it (bash: $'\r': command not found).
+* text=auto eol=lf
+
+*.spv binary
+*.jpg binary
+*.png binary
+*.bin binary

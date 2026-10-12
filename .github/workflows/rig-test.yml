@@ -1,0 +1,57 @@
+# Hardware tests on the real rig. The Orange Pi is a self-hosted runner
+# (label afl-cam-rig, setup in deploy/rig-runner.md); it runs one job at a
+# time, so PRs from parallel sessions queue for the cameras. Fast suite by
+# default; label a PR `rig:slow` (or tick "slow" on a manual run) for the
+# record cycle too.
+name: rig-test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "afl_cam/**"
+      - "tests/**"
+      - "scripts/**"
+      - "deploy/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/rig-test.yml"
+  workflow_dispatch:
+    inputs:
+      slow:
+        description: "Include slow tests (record cycle)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  rig:
+    # never run code from forks on a box on the home network; of label
+    # events, only adding rig:slow re-runs
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       (github.event.action != 'labeled' || github.event.label.name == 'rig:slow'))
+    runs-on: [self-hosted, afl-cam-rig]
+    # job-level so a skipped label event doesn't touch it; a new push replaces
+    # that PR's QUEUED job, but a running one finishes (killing it mid-test
+    # could leave afl-camd stopped)
+    concurrency:
+      group: rig-test-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rig tests
+        env:
+          RIG_SLOW: ${{ (inputs.slow || contains(github.event.pull_request.labels.*.name, 'rig:slow')) && '1' || '' }}
+        run: bash scripts/rig_test.sh "$GITHUB_WORKSPACE"
+      - name: Daemon log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rig-daemon-log
+          path: rig-daemon.log
+          if-no-files-found: ignore

@@ -20,9 +20,11 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - Vulkan apps (cam2stitch): `LD_LIBRARY_PATH=/opt/libmali-g610/usr/lib/aarch64-linux-gnu:/opt/libmali-g610/usr/lib/aarch64-linux-gnu/mali VK_DRIVER_FILES=/opt/libmali-g610/usr/share/vulkan/icd.d/mali.json`.
 - GPU governor (session-only): `sudo bash -c 'echo performance > /sys/class/devfreq/fb000000.gpu/governor'`.
 - Cameras are only freed when the app is closed (one stream per camera at a time).
-- Recordings: `outputs/<session>/` + `recordings.db` (WAL). Commit & push to
-  GitHub (`origin`, branch `rk3588-native-recording`) when done — that's the
-  standing instruction.
+- Recordings: `outputs/<session>/` + `recordings.db` (WAL).
+- **Agent workflow (issues, branches, worktrees, rig tests): read
+  `AGENTS.md` first.** Development happens off the board; the board only
+  runs tests (`scripts/rig_test.sh`, queued on a lock). Work on a branch
+  per issue and open a PR against `main`; never push to `main` directly.
 - Field remote (iPhone): primary = the afl-camd daemon (port 80, web UI +
   WHEP/HLS preview via MediaMTX on :8889/:8888). **Productionised
   (2026-10-09): `scripts/install_field_services.sh` enables systemd units

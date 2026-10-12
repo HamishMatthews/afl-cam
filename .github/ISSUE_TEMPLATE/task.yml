@@ -1,0 +1,36 @@
+name: Task
+description: A unit of work an agent (or a person) can pick up
+labels: ["ready"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be true when this is done, in user terms.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Done when
+      description: Checks a reviewer can run. Name the rig test or measurement if it's hardware.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [native, daemon, web, ui, stitch, deploy, tests, docs]
+    validations:
+      required: true
+  - type: checkboxes
+    id: rig
+    attributes:
+      label: Hardware
+      options:
+        - label: Needs the rig to verify (add the needs-rig label)
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Files, logs, CLAUDE.md invariants that apply.
