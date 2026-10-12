@@ -13,6 +13,10 @@ daemon on a side port, queued on a lock, then restores the installed
 `afl-camd`. Never edit the checkout at `/home/hamish/Documents/afl-cam`
 on the board, never run tests there outside `rig_test.sh`, and never write
 to `calibration/` (the frozen alignment is shared by every test run).
+That checkout follows `main` on its own: every push to `main` runs
+`.github/workflows/deploy.yml` on the rig, which fast-forwards it and
+restarts `afl-camd` (`scripts/deploy_board.sh`; it refuses while
+recording).
 
 ## Picking up work
 

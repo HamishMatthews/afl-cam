@@ -35,6 +35,16 @@ never run code from strangers' PRs (the workflow also refuses fork PRs).
 
 Jobs run one at a time, so parallel PRs queue for the cameras.
 
+The same runner deploys: every push to `main` runs
+`.github/workflows/deploy.yml`, which fast-forwards
+`/home/hamish/Documents/afl-cam` to the new `main` and restarts
+`afl-camd` (`scripts/deploy_board.sh`, using the stop/start rule above).
+It refuses, changing nothing, while a recording, finalize or re-align is
+running, or when that checkout has local edits or is not on `main`; re-run
+it from **Actions → deploy → Run workflow** once fixed. Changes to the
+service files themselves still need `scripts/install_field_services.sh`
+(the job warns when they change).
+
 ## 3. ssh for local sessions
 
 `remote_rig_test.sh` uses `ssh hamish@orangepi5-max` (override with `AFL_CAM_PI`).

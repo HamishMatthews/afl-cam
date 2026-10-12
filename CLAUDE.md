@@ -27,6 +27,10 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   `AGENTS.md` first.** Development happens off the board; the board only
   runs tests (`scripts/rig_test.sh`, queued on a lock). Work on a branch
   per issue and open a PR against `main`; never push to `main` directly.
+  A merge to `main` goes live on its own: the `deploy` workflow
+  fast-forwards the board's checkout and restarts afl-camd
+  (`scripts/deploy_board.sh`; refuses while recording or with local edits,
+  re-run it from Actions once idle).
 - Field remote (iPhone): primary = the afl-camd daemon (port 80, web UI +
   WHEP/HLS preview via MediaMTX on :8889/:8888). **Productionised
   (2026-10-09): `scripts/install_field_services.sh` enables systemd units

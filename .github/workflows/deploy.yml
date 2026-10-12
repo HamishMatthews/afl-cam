@@ -1,0 +1,29 @@
+# Keeps the board's installed field daemon on main: every push to main
+# fast-forwards /home/hamish/Documents/afl-cam on the rig and restarts
+# afl-camd (scripts/deploy_board.sh). Refuses while recording; re-run it
+# from Actions → deploy → Run workflow once the rig is idle.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, afl-cam-rig]
+    # one at a time; a newer push replaces a queued deploy, a running one
+    # finishes
+    concurrency:
+      group: deploy-board
+      cancel-in-progress: false
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # the board fetches from this tree
+      - name: Deploy to the board
+        run: bash scripts/deploy_board.sh "$GITHUB_WORKSPACE"
