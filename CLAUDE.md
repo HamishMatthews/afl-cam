@@ -73,7 +73,13 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   `AFL_CAM_RESUME_MAX_GAP_S` (900) after the last heartbeat finalizes
   instead of resuming.
 - `afl_cam/web/index.html` — the phone page: status/REC/elapsed, WHEP
-  preview with HLS fallback, schedule, recordings browser (play/save/delete).
+  preview with HLS fallback, schedule, recordings browser (play/save/delete),
+  and a Setup tab: pre-game self-test (`afl_cam/selftest.py`), re-align with
+  streamed log + before/after stitch score (`RealignJob` in daemon.py runs
+  `recapture_alignment.py`; the daemon closes the pipeline first, state
+  `realigning`), framing guides (seam, overlap, horizon from the live maps,
+  `afl_cam/framing.py`), PWA manifest + icons. The rig test re-aligns into
+  `AFL_CAM_ALIGN_OUT` (scratch), never `calibration/`.
 - `deploy/mediamtx.yml` + `deploy/systemd/*` + `scripts/install_field_services.sh`
   — MediaMTX (:8554 RTSP in, :8889 WHEP, :8888 HLS) and afl-camd units.
 - `afl_cam/config.py` — camera discovery, `STITCH_PARAMS_DIR`

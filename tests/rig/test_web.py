@@ -18,6 +18,9 @@ def test_page_serves_with_expected_markers():
     assert "mkproxy" in html
     # button font consistency (anchors and buttons share .mini-btn styles)
     assert "font: inherit" in html
+    # Setup view + Add to Home Screen
+    assert 'id="tab-setup"' in html and "/api/realign" in html
+    assert 'rel="manifest"' in html and 'rel="apple-touch-icon"' in html
 
 
 def test_hls_js_bundled_and_served():
