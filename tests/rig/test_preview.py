@@ -6,6 +6,9 @@ import http.cookiejar
 import time
 import urllib.request
 
+from afl_cam import framing
+from afl_cam.config import STITCH_PARAMS_DIR
+
 from .conftest import stitch, wake_standby
 
 HLS = "http://127.0.0.1:8888"
@@ -56,12 +59,19 @@ def test_preview_encoder_healthy():
     assert pv.get("drops", 999) == 0, "preview packets dropped"
 
 
+def _preview_height():
+    """cam2stitch's preview box: 1600 wide at the canvas aspect, height
+    rounded down to even. The canvas height changes with every re-align."""
+    params = framing.read_params(STITCH_PARAMS_DIR)
+    return (1600 * int(params[1]) // int(params[0])) & ~1
+
+
 def test_hls_master_playlist_serves():
     st = wake_standby()
     jar = _new_jar()
     master = _hls("/preview/index.m3u8", jar)
     assert "STREAM-INF" in master, "no master playlist"
-    assert "RESOLUTION=1600x564" in master, "wrong preview resolution"
+    assert f"RESOLUTION=1600x{_preview_height()}" in master, "wrong preview resolution"
     assert "FRAME-RATE=30" in master, "wrong preview frame rate"
 
 

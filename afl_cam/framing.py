@@ -2,8 +2,8 @@
 horizon fall on the stitched canvas, read from the live map set.
 
 Stdlib only (the daemon imports it). Reads params.bin plus ONE row of
-each blend-weight file, never the full maps (`stitch_maps.py` has the
-format; this is its read-only, numpy-free cousin).
+each blend-weight and map file, never the full arrays (`stitch_maps.py` has
+the format; this is its read-only, numpy-free cousin).
 """
 
 import math
@@ -54,18 +54,39 @@ def _weight_row(path: Path, row: int, width: int) -> Optional[bytes]:
     return data[0::4]
 
 
-def seam_columns(params_dir: Path, width: int, row: int) -> Optional[dict]:
-    """Overlap band and seam (where cam1's weight overtakes cam0's) on one
-    canvas row, in canvas pixels."""
+def seam_column(params_dir: Path, width: int, row: int) -> Optional[int]:
+    """Canvas column where cam1 takes over from cam0 on one row: where its
+    weight reaches cam0's (the middle of a ramp, or the cut itself when the
+    blend is a hard cut, which refine_seam can leave)."""
     w0 = _weight_row(Path(params_dir) / "w0.bin", row, width)
     w1 = _weight_row(Path(params_dir) / "w1.bin", row, width)
     if w0 is None or w1 is None:
         return None
-    both = [x for x in range(width) if w0[x] and w1[x]]
-    if not both:
+    return next((x for x in range(width) if w1[x] and w1[x] >= w0[x]), None)
+
+
+def _valid_span(params_dir: Path, params: list, cam: int, row: int) -> Optional[tuple]:
+    """First and last canvas column where `cam` has a source pixel on `row`
+    (its map points inside the raw frame there). The blend weights can't
+    say: seam refinement writes 0/255 outside a narrow ramp."""
+    base = 8 + CAM_BLOCK * cam
+    off_x, off_y, map_w, map_h = (int(params[base + i]) for i in (11, 12, 13, 14))
+    local = row - off_y
+    if not 0 <= local < map_h or map_w <= 0:
         return None
-    seam = next((x for x in both if w1[x] >= w0[x]), both[-1])
-    return {"overlap": [both[0], both[-1]], "seam": seam}
+    try:
+        with open(Path(params_dir) / f"map{cam}.bin", "rb") as fh:
+            fh.seek(local * map_w * 8)
+            data = fh.read(map_w * 8)
+    except OSError:
+        return None
+    if len(data) != map_w * 8:
+        return None
+    xy = struct.unpack(f"<{2 * map_w}f", data)
+    src_w, src_h = params[2], params[3]
+    cols = [off_x + i for i, (x, y) in enumerate(zip(xy[0::2], xy[1::2]))
+            if 0 <= x <= src_w - 1 and 0 <= y <= src_h - 1]
+    return (cols[0], cols[-1]) if cols else None
 
 
 def framing(params_dir: Path) -> Optional[dict]:
@@ -79,14 +100,17 @@ def framing(params_dir: Path) -> Optional[dict]:
         return None
     hz = horizon_row(params)
     row = int(hz) if hz is not None and 0 <= hz < height else height // 2
-    cols = seam_columns(params_dir, width, row)
+    seam = seam_column(params_dir, width, row)
+    spans = [_valid_span(params_dir, params, cam, row) for cam in (0, 1)]
+    overlap = [max(s[0] for s in spans), min(s[1] for s in spans)] if all(spans) else None
+    if overlap and overlap[0] >= overlap[1]:
+        overlap = None
     out = {
         "canvas": [width, height],
         "horizon": round(hz / height, 4)
         if hz is not None and 0 <= hz < height else None,
-        "seam": round(cols["seam"] / width, 4) if cols else None,
-        "overlap": [round(c / width, 4) for c in cols["overlap"]]
-        if cols else None,
+        "seam": round(seam / width, 4) if seam is not None else None,
+        "overlap": [round(c / width, 4) for c in overlap] if overlap else None,
     }
     try:
         out["aligned_at"] = (Path(params_dir) / "params.bin").stat().st_mtime
