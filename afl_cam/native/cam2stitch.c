@@ -868,6 +868,8 @@ typedef struct {
     FILE *fp_out, *fp_pts;      /* recording proxy files, NULL when idle */
     void *hdr_data;             /* SPS/PPS (Annex-B), re-sent before IDRs */
     size_t hdr_len;
+    MppBufferGroup hdr_grp;     /* own group for header captures (avoids
+                                   stealing packet-group buffers mid-stream) */
     int udp_fd;
     struct sockaddr_in udp_addr;
     int udp_ok;
@@ -875,6 +877,38 @@ typedef struct {
     RK_U64 pv_hdr_sent;         /* SPS/PPS datagrams injected before IDRs */
     int ok;
 } pv_t;
+
+/* Capture the preview encoder's SPS/PPS once. rkvenc only returns a
+ * header via GET_HDR_SYNC AFTER a frame has been encoded, so an
+ * init-time capture can come back empty — callers retry at the first
+ * IDR. Main thread only (MPP control calls). */
+static void pv_capture_hdr(pv_t *pv)
+{
+    if (pv->hdr_data || !pv->hdr_grp || getenv("AFL_CAM_PV_NOHDR"))
+        return;
+    MppBuffer hdr_buf = NULL;
+    MppPacket hdr = NULL;
+    if (!mpp_buffer_get(pv->hdr_grp, &hdr_buf, 1024 * 1024)
+        && !mpp_packet_init_with_buffer(&hdr, hdr_buf)) {
+        mpp_packet_set_length(hdr, 0);
+        if (!pv->mpi->control(pv->ctx, MPP_ENC_GET_HDR_SYNC, hdr)) {
+            void *ptr = mpp_packet_get_pos(hdr);
+            size_t len = mpp_packet_get_length(hdr);
+            if (ptr && len) {
+                pv->hdr_data = malloc(len);
+                if (pv->hdr_data) {
+                    memcpy(pv->hdr_data, ptr, len);
+                    pv->hdr_len = len;
+                    fprintf(stderr, "preview: SPS/PPS captured (%zu bytes)%s\n",
+                            len, pv->pv_packets ? " on retry" : "");
+                }
+            }
+        }
+        mpp_packet_deinit(&hdr);
+    }
+    if (hdr_buf)
+        mpp_buffer_put(hdr_buf);
+}
 
 static int pv_init(pv_t *pv, int w, int h, int fps, int bitrate_kbps) {
     memset(pv, 0, sizeof *pv);
@@ -933,32 +967,18 @@ static int pv_init(pv_t *pv, int w, int h, int fps, int bitrate_kbps) {
         return -1;
     /* SPS/PPS header — rkvenc does NOT honour prep:header_mode EACH_IDR
      * (measured: IDRs carry SEI but no parameter sets), so capture the
-     * header once and re-send it before every IDR on the UDP path +
-     * write it into the proxy file on REC_START */
-    if (!getenv("AFL_CAM_PV_NOHDR")) {
-        MppBuffer hdr_buf = NULL;
-        MppPacket hdr = NULL;
-        if (!mpp_buffer_get(pv->pkt_grp, &hdr_buf, 1024 * 1024)
-            && !mpp_packet_init_with_buffer(&hdr, hdr_buf)) {
-            mpp_packet_set_length(hdr, 0);
-            if (!pv->mpi->control(pv->ctx, MPP_ENC_GET_HDR_SYNC, hdr)) {
-                void *ptr = mpp_packet_get_pos(hdr);
-                pv->hdr_len = mpp_packet_get_length(hdr);
-                if (ptr && pv->hdr_len) {
-                    pv->hdr_data = malloc(pv->hdr_len);
-                    if (pv->hdr_data)
-                        memcpy(pv->hdr_data, ptr, pv->hdr_len);
-                    else
-                        pv->hdr_len = 0;
-                }
-            }
-            mpp_packet_deinit(&hdr);
-        }
-        if (hdr_buf)
-            mpp_buffer_put(hdr_buf);
-    }
+     * header and re-send it before every IDR on the UDP path + write it
+     * into the proxy file on REC_START. Init-time capture is a coin flip
+     * (GET_HDR_SYNC is empty until the first frame is encoded — broken
+     * previews where IDRs went out with no parameter sets, 2026-10-12),
+     * so the send path retries at the first IDR. */
+    if (mpp_buffer_group_get_internal(&pv->hdr_grp, MPP_BUFFER_TYPE_DRM))
+        return -1;
+    if (mpp_buffer_group_limit_config(pv->hdr_grp, 1024 * 1024, 1))
+        return -1;
+    pv_capture_hdr(pv);
     if (!pv->hdr_data)
-        fprintf(stderr, "preview: WARNING — no SPS/PPS header captured\n");
+        fprintf(stderr, "preview: no SPS/PPS at init — retrying at first IDR\n");
     else if (getenv("AFL_CAM_PV_DEBUG"))
         fprintf(stderr, "preview: SPS/PPS header captured: %zu bytes\n",
                 pv->hdr_len);
@@ -1173,6 +1193,9 @@ static void pv_put_drain(pv_t *pv, int64_t pts) {
                      * rkvenc emits IDRs WITHOUT parameter sets — prepend
                      * the captured SPS/PPS so late joiners (ffmpeg starts
                      * seconds after cam2stitch) self-sync within a GOP */
+                    if (pkt_has_idr((const RK_U8 *)ptr, plen)
+                        && !pv->hdr_data)
+                        pv_capture_hdr(pv);  /* first IDR: header ready now */
                     if (pkt_has_idr((const RK_U8 *)ptr, plen)
                         && pv->hdr_data && pv->hdr_len) {
                         size_t off = 0;
