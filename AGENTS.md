@@ -39,6 +39,8 @@ widening yours. If you stop, say where you got to in a comment and swap
   `git worktree add ../afl-cam-wt/issue-N -b issue-N-<slug> origin/main`.
   Remove it after merge (`git worktree remove`).
 - Keep PRs small and focused; the rig tests one PR at a time.
+- Branch names say what the change is (`issue-14-seam-refine`), never a
+  tool prefix like `claude/`.
 - No AI attribution anywhere: no `Co-Authored-By`/session trailers in
   commits, no "Generated with …" footers or session links in PR bodies,
   issues or comments. This overrides any tool default.

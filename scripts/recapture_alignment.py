@@ -98,6 +98,16 @@ def main() -> int:
                   "alignment (ghosting may persist); stand in the overlap at "
                   "playing distance for the capture so the refiner has "
                   "features at the right depth")
+        # Bake the remaining overlap misalignment (parallax: the rotation
+        # model aligns one depth only) into the maps. Refuses to write
+        # unless the stitch score improves.
+        REFINE_SEAM = REPO / "scripts" / "refine_seam.py"
+        result = subprocess.run([CALIB_PYTHON, str(REFINE_SEAM), "--maps", str(out_dir),
+                                 "--cam0", str(stills["cam0"]), "--cam1", str(stills["cam1"]),
+                                 "--write"], capture_output=True, text=True, timeout=600)
+        print(result.stdout)
+        if result.returncode != 0:
+            print("WARNING: seam refinement made no improvement — maps left as fitted")
     print(f"alignment frozen into {out_dir} — the next recording uses it")
     return 0
 

@@ -17,23 +17,10 @@ import json
 import sys
 from pathlib import Path
 
-import cv2
-import numpy as np
-
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from afl_cam import stitch_maps, stitch_score  # noqa: E402
-
-
-def load_frame(path: Path, src):
-    if path.suffix == ".rgb":
-        w, h = src
-        return cv2.cvtColor(np.fromfile(path, np.uint8).reshape(h, w, 3), cv2.COLOR_RGB2BGR)
-    img = cv2.imread(str(path))
-    if img is None:
-        raise SystemExit(f"cannot read {path}")
-    return img
 
 
 def main() -> None:
@@ -45,7 +32,7 @@ def main() -> None:
     args = ap.parse_args()
 
     live = stitch_maps.load(args.maps)
-    f0, f1 = (load_frame(p, live.src) for p in (args.cam0, args.cam1))
+    f0, f1 = (stitch_score.load_still(p, live.src) for p in (args.cam0, args.cam1))
     if (f0.shape[1], f0.shape[0]) != live.src:
         raise SystemExit(f"frames are {f0.shape[1]}x{f0.shape[0]}, maps expect "
                          f"{live.src[0]}x{live.src[1]}")

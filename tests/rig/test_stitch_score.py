@@ -38,3 +38,23 @@ def test_rig_stitch_score(capsys):
     # deliverable. First measurement with the accurate ruler (2026-10-12):
     # median 18 px, p95 33 px on the re-align stills.
     assert s["misalign_median"] < 40.0
+
+
+def test_rig_seam_refine_improves_score(capsys):
+    """Seam refinement on the real stills, in memory (the live maps are not
+    touched): the refined maps must ghost less than the current ones."""
+    from afl_cam import seam_refine
+
+    live = stitch_maps.try_load(MAPS_DIR)
+    raws = [MAPS_DIR / f"cam{i}.rgb" for i in (0, 1)]
+    if live is None or not all(p.exists() for p in raws):
+        pytest.skip(f"no live map set + re-align stills in {MAPS_DIR}")
+    f0, f1 = (stitch_score.load_still(p, live.src) for p in raws)
+
+    refined, before, after = seam_refine.refine(f0, f1, live)
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "refined_score.json").write_text(json.dumps(after, indent=2) + "\n")
+    stitch_score.render_seam_crop(f0, f1, refined, OUT / "seam_refined.jpg")
+    with capsys.disabled():
+        print(f"\n[seam-refine] before {json.dumps(before)}\n[seam-refine] after  {json.dumps(after)}")
+    assert after["misalign_median"] < before["misalign_median"]

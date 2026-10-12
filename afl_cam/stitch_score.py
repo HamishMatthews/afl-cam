@@ -24,6 +24,19 @@ import numpy as np
 from . import stitch_maps
 
 
+def load_still(path: Path, src) -> np.ndarray:
+    """BGR still: an image file, or the raw RGB `camN.rgb` the re-align
+    saves in the map dir (src = its (w, h))."""
+    path = Path(path)
+    if path.suffix == ".rgb":
+        w, h = src
+        return cv2.cvtColor(np.fromfile(path, np.uint8).reshape(h, w, 3), cv2.COLOR_RGB2BGR)
+    img = cv2.imread(str(path))
+    if img is None:
+        raise OSError(f"cannot read {path}")
+    return img
+
+
 def warp_views(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps):
     """Each camera warped alone into the full canvas, plus its valid mask."""
     cw, ch = live.canvas
