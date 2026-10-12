@@ -4,7 +4,7 @@
 // PRE-COMPUTED MAP TEXTURES (map0/map1, R32G32F, one texel per camera-map
 // pixel — generated once per calibration by dump_camera_params.py) instead
 // of the analytic warp_cam math: the shader is pure texture sampling, so
-// full-canvas (5304x2084) stitching is bandwidth-bound instead of ALU-bound.
+// full-canvas (5304x1876) stitching is bandwidth-bound instead of ALU-bound.
 // The map texel at the canvas pixel holds the exact (s,t) source coords
 // cv2.remap consumes (invalid = -1), fetched with texelFetch — no
 // interpolation, the value equals the old analytic warp_cam to float

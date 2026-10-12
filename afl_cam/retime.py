@@ -60,7 +60,7 @@ def mux_with_pts_rate(raw: Path, pts_path: Path, out: Path,
     `.pts` sidecar remains the exact per-frame timing for the stitcher.
 
     ``codec="hevc"`` tags the stream hvc1 (not hev1): iPhone/QuickTime
-    refuse to play hev1-tagged HEVC (iphone-control-plan.md §4).
+    refuse to play hev1-tagged HEVC (docs/archive/iphone-control-plan.md §4).
 
     ``faststart=True`` moves the moov atom to the front — needed for
     HTTP streaming (Safari's Range/206 requirement).

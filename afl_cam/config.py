@@ -196,9 +196,8 @@ LIVE_STITCH = os.environ.get("AFL_CAM_LIVE_STITCH", "1") == "1"
 STITCH_RECORDER_SRC = ROOT_DIR / "afl_cam" / "native" / "cam2stitch.c"
 STITCH_RECORDER_BIN = ROOT_DIR / "afl_cam" / "native" / "cam2stitch"
 STITCH_SHADER = ROOT_DIR / "afl_cam" / "native" / "stitch_nv12.spv"
-# Native full-resolution canvas (5304x2084 for the current rig aim — the
-# combined per-camera resolution the user asked for; verified live at 30fps
-# pipeline capacity, d9c220b). Regenerate via:
+# Native full-resolution canvas: width is STITCH_CANVAS_WIDTH, height comes
+# from the frozen maps (currently 5304×1876). Regenerate via:
 #   scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> calibration/stitch_live_full
 STITCH_PARAMS_DIR = ROOT_DIR / "calibration" / "stitch_live_full"
 STITCH_CANVAS_WIDTH = 5304

@@ -14,7 +14,7 @@
  *   cam2stitch -src <params_dir> <cam0.nv12> <cam1.nv12> <out.nv12>
  *               [n_iters] [shader.spv]
  *
- * GPU loop (see live_stitch_plan.md): a PRE-RECORDED 3-slot command-buffer
+ * GPU loop (see docs/archive/live_stitch_plan.md): a PRE-RECORDED 3-slot command-buffer
  * ring — nothing is re-recorded after init, sidestepping the libmali quirk
  * where later vkBeginCommandBuffer recordings silently discard earlier
  * ones. Each slot cb is SELF-CONTAINED (weight uploads + initial barriers +
@@ -25,7 +25,7 @@
  * uint, repacked on the CPU), no shared memory, no barriers, no
  * floatBitsToUint. Fences must be created pre-signaled.
  *
- * DAEMON mode (afl-camd field supervisor, iphone-control-plan.md §2.1):
+ * DAEMON mode (afl-camd field supervisor, docs/archive/iphone-control-plan.md §2.1):
  * when AFL_CAM_CTL_SOCK is set the pipeline runs CONTINUOUSLY in standby —
  * cameras open, GPU stitching, preview encoding — and recording is a
  * toggle. A unix-socket control interface accepts, one command per line:
@@ -41,8 +41,8 @@
  * While not recording the master encoder put/drain is skipped (idle VPU;
  * puts resume on REC_START with a forced IDR).
  *
- * PREVIEW encode (iphone-control-plan.md §4): with AFL_CAM_PREVIEW_UDP set,
- * a second rkvenc session (H.264 Constrained Baseline, ~1600x572 CBR) encodes
+ * PREVIEW encode (docs/archive/iphone-control-plan.md §4): with AFL_CAM_PREVIEW_UDP set,
+ * a second rkvenc session (H.264 Constrained Baseline, ~1600x564 CBR) encodes
  * a box-downscale of the stitched canvas — done by the worker thread straight
  * from the packed SSBO. The main thread puts/drains the preview frames
  * (invariant) and fans the Annex-B packets out to (a) a UDP socket (default
@@ -705,8 +705,8 @@ static void gpu_stitch(gpu_t *g, const void *nv0, const void *nv1, void *tight_o
 
 /* ================== preview encode (daemon mode) ================== */
 
-/* Second rkvenc session on a ~1600x572 box-downscale of the stitched
- * canvas (iphone-control-plan.md §4): H.264 Constrained Baseline, CBR
+/* Second rkvenc session on a ~1600x564 box-downscale of the stitched
+ * canvas (docs/archive/iphone-control-plan.md §4): H.264 Constrained Baseline, CBR
  * ~3.5 Mbps, GOP 1s — decodes everywhere (Safari WHEP/HLS, Android).
  * The worker downscales the packed SSBO into a tight staging buffer
  * (drop-on-busy); the MAIN thread copies it into the encoder input and
@@ -2352,7 +2352,7 @@ int main(int argc, char **argv) {
     }
 
     /* ---- preview encoder (daemon mode, AFL_CAM_PREVIEW_UDP set) ----
-     * H.264 ~1600x572 (canvas aspect) CBR — the phone preview + proxy.
+     * H.264 ~1600x564 (canvas aspect) CBR — the phone preview + proxy.
      * Init BEFORE the worker starts: the worker downscales into its stage. */
     pv_t pv = {0};
     int pv_ok = 0;

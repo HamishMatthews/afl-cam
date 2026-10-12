@@ -254,5 +254,6 @@ alignment now uses measured K + `scripts/refine_rotation.py`'s R.
 **Camera discovery (2026-09-06).** A camera plugged into a USB 2.0 port
 enumerates on the EHCI companion (`fc800000.usb/usb5/5-1`) instead of
 `xhci-hcd.N.auto` — `config.py::_discover_cameras` now matches both and
-fills undocumented ports in sorted order (use the UI Swap button if sides
-come out swapped).
+fills undocumented ports in sorted order (no Swap button since
+2026-10-09; the rig sockets are labeled, so edit `_CAMERA_PORTS` if wiring
+changes).

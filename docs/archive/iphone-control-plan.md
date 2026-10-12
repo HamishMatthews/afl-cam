@@ -1,3 +1,5 @@
+> **Historical**: superseded design plan; the single source of truth is [CLAUDE.md](../../CLAUDE.md).
+
 afl-cam: iPhone control and connectivity design
 
 Goal: GoPro/Insta360-level usability from an iPhone. Join the camera, see a live preview, start and stop recording, check health, and browse and watch past recordings, without a laptop.
