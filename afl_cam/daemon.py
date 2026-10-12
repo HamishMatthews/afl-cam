@@ -88,6 +88,7 @@ from .config import (
     STITCH_SHADER, _discover_cameras, build_cam2h264, build_cam2stitch,
     rediscover_cameras, vk_env,
 )
+from . import resume
 from .db import RecordingDB
 from .sessions import new_session_dir, remove_session_dir, session_dir_is_safe
 
@@ -115,6 +116,10 @@ WHEP_PORT = 8889
 HLS_PORT = 8888
 RESOLUTION = {"width": 3840, "height": 2160, "fps": 30}   # stitch pipeline
 HEVC = ENCODE_CODEC != "h264"
+INTENT_PATH = LIVE_SNAP_DIR / "intent.json"   # afl_cam/resume.py
+# a reboot later than this after the last heartbeat finalizes the
+# recording instead of resuming it (the game is over; don't record the shed)
+RESUME_MAX_GAP_S = float(os.environ.get("AFL_CAM_RESUME_MAX_GAP_S", "900"))
 # Re-align target: the live map set. The rig test points it at a scratch
 # dir (calibration/ is shared by every test run and must not be written).
 ALIGN_OUT = Path(os.environ.get("AFL_CAM_ALIGN_OUT") or STITCH_PARAMS_DIR)
@@ -545,6 +550,15 @@ def _pts_median_fps(pts_path: Path, fallback: float) -> float:
     return 1e6 / dts[len(dts) // 2]
 
 
+def _segments_report(folder: Optional[Path]) -> Optional[dict]:
+    """{restarts, lost_s} for a recording that resumed after a crash."""
+    try:
+        rep = json.loads((folder / "segments.json").read_text())
+        return {"restarts": rep["restarts"], "lost_s": rep["lost_s"]}
+    except (TypeError, OSError, ValueError, KeyError):
+        return None
+
+
 def _run_ffmpeg(args: list[str], timeout: int = 300) -> tuple[bool, str]:
     try:
         result = subprocess.run(
@@ -611,21 +625,31 @@ class Finalizer(threading.Thread):
             return self._run_separate()
         s = self.session
         dir_ = s.dir
-        raw = dir_ / "stitch.raw.h264"
-        pts = dir_ / "stitch.pts"
-        proxy_raw = dir_ / "preview.raw.h264"
-        proxy_pts = dir_ / "preview.pts"
-        master_ok = raw.exists() and mux_master(raw, pts, dir_ / "stitch.mp4")
-        proxy_ok = proxy_raw.exists() and mux_proxy(
-            proxy_raw, proxy_pts, dir_ / "proxy.mp4")
+        # every run of cam2stitch in this session is a segment (one unless
+        # the recording resumed after a crash — afl_cam/resume.py)
+        master = resume.segments(dir_, "stitch.raw.h264")
+        proxy = resume.segments(dir_, "preview.raw.h264")
+        master_ok, master_all = resume.mux_segments(
+            master, dir_ / "stitch.mp4", mux_master,
+            ("-tag:v", "hvc1") if HEVC else ()) if master else (False, False)
+        proxy_ok, proxy_all = resume.mux_segments(
+            proxy, dir_ / "proxy.mp4", mux_proxy,
+            ("-movflags", "+faststart")) if proxy else (False, False)
         if proxy_ok:
             make_thumb(dir_ / "proxy.mp4", dir_ / "thumb.jpg")
+        if s.restarts:
+            resume.write_report(dir_, s.restarts, s.gaps)
+            log.warning("finalize: session %d resumed %d time(s), gaps %s s",
+                        s.session_id, s.restarts,
+                        [g["gap_s"] for g in s.gaps])
         # raw elementary streams are gone once muxed (the UI's remux
         # deletes them too); keep the small .pts sidecars for analysis
-        if master_ok:
-            raw.unlink(missing_ok=True)
-        if proxy_ok:
-            proxy_raw.unlink(missing_ok=True)
+        if master_all:
+            for raw, _ in master:
+                raw.unlink(missing_ok=True)
+        if proxy_all:
+            for raw, _ in proxy:
+                raw.unlink(missing_ok=True)
         size = (dir_ / "stitch.mp4").stat().st_size if master_ok else 0
         db = RecordingDB(DB_PATH)
         try:
@@ -783,8 +807,35 @@ class Session:
         self.kind = kind                      # live | separate
         self.recorder = recorder              # separate mode only
         self.recording_ids = recording_ids or {}
-        self.start = time.time()
-        self.duration = 0.0
+        self.start = time.time()       # this segment's start
+        self.duration = 0.0            # final, set at stop
+        self.elapsed_before = 0.0      # earlier segments (crash resume)
+        self.restarts = 0
+        self.gaps: list = []           # [{"at_s", "gap_s"}] per resume
+        self.lost_at = 0.0             # when the live segment died
+
+    def elapsed(self, seg_elapsed: Optional[float] = None) -> float:
+        """Recorded time over all segments (seg_elapsed: cam2stitch's own
+        count for the live one, else wall clock)."""
+        if seg_elapsed is None:
+            seg_elapsed = time.time() - self.start
+        return self.elapsed_before + seg_elapsed
+
+    def intent(self) -> dict:
+        return {"dir": str(self.dir), "session_id": self.session_id,
+                "recording_id": self.recording_id,
+                "elapsed_before": self.elapsed_before,
+                "seg_start": self.start, "restarts": self.restarts,
+                "gaps": self.gaps, "alive_at": time.time()}
+
+    @classmethod
+    def from_intent(cls, intent: dict) -> "Session":
+        s = cls(Path(intent["dir"]), int(intent["session_id"]),
+                int(intent["recording_id"]), [])
+        s.elapsed_before = float(intent.get("elapsed_before") or 0.0)
+        s.restarts = int(intent.get("restarts") or 0)
+        s.gaps = list(intent.get("gaps") or [])
+        return s
 
     def stop_audio(self):
         for proc in self.audio:
@@ -1399,6 +1450,8 @@ class CamDaemon:
         self._clock_synced = False
         self._pending_start = False
         self._pending_stop = False
+        self._resume = False          # a crashed recording waits to resume
+        self._intent_saved_at = 0.0
         self._pending_realign = False
         self.realign: Optional[RealignJob] = None
         self.mode = "live"            # live | separate (resets on restart)
@@ -1430,6 +1483,7 @@ class CamDaemon:
     # -- lifecycle -------------------------------------------------------
 
     def run(self):
+        self._recover_intent()
         self.supervisor.start()
         self.preview_chain.start()
         tick = threading.Thread(target=self._tick_loop, daemon=True,
@@ -1514,7 +1568,7 @@ class CamDaemon:
             return False           # separate-mode recorders own them
         if self.state != "idle":
             return True
-        if self._pending_start or self._ws:
+        if self._pending_start or self._resume or self._ws:
             return True
         return time.time() - self._last_http < 2
 
@@ -1671,7 +1725,7 @@ class CamDaemon:
 
     def intent_stop(self) -> tuple[bool, str]:
         with self._intents_lock:
-            if self.state != "recording":
+            if self.state != "recording" and not self._resume:
                 return False, "not recording"
             self._pending_stop = True
         deadline = time.time() + 8
@@ -1694,9 +1748,10 @@ class CamDaemon:
 
             # idle → starting (phone arrived or button press)
             if self.state in ("idle", "error") and \
-                    (self._pending_start or
+                    (self._pending_start or self._resume or
                      now - self._last_http < 2 or self._ws):
-                self._set_state("starting", error=None)
+                self._set_state("starting", error=(
+                    "recording interrupted — resuming" if self._resume else None))
 
             if self.state == "starting":
                 # adopted pipelines have proc=None — the socket connection
@@ -1707,6 +1762,7 @@ class CamDaemon:
                     if st.get("state") == "recording":
                         # pipeline was already recording (daemon restarted
                         # while cam2stitch kept running)
+                        self._resume = False
                         self._set_state("recording")
                         self._attach_recording(st)
                     else:
@@ -1737,7 +1793,8 @@ class CamDaemon:
                           now - self.supervisor.status_ts)
                 self.supervisor.kill_pipeline()
                 if self.session is not None:
-                    # finalize what was written (per-packet flushes)
+                    # resume into the next segment (per-packet flushes keep
+                    # what was written)
                     self.on_stitch_exit()
 
             # separate mode: the recorders take the cameras from the
@@ -1754,6 +1811,15 @@ class CamDaemon:
                     self.error = f"{dead} recorder stopped unexpectedly"
                     self._execute_stop()
 
+            # a stop while a crashed recording waits to resume: finalize
+            # the segments already on disk
+            if self._pending_stop and self._resume:
+                self._abandon_resume()
+
+            # crashed recording: back into the same session once the
+            # pipeline is up again
+            if self._resume and self.state == "standby":
+                self._execute_resume()
             # re-align: close the pipeline, hand the cameras to the chain
             if self._pending_realign and self.session is None \
                     and self.state in ("idle", "starting", "standby", "error"):
@@ -1770,6 +1836,12 @@ class CamDaemon:
             if self._pending_stop and self.state == "recording":
                 self._execute_stop()
 
+            # heartbeat the record intent (a reboot long after the last
+            # one finalizes instead of resuming)
+            if self.state == "recording" and self.session is not None \
+                    and now - self._intent_saved_at > 5:
+                self._save_intent()
+
             # schedule
             if self.schedule and self.state == "standby":
                 sched = self.schedule
@@ -1784,7 +1856,7 @@ class CamDaemon:
                         self.schedule = None
             elif self.schedule and self.state == "recording" \
                     and self.session is not None:
-                if self.session.duration >= self.schedule["stop_after"]:
+                if self.session.elapsed() >= self.schedule["stop_after"]:
                     log.info("schedule: stopping after %.0fs",
                              self.schedule["stop_after"])
                     self.schedule = None
@@ -1907,8 +1979,115 @@ class CamDaemon:
             self._set_state("error", error=f"record start refused: {reply}")
             return
         self.session = Session(dir_, session_id, row_id, audio)
+        self._save_intent()
         self._set_state("recording")
         log.info("recording: session %d -> %s", session_id, dir_.name)
+
+    # -- crash resume (afl_cam/resume.py) ---------------------------------
+
+    def _save_intent(self):
+        # only the live stitch can resume; a separate-mode session that
+        # dies is finalized from what its recorders wrote
+        if self.session is None or self.session.kind != "live":
+            return
+        try:
+            resume.save_intent(INTENT_PATH, self.session.intent())
+            self._intent_saved_at = time.time()
+        except OSError as e:
+            log.error("record intent not saved: %s", e)
+
+    def _recover_intent(self):
+        """Boot / daemon start: a record intent left behind means the last
+        recording never stopped. Resume it (fresh enough) or finalize it."""
+        intent = resume.load_intent(INTENT_PATH)
+        if intent is None:
+            return
+        try:
+            session = Session.from_intent(intent)
+        except (KeyError, TypeError, ValueError) as e:
+            log.error("record intent unreadable (%s) — cleared", e)
+            resume.clear_intent(INTENT_PATH)
+            return
+        if not session_dir_is_safe(session.dir) or not session.dir.is_dir():
+            log.error("record intent points at %s — cleared", session.dir)
+            resume.clear_intent(INTENT_PATH)
+            return
+        alive_at = float(intent.get("alive_at") or 0.0)
+        seg_start = float(intent.get("seg_start") or alive_at)
+        session.elapsed_before += max(0.0, alive_at - seg_start)
+        session.lost_at = alive_at
+        if time.time() - alive_at > RESUME_MAX_GAP_S:
+            log.warning("record intent for %s is %.0f s old — finalizing "
+                        "instead of resuming", session.dir.name,
+                        time.time() - alive_at)
+            resume.clear_intent(INTENT_PATH)
+            session.duration = session.elapsed_before
+            Finalizer(self, session).start()
+            return
+        log.warning("recording %s never stopped — resuming it",
+                    session.dir.name)
+        self.session = session
+        self._resume = True
+        self.error = "recording interrupted — resuming"
+
+    def _segment_lost(self):
+        """The live segment died (pipeline crash / watchdog kill): keep the
+        session and resume into the next segment once the pipeline is back."""
+        s = self.session
+        s.elapsed_before = s.elapsed()
+        s.lost_at = s.start = time.time()   # elapsed_before holds it all now
+        s.stop_audio()
+        s.audio = []
+        self._resume = True
+        self._save_intent()
+        log.error("stitch pipeline died mid-recording — resuming into the "
+                  "next segment of session %d", s.session_id)
+        self._set_state("starting",
+                        error="pipeline restarted — resuming the recording")
+
+    def _execute_resume(self):
+        s = self.session
+        if s is None:
+            self._resume = False
+            return
+        seg = resume.seal_segment(s.dir)
+        audio = self._start_audio(s.dir)
+        try:
+            reply = self.supervisor.command(f"REC_START {s.dir}")
+        except RuntimeError as e:
+            reply = f"ERR {e}"
+        if not reply.startswith("OK"):
+            for proc in audio:
+                proc.terminate()
+            log.error("resume REC_START refused: %s", reply)
+            self._set_state("error", error=f"resume refused: {reply} — retrying")
+            return
+        now = time.time()
+        s.restarts += 1
+        gap = round(now - s.lost_at, 1) if s.lost_at else None
+        s.gaps.append({"at_s": round(s.elapsed_before, 1), "gap_s": gap})
+        s.start = now
+        s.audio = audio
+        self._resume = False
+        self._pending_start = False     # a RECORD press while resuming
+        self._save_intent()
+        self.error = None
+        self._set_state("recording")
+        log.warning("recording resumed: session %d, restart %d, gap %s s "
+                    "(sealed segment %s)", s.session_id, s.restarts, gap, seg)
+
+    def _abandon_resume(self):
+        """Stop pressed while waiting to resume: finalize what's on disk."""
+        self._pending_stop = False
+        self._resume = False
+        resume.clear_intent(INTENT_PATH)
+        session = self.session
+        self.session = None
+        if session is None:
+            return
+        session.duration = session.elapsed_before
+        self._set_state("finalizing", error=None)
+        Finalizer(self, session).start()
 
     def _execute_start_separate(self):
         """Separate mode: close the pipeline, then one cam2h264 per camera
@@ -1999,7 +2178,14 @@ class CamDaemon:
             log.error("re-attach bookkeeping failed: %s", e)
             self._set_state("error", error=str(e))
             return
+        prev = self.session
         self.session = Session(dir_, session_id, row_id, [])
+        if prev is not None and prev.dir == dir_:
+            # the record intent's counters (resumed before this attach)
+            self.session.elapsed_before = prev.elapsed_before
+            self.session.restarts = prev.restarts
+            self.session.gaps = prev.gaps
+        self._save_intent()
         log.info("re-attached to session %d (%s)", session_id, dir_.name)
 
     def _execute_stop(self):
@@ -2015,11 +2201,10 @@ class CamDaemon:
             self._set_state("finalizing")
             Finalizer(self, s).start()
             return
+        resume.clear_intent(INTENT_PATH)   # an explicit stop ends it
         st = self.supervisor.get_status()
-        if st and st.get("rec_elapsed_s"):
-            s.duration = float(st["rec_elapsed_s"])
-        else:
-            s.duration = time.time() - s.start
+        s.duration = s.elapsed(float(st["rec_elapsed_s"])
+                               if st and st.get("rec_elapsed_s") else None)
         try:
             self.supervisor.command("REC_STOP")
         except RuntimeError as e:
@@ -2052,25 +2237,22 @@ class CamDaemon:
             if self.state == "finalizing":
                 self._set_state("idle")    # the next wake reopens the pipeline
         elif self.state == "finalizing":
-            self._set_state("standby")
+            # a resume abandoned before the pipeline came back: bring it up
+            self._set_state("standby" if self.stitch_running() else "starting")
 
     def on_stitch_exit(self):
         """cam2stitch died — either our idle-stop (expected) or a crash.
-        On a crash mid-recording, finalize what was written (the files are
-        flushed per packet, so what's on disk muxes into a valid shorter
-        recording)."""
+        On a crash mid-recording the record intent survives: the session
+        resumes into its next segment once the pipeline is back (the files
+        are flushed per packet, so what's on disk is a valid segment)."""
         if self._idle_sigterm:
             self._idle_sigterm = False
             return                      # deliberate shutdown — stay idle
-        if self.state in ("recording",) and self.session is not None:
-            log.error("stitch pipeline died mid-recording — finalizing "
-                      "what was written")
-            session = self.session
-            session.duration = time.time() - session.start
-            session.stop_audio()
-            self.session = None
-            self._set_state("finalizing", error=None)
-            Finalizer(self, session).start()
+        if self.state == "recording" and self.session is not None \
+                and self.session.kind == "live":
+            self._segment_lost()
+        elif self._resume:
+            return                      # already waiting to resume
         elif self.state != "idle":
             self._set_state("error",
                             error="stitch pipeline crashed — retrying")
@@ -2227,6 +2409,7 @@ class CamDaemon:
                     "thumb": f"/api/recordings/{s['id']}/thumb.jpg"
                     if proxy and (folder / "thumb.jpg").is_file() else None,
                     "stitch_status": s.get("stitch_status"),
+                    "resumed": _segments_report(folder),
                     "error": bool(s.get("has_error")),
                     "recording": self.session is not None
                     and self.session.session_id == s["id"],
@@ -2321,10 +2504,11 @@ class CamDaemon:
         recording = self.state == "recording"
         elapsed = 0.0
         if recording and self.session:
-            if st and st.get("rec_elapsed_s"):
-                elapsed = float(st["rec_elapsed_s"])
-            else:
-                elapsed = time.time() - self.session.start
+            elapsed = self.session.elapsed(
+                float(st["rec_elapsed_s"])
+                if st and st.get("rec_elapsed_s") else None)
+        elif self._resume and self.session:
+            elapsed = self.session.elapsed_before
         return {
             "ok": True,
             "state": self.state,
@@ -2348,6 +2532,13 @@ class CamDaemon:
                 "cam0": bool(self.session and len(self.session.audio) > 0),
                 "cam1": bool(self.session and len(self.session.audio) > 1),
             } if recording else {"cam0": False, "cam1": False},
+            # crash resume: a live recording comes back on its own after
+            # a pipeline/daemon restart or a reboot (afl_cam/resume.py)
+            "resume": {
+                "armed": bool(self.session) and (recording or self._resume),
+                "pending": self._resume,
+                "restarts": self.session.restarts if self.session else 0,
+            },
             "schedule": self.schedule,
             "realign": self.realign_status(),
             "mode": self.mode,

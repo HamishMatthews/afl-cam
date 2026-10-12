@@ -53,6 +53,7 @@ def separate(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "ROOT_DIR", tmp_path)
     monkeypatch.setattr(d, "OUTPUTS_DIR", outputs)
     monkeypatch.setattr(d, "DB_PATH", tmp_path / "rec.db")
+    monkeypatch.setattr(d, "INTENT_PATH", tmp_path / "_live" / "intent.json")
     monkeypatch.setattr(sessions, "OUTPUTS_DIR", outputs)
     daemon = d.CamDaemon()
     daemon._last_http = 0.0
@@ -87,6 +88,8 @@ def test_separate_record_cycle(separate):
     assert separate.pipeline_wanted() is False       # recorders own the cameras
     assert separate.live_snapshot("cam1").name == "cam1_preview.jpg"
     assert separate.snapshot()["session_kind"] == "separate"
+    separate._save_intent()                  # crash resume is live-only
+    assert not d.INTENT_PATH.exists()
 
     separate._execute_stop()
     wait_state(separate, "idle")
