@@ -37,44 +37,49 @@ Codec is HEVC by default (`AFL_CAM_CODEC=h264` to revert). Capture is V4L2 UVC
 ## Install / run
 
 **Requirements:** Python ≥ 3.12, [uv](https://docs.astral.sh/uv/), ffmpeg,
-GTK3 + PyGObject, `v4l2-utils`. Board-level setup (MPP, librga, libmali,
+`v4l2-utils`. Board-level setup (MPP, librga, libmali,
 RKNN, IRQ pinning, NVMe fixes) is documented step-by-step in
 [`orange_pi_5_max_setup.md`](orange_pi_5_max_setup.md).
 
 ```bash
-uv sync                       # project venv (py3.14, GTK app + engine)
-uv run afl-cam ui             # the GTK app
-uv run afl-cam daemon         # the field daemon (iPhone web UI + API, port 80)
+uv sync                                   # project venv
+bash scripts/install_field_services.sh    # afl-camd + MediaMTX as services
 ```
+
+Then open `http://aflcam.local/` (or the board's address) on a phone or any
+browser.
 
 Two Python environments exist on the board:
 
 | venv | uses |
 |---|---|
-| project `.venv` (py3.14, has `gi`) | the UI, engine, config, retime caller |
+| project `.venv` | the daemon (afl-camd), CLI, re-stitch, retime |
 | `/home/hamish/venvs/cv2-new` (OpenCV 5 + PyAV 13) | stitcher, alignment scripts, retime worker |
 
 The GPU recorder needs the libmali Vulkan ICD (spawned processes don't
-inherit shell env; `engine.py` sets it from config):
+inherit shell env — `config.vk_env()` sets it):
 `VK_DRIVER_FILES=/opt/libmali-g610/usr/share/vulkan/icd.d/mali.json`,
 `LD_LIBRARY_PATH=/opt/libmali-g610/usr/lib/aarch64-linux-gnu{:/mali}`.
 
 ## Usage
 
-The UI has everything: previews, **Mode** dropdown (Live / Separate),
-resolution, duration, record, stitch, play, delete, and **Re-align Cameras**.
+The phone page (served by afl-camd) is the only interface. **Record**:
+record/stop, live stitched preview, Live stitch / Separate mode, schedule,
+recordings (play, save, delete, stitch a separate-mode session). **Setup**:
+pre-game check, framing guides, **Re-align** with a before/after stitch
+score. Add it to the Home Screen to use it like an app.
 
 ```bash
-uv run afl-cam ui               # the app
 afl-cam list                    # sessions with stitch status
 afl-cam stitch --session 12     # stitch a separate-mode session
 afl-cam stitch --all            # stitch every unstitched session
 ```
 
 Recordings land in `outputs/<YYYYMMDD_HHMMSS>/` with rows in `recordings.db`
-(SQLite, WAL). The **Re-align Cameras** button runs the full re-alignment
-chain (stills → bundle → canvas-space R refinement → freeze); stand in the
-overlap at playing distance during the capture.
+(SQLite, WAL). **Setup → Re-align** runs the full re-alignment chain
+(stills → bundle → canvas-space R refinement → freeze) and shows the
+before/after stitch score; stand in the overlap at playing distance during
+the capture.
 
 ## For maintainers
 

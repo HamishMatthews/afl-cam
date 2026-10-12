@@ -3,23 +3,25 @@
 Dual-4K30 recording + live GPU panoramic stitching for AFL football on an
 **Orange Pi 5 Max (RK3588), Armbian, kernel 6.1.115-vendor-rk35xx**. Two USB
 UVC MJPEG cameras in a static rig. The deliverable C code lives in
-`afl_cam/native/`; the GTK3 UI in `afl_cam/ui.py`.
+`afl_cam/native/`. The only interface is the phone web app served by
+afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
+2026-10-12 (issue #18) and its tools live in the page's Setup tab.
 
 ## Running things
 
-- UI: `uv run afl-cam ui` (project `.venv`, py3.14, has `gi`).
 - Field daemon: `uv run afl-cam daemon` — afl-camd (docs/archive/iphone-control-plan.md):
   supervises a long-running cam2stitch, serves the web UI + REST + WS API
   (port 80, falls back to 8080; `AFL_CAM_PORT` overrides), session
   finalize, clock sync, auto-stop, schedule, GPIO. Installed as a systemd
   service by `scripts/install_field_services.sh` (also installs MediaMTX).
-  The daemon and the GTK UI are mutually exclusive (both want the cameras).
+  Open http://<board>/ in any browser for the UI.
 - Stitcher + alignment scripts: **`/home/hamish/venvs/cv2-new/bin/python3`**
   (OpenCV 5 + PyAV 13; the project venv has no wheels for the bundle API).
 - sudo on this board: `echo 123 | sudo -S -p '' <cmd>`.
 - Vulkan apps (cam2stitch): `LD_LIBRARY_PATH=/opt/libmali-g610/usr/lib/aarch64-linux-gnu:/opt/libmali-g610/usr/lib/aarch64-linux-gnu/mali VK_DRIVER_FILES=/opt/libmali-g610/usr/share/vulkan/icd.d/mali.json`.
 - GPU governor (session-only): `sudo bash -c 'echo performance > /sys/class/devfreq/fb000000.gpu/governor'`.
-- Cameras are only freed when the app is closed (one stream per camera at a time).
+- One stream per camera at a time: the daemon closes cam2stitch before a
+  re-align or a separate-mode recording takes the cameras.
 - Recordings: `outputs/<session>/` + `recordings.db` (WAL).
 - **Agent workflow (issues, branches, worktrees, rig tests): read
   `AGENTS.md` first.** Development happens off the board; the board only
@@ -35,9 +37,7 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   `afl-cam`/`aflcam2026` → http://aflcam.local/.**
   `scripts/field_wifi.sh ap|ap-boot|follow|recover|stop` switches modes
   manually (`recover` = bcmdhd firmware-wedge recovery, no reboot needed).
-  The GTK UI's remote page (`afl_cam/remote.py`, port 8080) is the fallback
-  when the UI runs — stop the daemon first (`systemctl stop afl-camd`; daemon
-  and UI can't share the cameras). iPhone desk test checklist:
+  iPhone desk test checklist:
   `field_desk_test.md` (NOT yet run with a real iPhone).
 
 ## Key files
@@ -80,12 +80,16 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   `realigning`), framing guides (seam, overlap, horizon from the live maps,
   `afl_cam/framing.py`), PWA manifest + icons. The rig test re-aligns into
   `AFL_CAM_ALIGN_OUT` (scratch), never `calibration/`.
+  Record tab has a Live stitch / Separate switch: separate mode closes
+  cam2stitch and runs one cam2h264 per camera (`SeparateRecorder`),
+  proxy.mp4 = hard link to cam0.mp4; "Stitch" on a separate session runs
+  `python -m afl_cam.restitch <id>` (niced subprocess, stitch_video.mp4).
 - `deploy/mediamtx.yml` + `deploy/systemd/*` + `scripts/install_field_services.sh`
   — MediaMTX (:8554 RTSP in, :8889 WHEP, :8888 HLS) and afl-camd units.
 - `afl_cam/config.py` — camera discovery, `STITCH_PARAMS_DIR`
   (`calibration/stitch_live_full`), `STITCH_CANVAS_WIDTH=5304`, Vulkan env,
   `build_cam2stitch()`/`vk_env()` helpers (stdlib, shared with the daemon).
-- `afl_cam/engine.py` — spawns recorders, `can_live_stitch()` gate.
+- `afl_cam/engine.py` — per-camera recorder for `afl-cam record` (CLI).
 - `afl_cam/stitch_maps.py` — THE map-set format (params.bin, map0/1.bin,
   w0/1.bin): one writer (`dump_camera_params.py`), read by cam2stitch and
   the offline stitcher.
@@ -93,10 +97,9 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   map set itself** (same geometry + weights as cam2stitch, distortion
   zeroed), so a re-stitch of per-camera files reproduces the live stitch
   (`AFL_CAM_REBUNDLE=1` or a missing/torn set → per-session bundling).
-- `afl_cam/ui.py` — GTK3 app; Re-align button streams output to the terminal.
 - `afl_cam/retime.py` — VFR→CFR remux from `.pts` sidecars; HEVC muxes are
   tagged `hvc1` (iPhone/QuickTime refuse `hev1`).
-- `scripts/recapture_alignment.py` — re-align chain (UI button backend):
+- `scripts/recapture_alignment.py` — re-align chain (phone Setup → Re-align):
   stills → `dump_camera_params.py` (bundle) → `refine_rotation.py` →
   `dump_camera_params.py --r1` (final, atomic writes).
 - `afl_cam/seam_refine.py` + `scripts/refine_seam.py` — fits the measured
@@ -229,11 +232,6 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   HLS playlist, idempotent start/stop, DELETE, crash-retry + socket
   adoption. **NOT verified: Safari on the board AP — see
   `field_desk_test.md` and run it before game day.**
-- The GTK UI path is unchanged and still works (legacy-mode regression
-  run: 199/197 frames encoded, clean mux). UI + daemon are mutually
-  exclusive — `systemctl stop afl-camd` to run the UI with cameras; a
-  daemon wake attempt while the UI owns the cameras fails cleanly
-  (error banner + retry), it does not steal them.
 - Master encode capacity note: at 80 Mbps HEVC the full canvas sustains
   roughly the sensor rate in dim scenes (~13–20 fps); at brighter light
   (~24–34 fps input) the encoder drops frames when input exceeds its
@@ -246,11 +244,13 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   18 px / p95 33 px and a 1.24× exposure ratio on the re-align stills
   (2026-10-12) — the rig CI's stitch-score line has the current number (was 13–70 px before the canvas-space refinement). Near-field grass
   (~19 px bottom band) is genuine parallax — physics, not a bug.
-- Re-align button works end-to-end and streams logs; dump writes are atomic.
+- Re-align from the phone works end-to-end on the rig (rig CI, 2026-10-12)
+  and streams logs; dump writes are atomic.
 - Live preview while recording: the recorders write the raw 4K UVC JPEG
   payload to `<session>/camN_preview.jpg` every `AFL_CAM_PREVIEW_SECS`
-  (atomic tmp+rename; config default 1 s) for the GTK UI. The phone uses the
-  stitched H.264 preview (cam2stitch daemon mode → MediaMTX) instead. (The
+  (atomic tmp+rename; config default 1 s); the phone shows cam2h264's while
+  recording in separate mode. Live mode uses the stitched H.264 preview
+  (cam2stitch daemon mode → MediaMTX). (The
   old MPP-jpegenc downscale was never wired up and is removed.)
 - Encode defaults (2026-09-07): **HEVC** 60 Mbps per camera, 80 Mbps for the
   stitched canvas (`AFL_CAM_CODEC=h264` to revert; measured via `cam2h264
@@ -258,14 +258,10 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   single rkvenc core, HEVC is faster than H.264 at the canvas size). CBR
   scales with actual fps, so dim-light ~20 fps recordings undershoot the
   target proportionally.
-- Field remote (2026-09-07): `afl_cam/remote.py` + `afl_cam/remote/index.html`
-  — iPhone control (toggle/mode/res/duration/realign/swap) + 5 fps preview
-  polling; actions cross to the GTK thread via a queue. Untested end-to-end
-  with the real UI (standalone server tests pass).
 - Pending: the `field_desk_test.md` iPhone run; outdoor bright-daylight
   30 fps verification; NVMe heatsink; gnome-shell burns ~385% CPU
-  (software-rendered desktop — consider a lighter session); the UI's
-  `recordings not saving` report from 2026-09-06 may need reproducing.
+  (software-rendered desktop — consider a lighter session, or none: the
+  board needs no desktop now).
 
 ## More context
 

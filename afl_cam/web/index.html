@@ -57,6 +57,16 @@
   #recBtn.stop { background: #b62324; }
   #recBtn:disabled { opacity: .5; }
   #hint { margin-top: 10px; color: var(--dim); font-size: 13px; }
+  #mode { display: inline-flex; margin-top: 12px; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  #mode button { font: inherit; font-size: 13px; padding: 6px 14px; border: none;
+    background: var(--panel2); color: var(--dim); }
+  #mode button.on { background: var(--blue); color: #000; font-weight: 600; }
+  #mode button:disabled { opacity: .6; }
+  #mode-note { color: var(--dim); font-size: 12px; margin-top: 6px; }
+
+  /* separate-mode recording: 4K snapshots instead of the stitched stream */
+  #snaps { position: absolute; inset: 0; display: none; background: #000; }
+  #snaps img { width: 50%; height: 100%; object-fit: cover; float: left; }
 
   /* ---- stats ---- */
   #stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
@@ -171,6 +181,11 @@
     <div id="elapsed">0:00:00</div>
     <button id="recBtn" disabled>…</button>
     <div id="hint"></div>
+    <div id="mode">
+      <button id="mode-live" class="on">Live stitch</button>
+      <button id="mode-separate">Separate</button>
+    </div>
+    <div id="mode-note"></div>
   </section>
 
   <section id="stats" class="tab-record">
@@ -183,6 +198,7 @@
 
   <section id="preview">
     <video id="vid" playsinline muted autoplay></video>
+    <div id="snaps"><img id="snap0" alt=""><img id="snap1" alt=""></div>
     <div id="guides">
       <div id="g-overlap"></div>
       <div id="g-horizon"></div>
@@ -304,6 +320,8 @@ function applyStatus(s) {
       st.skew_avg_us >= 0 ? Math.round(st.skew_avg_us / 1000) + "ms" : "–";
   }
   applyRealign(s.realign);
+  applyMode(s);
+  applyRestitch(s.restitch);
   const lr = s.last_recording;
   $("st-last").querySelector(".v").textContent = lr ? (lr.ok ? "✓" : "✗") : "–";
 
@@ -533,6 +551,67 @@ $("ra-run").addEventListener("click", async () => {
   } catch (e) { $("ra-state").textContent = "network error"; $("ra-run").disabled = false; }
 });
 
+/* ---------- recording mode (live stitch | separate) ---------- */
+let snapTimer = null;
+function applyMode(s) {
+  const mode = s.mode || "live";
+  $("mode-live").classList.toggle("on", mode === "live");
+  $("mode-separate").classList.toggle("on", mode === "separate");
+  const locked = !!(s.recording || s.state === "finalizing" || s.state === "realigning");
+  $("mode-live").disabled = $("mode-separate").disabled = locked;
+  $("mode-note").textContent = mode === "separate"
+    ? "each camera records its own 4K file; stitch it afterwards from Recordings"
+    : "";
+  const separateLive = s.recording && s.session_kind === "separate";
+  $("snaps").style.display = separateLive ? "block" : "none";
+  if (separateLive && !snapTimer) {
+    const tick = () => {
+      const t = Date.now();
+      $("snap0").src = "/api/live/cam0.jpg?t=" + t;
+      $("snap1").src = "/api/live/cam1.jpg?t=" + t;
+    };
+    tick();
+    snapTimer = setInterval(tick, 2000);
+  } else if (!separateLive && snapTimer) {
+    clearInterval(snapTimer); snapTimer = null;
+  }
+}
+async function setMode(mode) {
+  const r = await fetch("/api/mode", {method: "POST",
+    headers: {"Content-Type": "application/json", ...AUTH}, body: JSON.stringify({mode})});
+  const j = await r.json();
+  if (!j.ok) $("hint").textContent = j.error || "could not change mode";
+  else if (S) { S.mode = mode; applyMode(S); }
+}
+$("mode-live").addEventListener("click", () => setMode("live"));
+$("mode-separate").addEventListener("click", () => setMode("separate"));
+
+/* ---------- re-stitch (separate-mode sessions) ---------- */
+let RS = null, rsWasRunning = false;
+function applyRestitch(rs) {
+  RS = rs;
+  const running = !!(rs && rs.running);
+  document.querySelectorAll("[data-stitch]").forEach(btn => {
+    const id = Number(btn.dataset.stitch);
+    btn.disabled = running || !!(S && S.recording);
+    btn.textContent = running && rs.session_id === id ? "Stitching…" : "Stitch";
+  });
+  document.querySelectorAll("[data-stitch-progress]").forEach(el => {
+    const id = Number(el.dataset.stitchProgress);
+    el.textContent = rs && rs.session_id === id
+      ? (running ? rs.progress : rs.ok ? "" : "stitch failed: " + rs.progress) : "";
+  });
+  if (rsWasRunning && !running) loadRecordings();
+  rsWasRunning = running;
+}
+async function restitch(id, btn) {
+  btn.disabled = true;
+  const r = await fetch("/api/recordings/" + id + "/stitch",
+    {method: "POST", headers: {"Content-Type": "application/json", ...AUTH}, body: "{}"});
+  const j = await r.json();
+  if (!j.ok) { alert(j.error || "could not start the stitch"); btn.disabled = false; }
+}
+
 /* ---------- recordings ---------- */
 function fmtBytes(b) {
   if (!b) return "?";
@@ -554,19 +633,27 @@ function loadRecordings() {
           <div class="t">${(r.created_at || "").replace(" ", " · ")}${r.recording ? " · 🔴 LIVE" : ""}</div>
           <div class="s">${fmtDur(r.duration_s)} min:sec · ${fmtBytes(r.size_bytes)}</div>
           <div class="badges">
-            ${r.has_master ? '<span class="badge ok">master</span>' : '<span class="badge">master –</span>'}
+            ${r.kind === "separate" ? '<span class="badge ok">separate</span>' : ""}
+            ${r.has_master ? `<span class="badge ok">${r.kind === "separate" ? "stitched" : "master"}</span>`
+                           : (r.kind === "separate" ? "" : '<span class="badge">master –</span>')}
             ${r.has_proxy ? '<span class="badge ok">proxy</span>' : '<span class="badge">proxy –</span>'}
             ${r.resumed ? `<span class="badge">resumed ${r.resumed.restarts}× · ${Math.round(r.resumed.lost_s)} s gap</span>` : ""}
             ${r.error ? '<span class="badge" style="color:var(--red)">error</span>' : ""}
           </div>
+          ${r.kind === "separate" ? `<div class="s" data-stitch-progress="${r.id}"></div>` : ""}
         </div>
         <div class="acts">
           ${r.has_proxy ? `<button class="mini-btn" onclick="play(${r.id})">Play</button>`
                         : `<button class="mini-btn" onclick="mkproxy(${r.id}, this)">Make proxy</button>`}
           ${r.has_proxy ? `<a class="mini-btn" style="text-decoration:none" href="/api/recordings/${r.id}/proxy.mp4" download>Save</a>` : ""}
+          ${r.kind === "separate" && !r.has_master && !r.recording
+            ? `<button class="mini-btn" data-stitch="${r.id}" onclick="restitch(${r.id}, this)">Stitch</button>` : ""}
+          ${r.kind === "separate" && r.has_master
+            ? `<a class="mini-btn" style="text-decoration:none" href="/api/recordings/${r.id}/master.mp4" download>Save stitched</a>` : ""}
           <button class="mini-btn danger" ${r.recording ? "disabled" : ""} onclick="del(${r.id}, this)">Delete</button>
         </div>
       </div>`).join("");
+    applyRestitch(RS);
   }).catch(() => {});
 }
 function play(id) {

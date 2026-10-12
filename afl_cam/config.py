@@ -32,8 +32,8 @@ PLATFORM = sys.platform  # "linux" or "darwin"
 #   wedge after a hard crash mid-stream) it re-enumerates at full speed on
 #   the OHCI side, where uvcvideo's probe FAILS — the camera then has no
 #   video node at all and its panel sits frozen. scripts/usb_kick_cameras.sh
-#   soft-resets the socket (no replug needed); the UI runs it automatically
-#   at startup when a camera is missing.
+#   soft-resets the socket (no replug needed); the daemon runs it
+#   automatically when a camera is missing.
 #   macOS — AVFoundation device indices (find them with 'afl-cam list-devices')
 _CAMERA_PORTS = {
     # Physical socket controller aliases: (USB3 xhci, USB2 EHCI, USB2 OHCI)
@@ -147,21 +147,10 @@ RESOLUTIONS = {
 
 DEFAULT_RESOLUTION = "4K"
 
-# Preview settings (lower res to save USB bandwidth)
-PREVIEW_WIDTH = 640
-PREVIEW_HEIGHT = 360
-PREVIEW_FPS = 30
-
-# Container format for recordings
-CONTAINER = "avi"
-CODEC = "MJPEG"
-
 # Native MPP recorder (RK3588: V4L2 → jpegd → rkvenc; raw .h264 ES is
 # stream-copied into .mp4 on completion)
 NATIVE_RECORDER_SRC = ROOT_DIR / "afl_cam" / "native" / "cam2h264.c"
 NATIVE_RECORDER_BIN = ROOT_DIR / "afl_cam" / "native" / "cam2h264"
-NATIVE_CODEC = "H264"
-NATIVE_CONTAINER = "mp4"
 # rkvenc encode settings. Codec: HEVC default — measured (cam2h264 --bench)
 # same-or-better throughput than H.264 on this silicon, ~2x quality per bit,
 # and dual-concurrent 4K30 HEVC@60M sustains ~49 fps each (1.6x headroom).
@@ -173,8 +162,8 @@ ENCODE_CODEC = os.environ.get("AFL_CAM_CODEC", "hevc")   # "hevc" | "h264"
 NATIVE_BITRATE_KBPS = int(os.environ.get("AFL_CAM_BITRATE_KBPS", "60000"))
 STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "80000"))
 # The native recorders write the raw UVC JPEG payload to
-# <session>/camN_preview.jpg this often; the UI (and the field-remote web
-# page) poll those files for a live preview while recording. 1 fps: the
+# <session>/camN_preview.jpg this often; the phone page polls those files
+# for a live preview while recording in separate mode. 1 fps: the
 # payloads are full 4K (~600 KB).
 PREVIEW_INTERVAL_SECS = float(os.environ.get("AFL_CAM_PREVIEW_SECS", "1.0"))
 
@@ -188,11 +177,8 @@ EXPOSURE_TIME = 0
 # Default recording duration (0 = manual stop)
 DEFAULT_DURATION = 0
 
-# Live GPU stitching at record time: cam2stitch records BOTH cameras in one
-# process and writes the stitched panorama directly (no post step). When the
-# probe fails or a camera is missing the UI falls back to per-camera
-# recording. Off switch: AFL_CAM_LIVE_STITCH=0.
-LIVE_STITCH = os.environ.get("AFL_CAM_LIVE_STITCH", "1") == "1"
+# Live GPU stitching (cam2stitch under afl-camd): one process records BOTH
+# cameras and writes the panorama directly (no post step).
 STITCH_RECORDER_SRC = ROOT_DIR / "afl_cam" / "native" / "cam2stitch.c"
 STITCH_RECORDER_BIN = ROOT_DIR / "afl_cam" / "native" / "cam2stitch"
 STITCH_SHADER = ROOT_DIR / "afl_cam" / "native" / "stitch_nv12.spv"
@@ -201,7 +187,7 @@ STITCH_SHADER = ROOT_DIR / "afl_cam" / "native" / "stitch_nv12.spv"
 #   scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> calibration/stitch_live_full
 STITCH_PARAMS_DIR = ROOT_DIR / "calibration" / "stitch_live_full"
 STITCH_CANVAS_WIDTH = 5304
-# Re-align workflow (UI button): captures two stills and regenerates the
+# Re-align workflow (phone Setup → Re-align): captures two stills and regenerates the
 # frozen stitch params. Needs the OpenCV 5 venv (the project venv is py3.14
 # with no wheels for the bundle API).
 ALIGN_PYTHON = "/home/hamish/venvs/cv2-new/bin/python3"
@@ -246,6 +232,30 @@ def build_cam2stitch() -> Path | None:
               f"{result.stderr.strip()[-400:]}", file=sys.stderr)
         return None
     return STITCH_RECORDER_BIN
+
+def build_cam2h264() -> Path | None:
+    """Compile the per-camera recorder (separate mode) if missing or stale
+    (stdlib-only, like build_cam2stitch — the daemon needs it too)."""
+    import subprocess
+
+    if NATIVE_RECORDER_BIN.exists() and NATIVE_RECORDER_SRC.exists() and \
+            NATIVE_RECORDER_BIN.stat().st_mtime >= NATIVE_RECORDER_SRC.stat().st_mtime:
+        return NATIVE_RECORDER_BIN
+    cmd = [
+        "gcc", "-O2", "-I/usr/local/include/rockchip",
+        "-o", str(NATIVE_RECORDER_BIN), str(NATIVE_RECORDER_SRC),
+        "-L/usr/local/lib", "-lrockchip_mpp", "-lpthread",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"afl-cam: cam2h264 build failed: {e}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(f"afl-cam: cam2h264 build failed: "
+              f"{result.stderr.strip()[-400:]}", file=sys.stderr)
+        return None
+    return NATIVE_RECORDER_BIN
 
 # SQLite pragmas
 DB_PRAGMAS = {

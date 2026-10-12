@@ -15,8 +15,7 @@
 # driver — the AP runs hostapd+dnsmasq (afl-cam-ap.service brings it up at
 # boot only when no home WiFi is connected; NM keeps the home client job).
 #
-# The GTK UI (afl-cam ui) is the desk tool: stop afl-camd first
-# (systemctl stop afl-camd) — daemon and UI can't share the cameras.
+# The phone page is the only interface (desk tools live in its Setup tab).
 set -eu
 
 cd "$(dirname "$0")/.."

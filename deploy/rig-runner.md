@@ -42,9 +42,10 @@ With Tailscale on both machines, either enable Tailscale SSH on the board
 (`sudo tailscale set --ssh`) or put your dev machine's public key in
 `~/.ssh/authorized_keys`. On Windows run it from Git Bash or WSL.
 
-## 4. Remote desktop for the GTK UI
+## 4. Remote desktop
 
-For eyeballing the on-device UI from your PC:
+For looking at the board's desktop from your PC (the app itself is the
+phone page — open http://<board>/ in any browser):
 - GNOME on Wayland: **Settings → Sharing → Remote Desktop** (RDP), then
   connect with Windows' Remote Desktop Connection to the board's Tailscale
   name.
