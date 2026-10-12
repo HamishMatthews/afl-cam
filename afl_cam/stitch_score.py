@@ -132,9 +132,16 @@ def score(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps) -> dict:
     if res is None:
         out.update(misalign_tiles=0, misalign_median=None, misalign_p95=None)
     else:
+        t = res["tiles"]
+        # where it ghosts: uniform = rotation/intrinsics error; growing
+        # toward the bottom (near ground) = parallax
+        bands = np.array_split(np.argsort(t[:, 1]), 4)
         out.update(misalign_tiles=res["n_tiles"],
                    misalign_median=round(res["median"], 3),
-                   misalign_p95=round(res["p95"], 3))
+                   misalign_p95=round(res["p95"], 3),
+                   misalign_dxdy=[round(float(np.median(t[:, 2])), 2),
+                                  round(float(np.median(t[:, 3])), 2)],
+                   misalign_bands=[round(float(np.median(t[b, 4])), 2) for b in bands if len(b)])
 
     # exposure step: blur away texture and residual misalignment first
     b0 = cv2.GaussianBlur(g0, (0, 0), 8)[both]

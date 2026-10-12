@@ -220,8 +220,9 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - Live stitch at 5304×1876 canvas, quality parity with `cv2.remap` math
   (Y corr 0.999965), encoder + GPU pipelined ≈ 30 fps capacity.
 - Frozen alignment refined for the static rig: overlap misalignment ~0.5 px
-  median by the old (under-reading) ruler — see the rig CI's stitch-score
-  line for the current number (was 13–70 px before the canvas-space refinement). Near-field grass
+  median by the old (under-reading) ruler; the accurate ruler reads median
+  18 px / p95 33 px and a 1.24× exposure ratio on the re-align stills
+  (2026-10-12) — the rig CI's stitch-score line has the current number (was 13–70 px before the canvas-space refinement). Near-field grass
   (~19 px bottom band) is genuine parallax — physics, not a bug.
 - Re-align button works end-to-end and streams logs; dump writes are atomic.
 - Live preview while recording: the recorders write the raw 4K UVC JPEG
