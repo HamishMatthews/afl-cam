@@ -74,3 +74,42 @@ def test_exposure_matched_in_the_middle(tmp_path):
 def test_old_params_without_gain_mean_unity():
     _, _, live = rig()
     assert live.gain(0) == live.gain(1) == 1.0
+
+
+def wide_ramp(live, width=200):
+    """The old weights: a wide linear ramp down the middle of the overlap."""
+    from afl_cam import stitch_maps
+    mid = (OFF1 + SW) / 2
+    xs = np.arange(live.canvas[0], dtype=np.float32)
+    a = np.clip((mid + width / 2 - xs) / width, 0, 1)
+    w0 = np.tile(np.round(a * 255).astype(np.uint8), (SH, 1))
+    w0[:, SW:] = 0
+    w1 = np.where(np.arange(live.canvas[0]) >= OFF1, 255 - w0, 0).astype(np.uint8)
+    cams = [stitch_maps.CameraMap(c.map, c.off, w) for c, w in zip(live.cams, (w0, w1))]
+    return stitch_maps.LiveMaps(canvas=live.canvas, src=live.src, params=live.params, cams=cams)
+
+
+def test_narrow_seam_cuts_visible_ghosting():
+    f0, f1, live = rig(3.0, 0.0)               # 3 px residual everywhere
+    live = wide_ramp(live)
+    before = stitch_score.score(f0, f1, live)["seam_ghost"]
+    placed = seam_refine.place_seam(f0, f1, live)
+    after = stitch_score.score(f0, f1, placed)["seam_ghost"]
+    assert after < 0.5 * before
+    w0, w1 = (c.weight.astype(int) for c in placed.cams)
+    ov = (slice(None), slice(OFF1, SW))
+    assert np.all(w0[ov] + w1[ov] == 255)       # still a partition of unity
+    ramp = ((w0[ov] > 0) & (w0[ov] < 255)).sum(axis=1)
+    assert ramp.max() <= 64
+
+
+def test_seam_routes_around_a_disagreement():
+    f0, f1, live = rig()
+    # an object only cam1 sees in the middle of the overlap (a player in
+    # parallax / moving between exposures)
+    f1 = f1.copy()
+    f1[100:300, 150:190] = 255                 # cam1 frame x 150..190 = canvas 406..446
+    placed = seam_refine.place_seam(f0, f1, wide_ramp(live))
+    w0 = placed.cams[0].weight[100:300, 406:446].astype(int)
+    w1 = placed.cams[1].weight[100:300, 406:446].astype(int)
+    assert (np.minimum(w0, w1) == 0).mean() > 0.95   # never mixed across it

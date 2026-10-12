@@ -10,6 +10,9 @@ space on its own and compare the two views where both have pixels:
               residuals measure toe-in, not ghosting).
   luma_*      exposure mismatch between the views over the overlap: the
               brightness step a viewer sees where the blend hands over.
+  seam_ghost  the double image the blend actually shows (view difference
+              weighted by how evenly the two are mixed) — what the seam's
+              width and placement control.
 
 `render_seam_crop` saves the blended overlap (the shader's output, via the
 VideoStitcher reference) beside a red/green edge overlay for eyeballing.
@@ -168,6 +171,17 @@ def score(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps) -> dict:
         out["luma_ratio"] = round(float(np.median(b1[lit]) / np.median(b0[lit])), 4)
     else:
         out["luma_step"] = out["luma_ratio"] = None
+
+    # seam_ghost: how much double image the blend actually shows — the two
+    # views' difference weighted by how evenly they are mixed there
+    # (2*min(w0, w1): 1 at a 50/50 mix, 0 where one camera owns the pixel),
+    # mean grey levels per overlap pixel. A narrower / better-placed seam
+    # lowers it even when the views' misalignment is unchanged.
+    w0 = live.cams[0].weight[y0:y1, x0:x1].astype(np.float32)
+    w1 = live.cams[1].weight[y0:y1, x0:x1].astype(np.float32)
+    mix = 2 * np.minimum(w0, w1) / 255.0
+    diff = np.abs(cv2.GaussianBlur(g0, (0, 0), 1.5) - cv2.GaussianBlur(g1, (0, 0), 1.5))
+    out["seam_ghost"] = round(float((mix * diff)[both].mean()), 3) if both.any() else None
     return out
 
 
