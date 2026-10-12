@@ -97,9 +97,16 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
 - `afl_cam/stitch_maps.py` — THE map-set format (params.bin, map0/1.bin,
   w0/1.bin): one writer (`dump_camera_params.py`), read by cam2stitch and
   the offline stitcher.
+- `afl_cam/lens.py` + `afl_cam/intrinsics/cam{0,1}.json` — the lens: tracked
+  K and (k1, k2, k3) per camera, fitted from checkerboard stills
+  (`scripts/calibrate.py` captures, `python -m afl_cam.lens fit calibration`
+  fits; reports board coverage). The map generator builds the warp
+  undistorted and bakes the lens in last, so the maps hold RAW source coords
+  and the shader never changes; `refine_rotation.py` and
+  `measure_alignment.py` undistort their matches with it.
 - `afl_cam/stitcher.py` — separate-mode re-stitch; **warps with the live
-  map set itself** (same geometry + weights as cam2stitch, distortion
-  zeroed), so a re-stitch of per-camera files reproduces the live stitch
+  map set itself** (same geometry + weights as cam2stitch), so a re-stitch
+  of per-camera files reproduces the live stitch
   (`AFL_CAM_REBUNDLE=1` or a missing/torn set → per-session bundling).
 - `afl_cam/retime.py` — VFR→CFR remux from `.pts` sidecars; HEVC muxes are
   tagged `hvc1` (iPhone/QuickTime refuse `hev1`).
@@ -171,9 +178,19 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   gpio85 power-on) → modprobe. Watch for a stuck polkit auth overlay too —
   a wedged gnome-shell agent respawns `polkit-agent-helper-1` at 100% CPU;
   restart polkitd + NetworkManager to clear the pending request.
-- **Alignment math**: K is measured (checkerboard, distortion ZEROED — the
-  paper board's waviness, not the lens); R is refined in **canvas space**
-  with K fixed (`refine_rotation.py`). The 2-view bundle is degenerate on
+- **Alignment math**: K and the lens (k1, k2, k3) are measured from the
+  checkerboard stills (a full-screen board on a flat laptop display; NOT a
+  wavy paper board) and tracked in `afl_cam/intrinsics/`; R is refined in
+  **canvas space** with K and the lens fixed (`refine_rotation.py`). The
+  lens is near-rectilinear (corner rows stray 0.3 px median, 1.3 px p95 from
+  a straight line), so it is worth about 1 px in the overlap (far-field
+  matches, 2026-10-12: 1.8 px median off after the rotation fit with the
+  lens zeroed, 1.25 px with it); the large misalignment on indoor
+  re-align stills is parallax, not the lens. Never keep a K fitted WITH
+  distortion and drop the distortion (the old zeroing did). Close-range,
+  low-tilt boards constrain the focal length weakly (a pinhole refit lands
+  at fx 2150-2180 and fits 5x worse), so refit with boards tilted up to
+  ~30 deg across the whole frame. The 2-view bundle is degenerate on
   grass (focal 2125 vs measured 2237 → 13–70 px ghosting). Do NOT reintroduce
   per-session bundling as the primary path.
 - **Metric traps**: ray-direction angular residuals measure the cameras'

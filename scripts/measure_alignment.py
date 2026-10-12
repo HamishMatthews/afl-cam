@@ -8,8 +8,9 @@ variants:
   post    — fresh 2-view bundle with the bundle's own focal (what the
             post-stitch engine does per session)
   bundleK — fresh bundle R but intrinsics overridden with the measured
-            checkerboard K (what dump_camera_params.py does)
-  frozen  — measured K + the R frozen in calibration/stitch_live_full/cams.txt
+            checkerboard K and lens distortion (what dump_camera_params.py does)
+  frozen  — measured K and distortion + the R frozen in
+            calibration/stitch_live_full/cams.txt
 
 Usage:
     python3 scripts/measure_alignment.py [cam0.jpg] [cam1.jpg] [--width 1600]
@@ -25,15 +26,11 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from afl_cam import lens  # noqa: E402
 from afl_cam.stitch_score import residual_stats  # noqa: E402
 from afl_cam.stitcher import Stitcher, _camera_matrices, _spherical_bounds, _spherical_maps  # noqa: E402
 
 CALIB_DIR = REPO / "calibration"
-
-
-def load_measured(cam_key):
-    d = np.load(CALIB_DIR / f"{cam_key}_calib.npz")
-    return {"mtx": d["mtx"], "dist": d["dist"].ravel()}
 
 
 def fake_cam(fx, fy, cx, cy, R, aspect=None):
@@ -61,12 +58,12 @@ def fresh_bundle(stills, f0, f1):
     return None, None
 
 
-def build_warp_pair(cams, work_scale, full_size, w_scale, k=1.0):
-    """Maps + warped stills for both cameras (no undistort — dist is zeroed)."""
-    m0 = _spherical_maps(cams[0], work_scale, full_size, k, None, w_scale)
-    m1 = _spherical_maps(cams[1], work_scale, full_size, k, None, w_scale)
-    b0 = _spherical_bounds(cams[0], work_scale, full_size, w_scale)
-    b1 = _spherical_bounds(cams[1], work_scale, full_size, w_scale)
+def build_warp_pair(cams, work_scale, full_size, w_scale, k=1.0, dists=(None, None)):
+    """Maps + warped stills for both cameras (maps hold raw coords: dists bake the lens in)."""
+    m0 = _spherical_maps(cams[0], work_scale, full_size, k, None, w_scale, dists[0])
+    m1 = _spherical_maps(cams[1], work_scale, full_size, k, None, w_scale, dists[1])
+    b0 = _spherical_bounds(cams[0], work_scale, full_size, w_scale, dists[0])
+    b1 = _spherical_bounds(cams[1], work_scale, full_size, w_scale, dists[1])
     min_x = min(b0[0], b1[0])
     min_y = min(b0[1], b1[1])
     off0 = (int(round((b0[0] - min_x) * k)), int(round((b0[1] - min_y) * k)))
@@ -86,9 +83,9 @@ def overlap_crops(out_w, m0, m1, off0, off1):
     return c0, c1, (oy0, oy1, ox0, ox1)
 
 
-def measure_variant(label, cams, work_scale, f0, f1, w_scale, k=1.0, tag=""):
+def measure_variant(label, cams, work_scale, f0, f1, w_scale, k=1.0, tag="", dists=(None, None)):
     full_size = (f0.shape[1], f0.shape[0])
-    m0, m1, off0, off1, out_w, out_h = build_warp_pair(cams, work_scale, full_size, w_scale, k)
+    m0, m1, off0, off1, out_w, out_h = build_warp_pair(cams, work_scale, full_size, w_scale, k, dists)
     w0 = cv2.remap(f0, m0[0], m0[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     w1 = cv2.remap(f1, m1[0], m1[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     c0, c1, ol_roi = overlap_crops(out_w, m0, m1, off0, off1)
@@ -137,7 +134,7 @@ def measure_variant(label, cams, work_scale, f0, f1, w_scale, k=1.0, tag=""):
     # feature-based angular residual (definitive: geometry error vs parallax)
     K0, R0 = _camera_matrices(cams[0], work_scale)
     K1, R1 = _camera_matrices(cams[1], work_scale)
-    sres = sift_residual(f0, f1, (K0, K1), (R0, R1), w_scale)
+    sres = sift_residual(f0, f1, (K0, K1), (R0, R1), w_scale, dists)
     if sres:
         print(f"[{label}] sift: {sres['n']} matches, angular residual "
               f"median {sres['median']:.2f}px mean {sres['mean']:.2f}px "
@@ -146,11 +143,14 @@ def measure_variant(label, cams, work_scale, f0, f1, w_scale, k=1.0, tag=""):
 
 
 def parse_frozen_cams(path):
-    rows = {}
+    rows, dist = {}, {0: np.zeros(5), 1: np.zeros(5)}
     with open(path) as fh:
         for line in fh:
             parts = line.split()
             if len(parts) < 2:
+                continue
+            if parts[1] == "dist":     # "cam0 dist k1 k2 p1 p2 k3"
+                dist[int(parts[0][3:])] = np.array(parts[2:], dtype=np.float64)
                 continue
             try:
                 vals = [float(v) for v in parts[1:]]
@@ -159,10 +159,10 @@ def parse_frozen_cams(path):
             rows.setdefault(parts[0], []).append(vals)
     R = {i: np.array(rows[f"R{i}"], dtype=np.float64) for i in (0, 1)}
     K = {i: np.array(rows[f"K{i}"], dtype=np.float64) for i in (0, 1)}
-    return K, R, rows["warp_scale"][0][0]
+    return K, R, rows["warp_scale"][0][0], dist
 
 
-def sift_residual(f0, f1, K, R, w_scale):
+def sift_residual(f0, f1, K, R, w_scale, dists=(None, None)):
     """Feature-based angular residual: for each SIFT match, the angle between
     the two cameras' rays to the matched point, in canvas-px equivalents.
 
@@ -181,19 +181,14 @@ def sift_residual(f0, f1, K, R, w_scale):
     print(f"  sift: {len(kp0)}/{len(kp1)} keypoints, {len(good)} good matches")
     if not good:
         return None
-    K0i = np.linalg.inv(K[0])
-    K1i = np.linalg.inv(K[1])
-    angs = []
-    for m in good:
-        p0 = np.array([kp0[m.queryIdx].pt[0], kp0[m.queryIdx].pt[1], 1.0])
-        p1 = np.array([kp1[m.trainIdx].pt[0], kp1[m.trainIdx].pt[1], 1.0])
-        d0 = R[0] @ K0i @ p0
-        d1 = R[1] @ K1i @ p1
-        d0 /= np.linalg.norm(d0)
-        d1 /= np.linalg.norm(d1)
-        a = np.arccos(np.clip(d0 @ d1, -1.0, 1.0))
-        angs.append(a * w_scale)  # canvas px at the canvas center scale
-    arr = np.asarray(angs)
+    pts0 = np.array([kp0[m.queryIdx].pt for m in good])
+    pts1 = np.array([kp1[m.trainIdx].pt for m in good])
+    d0 = (R[0] @ lens.unproject(pts0, K[0], dists[0]).T).T
+    d1 = (R[1] @ lens.unproject(pts1, K[1], dists[1]).T).T
+    d0 /= np.linalg.norm(d0, axis=1, keepdims=True)
+    d1 /= np.linalg.norm(d1, axis=1, keepdims=True)
+    # canvas px at the canvas center scale
+    arr = np.arccos(np.clip((d0 * d1).sum(axis=1), -1.0, 1.0)) * w_scale
     return {"n": len(good), "median": float(np.median(arr)), "mean": float(np.mean(arr)),
             "p90": float(np.percentile(arr, 90)), "max": float(np.max(arr)), "all": arr}
 
@@ -216,8 +211,9 @@ def main():
     print(f"stills: {f0p} ({f0.shape[1]}x{f0.shape[0]})  {f1p}")
 
     stills = Stitcher()
-    cal0, cal1 = load_measured("cam0"), load_measured("cam1")
+    cal0, cal1 = lens.load("cam0"), lens.load("cam1")
     mtx0, mtx1 = cal0["mtx"], cal1["mtx"]
+    measured_dists = (cal0["dist"], cal1["dist"])
 
     # variant: post (fresh bundle, bundle focal — the per-session engine path)
     cams, ws = fresh_bundle(stills, f0, f1)
@@ -236,14 +232,14 @@ def main():
             m = mtx0 if idx == 0 else mtx1
             cam_k.append(fake_cam(m[0, 0], m[1, 1], m[0, 2], m[1, 2], cam.R))
         w_scale = float(np.median([c.focal for c in cam_k])) / 1.0
-        measure_variant("bundleK", cam_k, 1.0, f0, f1, w_scale, tag="bundleK")
+        measure_variant("bundleK", cam_k, 1.0, f0, f1, w_scale, tag="bundleK", dists=measured_dists)
 
     # variant: frozen (cams.txt from the last realign)
     if frozen_path.exists():
-        K, R, w_scale = parse_frozen_cams(frozen_path)
+        K, R, w_scale, fdist = parse_frozen_cams(frozen_path)
         cam_f = [fake_cam(K[i][0, 0], K[i][1, 1], K[i][0, 2], K[i][1, 2], R[i])
                  for i in (0, 1)]
-        measure_variant("frozen", cam_f, 1.0, f0, f1, w_scale, tag="frozen")
+        measure_variant("frozen", cam_f, 1.0, f0, f1, w_scale, tag="frozen", dists=(fdist[0], fdist[1]))
     else:
         print("no frozen cams.txt")
 
