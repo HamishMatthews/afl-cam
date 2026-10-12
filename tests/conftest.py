@@ -8,12 +8,14 @@ can't share the cameras. The suite wakes the daemon itself (every
 """
 
 import json
+import os
 import time
 import urllib.request
 
 import pytest
 
-BASE = "http://127.0.0.1:80"
+# scripts/rig_test.sh points this at a side-port daemon run from the tree under test
+BASE = os.environ.get("AFL_CAM_TEST_BASE", "http://127.0.0.1:80")
 
 
 def get(path, timeout=30):
