@@ -59,3 +59,4 @@ def test_rig_seam_refine_improves_score(capsys):
         print(f"\n[seam-refine] before {json.dumps(before)}\n[seam-refine] after  {json.dumps(after)}")
     assert after["misalign_median"] < before["misalign_median"]
     assert abs(after["luma_ratio"] - 1) < abs(before["luma_ratio"] - 1)
+    assert after["seam_ghost"] < before["seam_ghost"]

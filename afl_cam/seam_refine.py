@@ -116,6 +116,7 @@ def refine(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps, rounds: i
             break
         cur = apply_field(cur, fit_field(res["tiles"], box), box)
     cur = match_exposure(f0, f1, cur)
+    cur = place_seam(f0, f1, cur)
     after = stitch_score.score(f0, f1, cur)
     return cur, before, after
 
@@ -131,3 +132,67 @@ def match_exposure(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps,
         return live
     g = float(np.clip(np.sqrt(r), 1 / max_gain, max_gain))
     return live.with_gains(g, 1 / g)
+
+
+def seam_path(cost: np.ndarray, valid: np.ndarray, margin: int) -> np.ndarray:
+    """Min-cost top-to-bottom path (one column per row, moving at most one
+    column per row) through `cost`, staying `margin` px inside `valid`.
+    Returns the column per row, -1 for rows with no valid column."""
+    h, w = cost.shape
+    ok = valid.copy()
+    if margin > 0:   # keep the ramp inside the both-valid region
+        k = np.ones((1, 2 * margin + 1), np.uint8)
+        ok = cv2.erode(ok.astype(np.uint8), k, borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    big = np.float32(1e9)
+    c = np.where(ok, cost, big).astype(np.float32)
+    acc = np.empty_like(c)
+    back = np.zeros((h, w), np.int8)
+    acc[0] = c[0]
+    for y in range(1, h):
+        prev = acc[y - 1]
+        left = np.concatenate([[big], prev[:-1]])
+        right = np.concatenate([prev[1:], [big]])
+        stack = np.stack([left, prev, right])
+        arg = np.argmin(stack, axis=0)
+        acc[y] = c[y] + stack[arg, np.arange(w)]
+        back[y] = arg.astype(np.int8) - 1
+    path = np.full(h, -1, np.int64)
+    x = int(np.argmin(acc[-1]))
+    for y in range(h - 1, -1, -1):
+        path[y] = x if ok[y].any() else -1
+        x = int(np.clip(x + int(back[y, x]), 0, w - 1))
+    return path
+
+
+def place_seam(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps,
+               width: int = 64) -> stitch_maps.LiveMaps:
+    """Re-cut the blend: a `width`-px ramp along the path where the two views
+    already agree best (min |view0 - view1|), instead of a wide ramp down
+    the middle of the overlap. Residual misalignment then shows only in a
+    thin band, routed through grass rather than across lines or players."""
+    (v0, v1), (m0, m1) = stitch_score.warp_views(f0, f1, live)
+    box = stitch_score.overlap_box(m0, m1)
+    y0, y1, x0, x1 = box
+    g0 = cv2.GaussianBlur(stitch_score._gray(v0[y0:y1, x0:x1]).astype(np.float32), (0, 0), 4)
+    g1 = cv2.GaussianBlur(stitch_score._gray(v1[y0:y1, x0:x1]).astype(np.float32), (0, 0), 4)
+    both = (m0 & m1)[y0:y1, x0:x1]
+    cost = cv2.GaussianBlur(np.abs(g0 - g1), (0, 0), 6)
+    path = seam_path(cost, both, width // 2 + 1)
+
+    w0 = live.cams[0].weight.copy()
+    w1 = live.cams[1].weight.copy()
+    left = 0 if live.cams[0].off[0] <= live.cams[1].off[0] else 1
+    xs = np.arange(x1 - x0, dtype=np.float32)
+    for r, sx in enumerate(path):
+        if sx < 0:
+            continue
+        # left camera owns everything left of the seam, ramping to 0 across it
+        a = np.clip((sx + width / 2 - xs) / width, 0, 1)
+        a = np.where(both[r], a, np.nan)
+        wl = (w0 if left == 0 else w1)[y0 + r, x0:x1]
+        wr = (w1 if left == 0 else w0)[y0 + r, x0:x1]
+        sel = ~np.isnan(a)
+        wl[sel] = np.round(a[sel] * 255).astype(np.uint8)
+        wr[sel] = 255 - wl[sel]
+    cams = [stitch_maps.CameraMap(c.map, c.off, w) for c, w in zip(live.cams, (w0, w1))]
+    return stitch_maps.LiveMaps(canvas=live.canvas, src=live.src, params=live.params, cams=cams)

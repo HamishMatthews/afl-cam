@@ -87,7 +87,9 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   `dump_camera_params.py --r1` (final, atomic writes).
 - `afl_cam/seam_refine.py` + `scripts/refine_seam.py` — fits the measured
   overlap misalignment (parallax) as a smooth field and warps both maps by
-  half of it, fading out away from the overlap; last step of the re-align
+  half of it, fading out away from the overlap, matches exposure, and
+  re-cuts the blend as a 64 px ramp along the min-difference seam path;
+  last step of the re-align
   chain, writes only if the stitch score improves (`.prev` maps kept).
 - `afl_cam/stitch_score.py` + `scripts/stitch_score.py` — THE stitch
   quality score (overlap misalignment median/p95 px, exposure step, seam
