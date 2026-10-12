@@ -23,6 +23,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from afl_cam import stitch_maps  # noqa: E402
 from afl_cam.stitcher import Stitcher, _build_uint8_weights, _spherical_bounds, _spherical_maps  # noqa: E402
 
 CALIB_DIR = Path(__file__).resolve().parent.parent / "calibration"
@@ -205,18 +206,6 @@ def main() -> None:
         lines.append(f"cam{idx} dist " + " ".join(f"{v:.6g}" for v in calibs[idx]["dist"]))
     atomic_text(out_dir / "cams.txt", "\n".join(lines) + "\n")
 
-    atomic_write(out_dir / "w0.bin",
-                 np.repeat(w0[:, :, None].astype(np.uint8), 4, axis=2).tobytes())
-    atomic_write(out_dir / "w1.bin",
-                 np.repeat(w1[:, :, None].astype(np.uint8), 4, axis=2).tobytes())
-    # Warp maps for the GPU map-texture path (stitch_nv12.comp fetches these
-    # with texelFetch instead of running the analytic warp per pixel): the
-    # exact (s,t) source coords cv2.remap consumes, at the ROI shape the
-    # shader indexes via params off/mapwh. Invalid = -1 (matches the guard).
-    atomic_write(out_dir / "map0.bin",
-                 np.stack([m0[0], m0[1]], axis=-1).astype(np.float32).tobytes())
-    atomic_write(out_dir / "map1.bin",
-                 np.stack([m1[0], m1[1]], axis=-1).astype(np.float32).tobytes())
     atomic_write(out_dir / "cam0.rgb", cv2.cvtColor(f0, cv2.COLOR_BGR2RGB).tobytes())
     atomic_write(out_dir / "cam1.rgb", cv2.cvtColor(f1, cv2.COLOR_BGR2RGB).tobytes())
 
@@ -241,7 +230,13 @@ def main() -> None:
         params[base + 15:base + 19] = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
         params[base + 19:base + 23] = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
         params[base + 23:base + 28] = calibs[bidx]["dist"]
-    atomic_write(out_dir / "params.bin", params.tobytes())
+    # Weights + warp maps + params, in the one format cam2stitch (GPU
+    # map-texture path: texelFetch of the exact (s,t) cv2.remap consumes)
+    # and the offline VideoStitcher both read — afl_cam/stitch_maps.py.
+    stitch_maps.write(out_dir, stitch_maps.LiveMaps(
+        canvas=(out_w, out_h), src=(src_w, src_h), params=params,
+        cams=[stitch_maps.CameraMap(np.stack([m[0], m[1]], axis=-1), off, w.astype(np.uint8))
+              for m, off, w in ((m0, off0, w0), (m1, off1, w1))]))
     print(f"params.bin: warp_scale={w_scale:.1f}, krinv0={params[8:11]}, "
           f"pin0={params[23:27]}, raw0={params[27:31]}, dist0={params[31:36]}")
 
