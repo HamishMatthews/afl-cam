@@ -6,7 +6,8 @@ of per-camera files reproduces the live geometry and blend exactly.
 
 Files in the params dir (all raw little-endian, written atomically):
   params.bin  64 float32: [0..3] canvas_w, canvas_h, src_w, src_h,
-              [4] warp_scale, per-camera 28-float block at 8 + 28*cam:
+              [4] warp_scale, [5..6] per-camera exposure gain (0 = 1.0),
+              per-camera 28-float block at 8 + 28*cam:
               krinv(9) tl(2) off(2) mapwh(2) pin fx,fy,cx,cy(4)
               raw fx,fy,cx,cy(4) dist(5)
   map{0,1}.bin  float32 (map_h, map_w, 2): the raw source (x, y) for each
@@ -40,6 +41,16 @@ class LiveMaps:
     src: Tuple[int, int]      # (w, h) raw camera frame
     params: np.ndarray        # the 64 raw floats, kept for re-writing
     cams: List[CameraMap]
+
+    def gain(self, cam: int) -> float:
+        """Exposure gain the shader applies to this camera (1.0 if unset)."""
+        g = float(self.params[5 + cam])
+        return g if g > 0 else 1.0
+
+    def with_gains(self, g0: float, g1: float) -> "LiveMaps":
+        params = np.asarray(self.params, np.float32).copy()
+        params[5:7] = [g0, g1]
+        return LiveMaps(canvas=self.canvas, src=self.src, params=params, cams=self.cams)
 
 
 def _read(path: Path, dtype, shape) -> np.ndarray:

@@ -55,7 +55,9 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   files while recording.
 - `afl_cam/native/stitch_nv12.comp` (+ `.spv`) — map-texture shader, BT.601
   limited (jpegd outputs Y 16–235 exactly, `RANGE_FULL=0`), 4-Y-bytes-per-uint
-  SSBO packing.
+  SSBO packing; per-camera exposure gain from params.bin [5..6] (set by
+  seam_refine, 0 = 1.0). Rebuild the .spv with `glslangValidator -V
+  stitch_nv12.comp -o stitch_nv12.spv` (byte-reproducible).
 - `afl_cam/native/cam2h264.c` — per-camera recorder (separate mode).
 - `afl_cam/daemon.py` — afl-camd (stdlib only): supervises cam2stitch
   (spawn/restart/adopt a live socket from a previous run/idle-close on
