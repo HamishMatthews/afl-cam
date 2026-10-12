@@ -2,8 +2,7 @@
 
 These are INTEGRATION tests against the live board: they drive the real
 afl-camd daemon (http://127.0.0.1:80) and MediaMTX (HLS :8888) and use
-the real cameras. Close the desktop UI first — the daemon and the UI
-can't share the cameras. The suite wakes the daemon itself (every
+the real cameras. The suite wakes the daemon itself (every
 /api/status touch counts as a phone arrival).
 """
 

@@ -171,70 +171,10 @@ def cmd_record(args):
     print(f"Done. Session {session_id} → {session_dir}")
 
 
-def cmd_preview(args):
-    """Show live preview for a single camera."""
-    if PLATFORM == "darwin":
-        print("CLI preview needs GStreamer (Linux). On macOS, run the GTK app: afl-cam ui")
-        sys.exit(1)
-
-    if "DISPLAY" not in os.environ:
-        print("No display available. Preview requires a graphical session.")
-        sys.exit(1)
-
-    if args.cam not in CAMERAS:
-        print(f"Unknown camera: {args.cam}. Options: {list(CAMERAS)}")
-        sys.exit(1)
-
-    dev = CAMERAS[args.cam]
-    if not os.path.exists(dev):
-        print(f"Camera {args.cam} ({dev}) not found.")
-        sys.exit(1)
-
-    print(f"Preview: {args.cam} ({dev}) — Ctrl+C to stop")
-
-    # Use xvimagesink for direct display
-    import gi
-    gi.require_version("Gst", "1.0")
-    from gi.repository import Gst, GLib
-
-    Gst.init(None)
-
-    pipe = (
-        f"v4l2src device={dev} ! "
-        "image/jpeg,width=640,height=360,framerate=30/1 ! "
-        "jpegdec ! videoconvert ! "
-        "xvimagesink sync=false"
-    )
-    pipeline = Gst.parse_launch(pipe)
-
-    loop = GLib.MainLoop()
-
-    def on_signal(sig, frame):
-        print("\nStopping preview...")
-        pipeline.set_state(Gst.State.NULL)
-        loop.quit()
-
-    signal.signal(signal.SIGINT, on_signal)
-    signal.signal(signal.SIGTERM, on_signal)
-
-    pipeline.set_state(Gst.State.PLAYING)
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        pipeline.set_state(Gst.State.NULL)
-    print("Preview stopped.")
-
-
 def cmd_list_devices(_args):
     """Enumerate cameras and microphones (per-OS tools)."""
     from .capture import list_devices as _list_devices
     sys.exit(_list_devices())
-
-
-def cmd_ui(_args):
-    """Launch the GTK recording app."""
-    from .ui import main as ui_main
-    ui_main()
 
 
 def cmd_daemon(_args):
@@ -242,8 +182,8 @@ def cmd_daemon(_args):
 
     Supervises the always-on cam2stitch pipeline, serves the web UI + REST
     + WebSocket API (default port 80), manages sessions/finalize, clock
-    sync, auto-stop, schedule and the GPIO button. The GTK UI must NOT be
-    running at the same time (both want the cameras)."""
+    sync, auto-stop, schedule and the GPIO button. Don't run `afl-cam
+    record` at the same time (both want the cameras)."""
     from .daemon import main as daemon_main
     daemon_main()
 
@@ -551,9 +491,6 @@ def main():
     sub.add_parser("devices", help="List connected cameras")
     sub.add_parser("list-devices", help="Enumerate cameras and microphones (per-OS tools)")
 
-    # ui
-    sub.add_parser("ui", help="Launch the GTK recording app")
-
     # daemon (field control)
     sub.add_parser("daemon", help="Run the afl-camd field daemon "
                                   "(iPhone control + web UI + API)")
@@ -567,12 +504,6 @@ def main():
     p.add_argument("--duration", "-d", type=float, default=0,
                    help="Duration in seconds (0 = until Ctrl+C)")
     p.set_defaults(func=cmd_record)
-
-    # preview
-    p = sub.add_parser("preview", help="Live preview a camera")
-    p.add_argument("--cam", default="cam0", choices=["cam0", "cam1"],
-                   help="Camera to preview")
-    p.set_defaults(func=cmd_preview)
 
     # list
     p = sub.add_parser("list", help="List recordings")
@@ -638,10 +569,8 @@ def main():
     cmd_map = {
         "devices": cmd_devices,
         "list-devices": cmd_list_devices,
-        "ui": cmd_ui,
         "daemon": cmd_daemon,
         "record": cmd_record,
-        "preview": cmd_preview,
         "list": cmd_list,
         "play": cmd_play,
         "info": cmd_info,

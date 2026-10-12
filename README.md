@@ -45,36 +45,39 @@ recording** (no post step), or per-camera files stitched afterwards.
 ## Install / run
 
 **Requirements:** Python ≥ 3.12, [uv](https://docs.astral.sh/uv/), ffmpeg,
-GTK3 + PyGObject, `v4l2-utils`. Board-level setup (MPP, librga, libmali,
+`v4l2-utils`. Board-level setup (MPP, librga, libmali,
 RKNN, IRQ pinning, NVMe fixes) is documented step-by-step in
 [`orange_pi_5_max_setup.md`](orange_pi_5_max_setup.md).
 
 ```bash
-uv sync                       # project venv (py3.14, GTK app + engine)
-uv run afl-cam ui             # the GTK app
+uv sync                                   # project venv
+bash scripts/install_field_services.sh    # afl-camd + MediaMTX as services
 ```
+
+Then open `http://aflcam.local/` (or the board's address) on a phone or any
+browser.
 
 Two Python environments exist on the board:
 
 | venv | uses |
 |---|---|
-| project `.venv` (py3.14, has `gi`) | the UI, engine, config, retime caller |
+| project `.venv` | the daemon (afl-camd), CLI, re-stitch, retime |
 | `/home/hamish/venvs/cv2-new` (OpenCV 5 + PyAV 13) | stitcher, alignment scripts, retime worker |
 
 The GPU recorder needs the libmali Vulkan ICD (spawned processes don't
-inherit shell env — `engine.py` sets it from config):
+inherit shell env — `config.vk_env()` sets it):
 `VK_DRIVER_FILES=/opt/libmali-g610/usr/share/vulkan/icd.d/mali.json`,
 `LD_LIBRARY_PATH=/opt/libmali-g610/usr/lib/aarch64-linux-gnu{:/mali}`.
 
 ## Usage
 
-The UI has everything: previews (tap to refresh), **Mode** dropdown
-(Live / Separate), resolution, duration, record, stitch, play, delete,
-**Re-align Cameras**, and a collapsible recordings list. On the 5" screen it
-shrinks to 420×240.
+The phone page (served by afl-camd) is the only interface. **Record**:
+record/stop, live stitched preview, Live stitch / Separate mode, schedule,
+recordings (play, save, delete, stitch a separate-mode session). **Setup**:
+pre-game check, framing guides, **Re-align** with a before/after stitch
+score. Add it to the Home Screen to use it like an app.
 
 ```bash
-uv run afl-cam ui               # the app
 afl-cam list                    # sessions with stitch status
 afl-cam stitch --session 12     # stitch a separate-mode session
 afl-cam stitch --all            # stitch every unstitched session
@@ -95,8 +98,8 @@ field** (focal/R entangled — it once estimated focal 2125 vs the measured
    measured K fixed — `scripts/refine_rotation.py` (RANSAC over 2-point
    rotation hypotheses + LM on inliers). This is what kills the ghosting.
 
-The **Re-align Cameras** button runs the whole chain (output streams to the
-terminal you launched the UI from):
+**Setup → Re-align** on the phone runs the whole chain (its output streams to
+the page, followed by the before/after stitch score):
 
 ```
 scripts/recapture_alignment.py          capture one settled still per camera
@@ -114,7 +117,7 @@ phase-correlation with a blur pre-filter; ~0.5 px median mid-band = good).
 
 | script | purpose |
 |---|---|
-| `scripts/recapture_alignment.py` | one-command re-alignment (UI button backend) |
+| `scripts/recapture_alignment.py` | one-command re-alignment (the phone's Re-align backend) |
 | `scripts/dump_camera_params.py` | stills → `params.bin`, `map0/1.bin`, `w0/1.bin`, `cams.txt` (+ `--r1`, `--canvas-width`) |
 | `scripts/refine_rotation.py` | canvas-space rotation refinement (`--band` selects a depth band) |
 | `scripts/measure_alignment.py` | overlap misalignment in px (the ghosting ruler) |

@@ -11,9 +11,8 @@ from .conftest import BASE, get, post, status, wait_until, wake_standby
 
 @pytest.mark.slow
 def test_record_cycle_produces_faststart_proxy():
-    # The record start can race an external handover (someone taking over
-    # from the desktop UI mid-test) — retry the start if the pipeline is
-    # churning instead of reaching "recording".
+    # Retry the start if the pipeline is churning (a restart from an
+    # earlier test) instead of reaching "recording".
     start = None
     for attempt in range(3):
         wake_standby()
