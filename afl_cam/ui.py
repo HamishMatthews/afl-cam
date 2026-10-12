@@ -10,6 +10,8 @@ from pathlib import Path
 from queue import Queue
 from threading import Lock, Thread
 
+from .retime import mux_with_pts_rate
+
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
@@ -542,6 +544,13 @@ class MainWindow(Gtk.ApplicationWindow):
         play_btn.connect("clicked", self._on_play)
         list_btns.pack_start(play_btn, False, False, 0)
 
+        proxy_btn = Gtk.Button(label="Phone Proxy")
+        proxy_btn.set_tooltip_text(
+            "Mux the selected recording into an iPhone-playable proxy "
+            "(hvc1 + faststart) next to the raw file")
+        proxy_btn.connect("clicked", self._on_make_proxy)
+        list_btns.pack_start(proxy_btn, False, False, 0)
+
         self._stitch_btn = Gtk.Button(label="Stitch Selected")
         self._stitch_btn.connect("clicked", self._on_stitch)
         list_btns.pack_start(self._stitch_btn, False, False, 0)
@@ -616,13 +625,29 @@ class MainWindow(Gtk.ApplicationWindow):
             set_auto_exposure(cam_key)
 
         # Watchdog: a pipeline can reach PLAYING without ever delivering
-        # frames (e.g. the node is the camera's metadata device) — flag it.
+        # frames (e.g. the node is the camera's metadata device, or the
+        # device was just handed over by the daemon and needs a re-open) —
+        # flag it AND restart the preview once.
         GLib.timeout_add(3000, self._check_preview_frames)
 
     def _check_preview_frames(self) -> bool:
-        for side, panel in (("left", self._left_panel), ("right", self._right_panel)):
-            if self._previews.get(side) is not None and not panel.got_frame:
-                panel.set_status("no frames — camera busy or wedged?")
+        for side, panel, cam in (("left", self._left_panel, self._panel_cams[0]),
+                                 ("right", self._right_panel, self._panel_cams[1])):
+            p = self._previews.get(side)
+            if p is not None and not panel.got_frame:
+                panel.set_status("no frames — restarting preview…")
+                p.stop()
+                panel.reset_frame_flag()
+                if camera_present(cam):
+                    p2 = make_preview(camera_device(cam), label=cam)
+                    if side == "left":
+                        cb = lambda d, w, h: self._left_panel.update_frame(d, w, h)
+                    else:
+                        cb = lambda d, w, h: self._right_panel.update_frame(d, w, h)
+                    p2.start(on_frame=cb)
+                    self._previews[side] = p2
+                else:
+                    panel.set_status(f"offline ({cam})")
         return False  # one-shot
 
     def _check_daemon_conflict(self) -> bool:
@@ -661,9 +686,10 @@ class MainWindow(Gtk.ApplicationWindow):
                 req = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/release", method="POST",
                     data=b"{}", headers={"Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=4)
+                urllib.request.urlopen(req, timeout=8)
                 break
-            except OSError:
+            except OSError as e:
+                log.warning("daemon release on port %d failed: %s", port, e)
                 continue
         time.sleep(2)   # let cam2stitch close the cameras
         return False
@@ -920,6 +946,45 @@ class MainWindow(Gtk.ApplicationWindow):
             else:
                 subprocess.Popen(["xdg-open", str(path)],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _on_make_proxy(self, _btn):
+        """Mux the selected recording into an iPhone-playable proxy
+        (hvc1 tag + faststart) next to the raw file, in the background."""
+        rec_id = self._recording_list.get_selected_recording_id()
+        if rec_id is None:
+            return
+        rec = self._db.get(rec_id)
+        if not rec:
+            return
+        raw = Path(rec["file_path"])
+        if not raw.is_absolute():
+            raw = ROOT_DIR / raw
+        # sidecar convention: <name>.raw.h264 + <name>.pts (see engine.py)
+        pts = raw.with_suffix("").with_suffix(".pts")
+        if not raw.exists() or not pts.exists():
+            self.set_title(f"proxy: needs {raw.name} and {pts.name}")
+            return
+        out = raw.with_name(raw.stem.split(".raw")[0] + ".proxy.mp4")
+        codec = "hevc" if raw.suffix == ".hevc" else "h264"
+        self.set_title(f"afl-cam — generating {out.name}…")
+
+        def work():
+            ok = mux_with_pts_rate(raw, pts, out, codec=codec, faststart=True)
+            GLib.idle_add(lambda: self._proxy_done(ok, out))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _proxy_done(self, ok, out):
+        self.set_title("afl-cam")
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=False,
+            message_type=Gtk.MessageType.INFO if ok else Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text=(f"Proxy ready:\n{out}" if ok
+                  else f"Proxy generation failed:\n{out}"))
+        dialog.run()
+        dialog.destroy()
+        self._recording_list.refresh()
 
     def _on_play(self, _btn):
         # Only individual recordings can be played; session rows do nothing.

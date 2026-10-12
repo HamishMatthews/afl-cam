@@ -51,7 +51,8 @@ def measured_fps(pts_us: np.ndarray, fallback: float = 30.0) -> float:
 
 def mux_with_pts_rate(raw: Path, pts_path: Path, out: Path,
                       fallback_fps: float = 30.0,
-                      codec: str = "h264") -> bool:
+                      codec: str = "h264",
+                      faststart: bool = False) -> bool:
     """Mux the raw .h264 ES into .mp4 as CFR at the measured real rate.
 
     Stream copy (no re-encode) — the container timestamps are regular at the
@@ -60,6 +61,9 @@ def mux_with_pts_rate(raw: Path, pts_path: Path, out: Path,
 
     ``codec="hevc"`` tags the stream hvc1 (not hev1): iPhone/QuickTime
     refuse to play hev1-tagged HEVC (iphone-control-plan.md §4).
+
+    ``faststart=True`` moves the moov atom to the front — needed for
+    HTTP streaming (Safari's Range/206 requirement).
     """
     pts = load_pts(pts_path)
     fps = measured_fps(pts, fallback_fps) if pts is not None else fallback_fps
@@ -72,6 +76,8 @@ def mux_with_pts_rate(raw: Path, pts_path: Path, out: Path,
         "-c", "copy"]
     if codec == "hevc":
         args += ["-tag:v", "hvc1"]
+    if faststart:
+        args += ["-movflags", "+faststart"]
     args.append(str(out))
     result = subprocess.run(args, capture_output=True, text=True, timeout=60)
     if result.returncode == 0 and out.exists() and out.stat().st_size > 0:
