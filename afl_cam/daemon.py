@@ -1263,9 +1263,6 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._err("forbidden", status=403)
             ok, msg = self.daemon.intent_realign()
             return self._json({"ok": ok, "error": msg})
-        if path == "/api/release":
-            self.daemon.release_for_ui()
-            return self._ok()
         parts = path.split("/")
         if len(parts) == 5 and parts[1:3] == ["api", "recordings"] \
                 and parts[3].isdigit() and parts[4] == "proxy":
@@ -1280,7 +1277,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _make_proxy(self, sid: int):
         """Generate an iPhone-playable proxy for a session that lacks one
-        (desktop-UI recordings are in the same DB but have no proxy).
+        (older desktop-app and CLI recordings are in the same DB but have no
+        proxy).
         Runs in the background; the phone polls the recordings list."""
         folder = self.daemon.session_folder(sid)
         if folder is None:
@@ -1407,7 +1405,6 @@ class CamDaemon:
         self._cameras_busy: Optional[str] = None   # separate recorders own them
         self.restitch: Optional[RestitchJob] = None
         self._idle_sigterm = False    # we asked the pipeline down (not a crash)
-        self._hold_until = 0.0        # UI handover: don't respawn until then
         self._sigterm_sent_at = 0.0   # SIGTERM'd; SIGKILL if it doesn't exit
         self._sigterm_target = None   # WHICH process we SIGTERM'd — the
                                       # enforcement must never SIGKILL a
@@ -1511,8 +1508,6 @@ class CamDaemon:
         (crash retries) and any recent HTTP/WS activity."""
         if self.stopping:
             return False
-        if time.time() < self._hold_until:
-            return False           # UI handover in progress
         if self.state == "realigning":
             return False           # the re-align chain owns the cameras
         if self._cameras_busy:
@@ -1522,18 +1517,6 @@ class CamDaemon:
         if self._pending_start or self._ws:
             return True
         return time.time() - self._last_http < 2
-
-    def release_for_ui(self):
-        """Hand the cameras to the desktop UI (POST /api/release): close
-        the pipeline and hold off respawning long enough for the UI to
-        open the cameras without a race. The daemon keeps serving the
-        phone page and resumes automatically on the next wake once the
-        UI has closed."""
-        log.info("release: closing the pipeline for the desktop UI")
-        self._last_http = 0.0       # this request must not wake it back up
-        self._set_state("idle")
-        self._hold_until = time.time() + 15
-        self._close_pipeline()
 
     def _close_pipeline(self):
         """Close cam2stitch and wait until the cameras are free. The
@@ -1716,14 +1699,9 @@ class CamDaemon:
                 self._set_state("starting", error=None)
 
             if self.state == "starting":
-                # released for the UI handover: the pipeline being down is
-                # intentional — go idle instead of spinning in "starting"
-                if time.time() < self._hold_until \
-                        and self.supervisor.proc is None:
-                    self._set_state("idle")
                 # adopted pipelines have proc=None — the socket connection
                 # and the pushed status are the liveness proof, not proc
-                elif st is not None and (
+                if st is not None and (
                         self.supervisor.proc is not None
                         or self.supervisor._adopted):
                     if st.get("state") == "recording":
@@ -2195,7 +2173,7 @@ class CamDaemon:
     def make_proxy_for_session(self, session_id: int) -> bool:
         """Ensure <folder>/proxy.mp4 exists (iPhone-playable): remux the
         stitched master, or fall back to the first camera raw + pts.
-        Desktop-UI recordings land in the same DB but never get a proxy."""
+        Older desktop-app and CLI recordings never got a proxy."""
         folder = self.session_folder(session_id)
         if folder is None:
             return False

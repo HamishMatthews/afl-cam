@@ -1,6 +1,6 @@
 #!/bin/bash
-# afl-cam rig test suite — run ON the board, with the desktop UI closed
-# (the tests drive the real daemon + cameras).
+# afl-cam rig test suite — run ON the board (the tests drive the real
+# daemon + cameras).
 #
 #   scripts/run_tests.sh              fast tests (no record cycle)
 #   scripts/run_tests.sh -m slow      everything, including the record cycle

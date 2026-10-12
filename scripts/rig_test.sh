@@ -14,7 +14,7 @@
 # pytest args) runs the record cycle too.
 #
 # Needs: the sudoers rule in deploy/rig-runner.md (systemctl stop/start
-# afl-camd without a password), uv, and the desktop UI closed.
+# afl-camd without a password) and uv.
 set -euo pipefail
 
 TREE=$(realpath "${1:?usage: rig_test.sh <tree> [pytest args]}"); shift
@@ -29,11 +29,6 @@ if ! flock -n 9; then
     flock 9
 fi
 echo "[rig] lock held — testing $TREE"
-
-if pgrep -f "afl_cam.cli ui|afl-cam ui" > /dev/null; then
-    echo "[rig] the desktop UI is running and owns the cameras — close it first" >&2
-    exit 2
-fi
 
 cd "$TREE"
 # calibration/ is board-local (gitignored): share the rig's frozen alignment
