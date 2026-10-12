@@ -1,10 +1,9 @@
 """Extract camera params for the analytic GPU spherical shader.
 
-Intrinsics come from the MEASURED checkerboard calibration
-(calibration/cam{0,1}_calib.npz) — the two cameras' independent 5-coeff fits
-agree on K to 0.04%, the trustworthy signal. The fitted distortion
-coefficients describe the BOARD's waviness (paper board), not the lens, and
-are zeroed: the stitch treats the lens as pinhole + measured K.
+Intrinsics (K and the lens distortion k1, k2, k3) come from the MEASURED
+checkerboard calibration tracked in afl_cam/intrinsics/cam{0,1}.json (refit
+with `python -m afl_cam.lens fit`). The warp is built in the undistorted
+frame and the lens is applied last, so the maps hold raw source coordinates.
 
 The inter-camera rotation R comes from OpenCV's stitcher bundle adjustment
 on the RAW stills (the same estimateTransform flow the product uses) — its R
@@ -23,18 +22,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from afl_cam import stitch_maps  # noqa: E402
+from afl_cam import lens, stitch_maps  # noqa: E402
 from afl_cam.stitcher import Stitcher, _build_uint8_weights, _spherical_bounds, _spherical_maps  # noqa: E402
-
-CALIB_DIR = Path(__file__).resolve().parent.parent / "calibration"
-
-
-def load_measured(cam_key):
-    f = CALIB_DIR / f"{cam_key}_calib.npz"
-    if not f.exists():
-        raise SystemExit(f"missing {f.name} — run scripts/calibrate.py first")
-    d = np.load(f)
-    return {"mtx": d["mtx"], "dist": d["dist"].ravel()}
 
 
 def main() -> None:
@@ -65,9 +54,9 @@ def main() -> None:
     src_w, src_h = f0.shape[1], f0.shape[0]
     full_size = (src_w, src_h)
 
-    calibs = [load_measured("cam0"), load_measured("cam1")]
+    calibs = [lens.load("cam0"), lens.load("cam1")]
     print(f"measured calib: cam0 fx={calibs[0]['mtx'][0,0]:.1f} "
-          f"cam1 fx={calibs[1]['mtx'][0,0]:.1f} (distortion zeroed)")
+          f"cam1 fx={calibs[1]['mtx'][0,0]:.1f} (k1 {calibs[0]['dist'][0]:.4f}/{calibs[1]['dist'][0]:.4f})")
 
     stills = Stitcher()
     stitcher = None
@@ -130,8 +119,9 @@ def main() -> None:
 
     # spherical geometry, plain math (same formulas the GPU shader will use)
     w_scale = float(np.median([cam.focal for cam in cameras])) / work_scale
-    b0 = _spherical_bounds(cameras[0], work_scale, full_size, w_scale)
-    b1 = _spherical_bounds(cameras[1], work_scale, full_size, w_scale)
+    dists = [c["dist"] for c in calibs]
+    b0 = _spherical_bounds(cameras[0], work_scale, full_size, w_scale, dists[0])
+    b1 = _spherical_bounds(cameras[1], work_scale, full_size, w_scale, dists[1])
     min_x = min(b0[0], b1[0])
     max_x = max(b0[0] + b0[2], b1[0] + b1[2])
     min_y = min(b0[1], b1[1])
@@ -141,8 +131,8 @@ def main() -> None:
     # or scaled to a target width (3840 for the live-stitch encoder).
     k_scale = (canvas_width / nat_cw) if canvas_width else 1.0
 
-    m0 = _spherical_maps(cameras[0], work_scale, full_size, k_scale, None, w_scale)
-    m1 = _spherical_maps(cameras[1], work_scale, full_size, k_scale, None, w_scale)
+    m0 = _spherical_maps(cameras[0], work_scale, full_size, k_scale, None, w_scale, dists[0])
+    m1 = _spherical_maps(cameras[1], work_scale, full_size, k_scale, None, w_scale, dists[1])
 
     off0 = (int(round((b0[0] - min_x) * k_scale)), int(round((b0[1] - min_y) * k_scale)))
     off1 = (int(round((b1[0] - min_x) * k_scale)), int(round((b1[1] - min_y) * k_scale)))
@@ -178,9 +168,9 @@ def main() -> None:
     # GPU-ready params: per-cam block (28 floats):
     #   krinv(9) tl(2) off(2) mapwh(2) pin fx,fy,cx,cy(4) raw fx,fy,cx,cy(4)
     #   k1,k2,p1,p2,k3(5)
-    # Distortion is zeroed (see module docstring); the pinhole and raw
-    # matrices are then identical, and the shader's forward-distortion solve
-    # degenerates to a no-op.
+    # The undistorted frame reuses K, so the pinhole and raw matrices are
+    # identical; the lens is already in the maps (the map-texture shader
+    # never reads the dist slots).
     # ALL writes are atomic (tmp + rename): a crash or kill mid-write must
     # never leave truncated files behind — a truncated map set silently
     # breaks the next live-stitch recording (2026-09-01: the 18:58 realign
@@ -201,7 +191,7 @@ def main() -> None:
         for name, mtx in (("K", K), ("R", R)):
             for row in mtx:
                 lines.append(name + str(idx) + " " + " ".join(f"{v:.12g}" for v in row))
-        tl_x, tl_y, _, _ = _spherical_bounds(cameras[idx], work_scale, full_size, w_scale)
+        tl_x, tl_y, _, _ = _spherical_bounds(cameras[idx], work_scale, full_size, w_scale, dists[idx])
         lines.append(f"cam{idx} tl {tl_x} {tl_y}")
         lines.append(f"cam{idx} dist " + " ".join(f"{v:.6g}" for v in calibs[idx]["dist"]))
     atomic_text(out_dir / "cams.txt", "\n".join(lines) + "\n")
@@ -240,8 +230,8 @@ def main() -> None:
     print(f"params.bin: warp_scale={w_scale:.1f}, krinv0={params[8:11]}, "
           f"pin0={params[23:27]}, raw0={params[27:31]}, dist0={params[31:36]}")
 
-    # python-side reference from the same plain math (distortion is zero, so
-    # the stills warp directly — the GPU must match this exactly)
+    # python-side reference from the same plain math (the maps already hold
+    # raw source coords, so the stills warp directly — the GPU must match this)
     warp0 = cv2.remap(f0, m0[0], m0[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     warp1 = cv2.remap(f1, m1[0], m1[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     p0 = np.zeros((out_h, out_w, 3), np.uint8)

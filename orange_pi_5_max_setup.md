@@ -249,7 +249,7 @@ desktop) heating the whole board.
 
 **Stitch ghosting fix (canvas-space rotation refinement).** See README
 "Alignment" — the per-session bundle was degenerate on grass; the frozen
-alignment now uses measured K + `scripts/refine_rotation.py`'s R.
+alignment now uses measured K and lens distortion + `scripts/refine_rotation.py`'s R.
 
 **Camera discovery (2026-09-06).** A camera plugged into a USB 2.0 port
 enumerates on the EHCI companion (`fc800000.usb/usb5/5-1`) instead of

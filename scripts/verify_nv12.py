@@ -22,6 +22,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from afl_cam import lens  # noqa: E402
+
 # Must match the compiled shader (stitch_nv12.comp)
 RANGE_FULL = 0
 
@@ -70,7 +74,7 @@ def rgb_to_v(rgb):
 
 def warp_coords_at(params, cam, xs, ys):
     """Plain-math warp at arbitrary pixel-corner coords (float32).
-    Replicates the shader's warp_cam exactly (distortion zeroed)."""
+    Replicates the shader's warp_cam exactly (lens from the dist slots)."""
     warp_scale = float(params[4])
     base = 8 + cam * 28
     tl_x, tl_y = float(params[base + 9]), float(params[base + 10])
@@ -96,9 +100,12 @@ def warp_coords_at(params, cam, xs, ys):
     z = krinv[2, 0] * dir_x + krinv[2, 1] * dir_y + krinv[2, 2] * dir_z
     valid &= z > 0
 
-    sx = np.where(valid, x / np.maximum(z, 1e-12), -1).astype(np.float32)
-    sy = np.where(valid, y / np.maximum(z, 1e-12), -1).astype(np.float32)
-    return sx, sy
+    K = np.array([[params[base + 15], 0, params[base + 17]],
+                  [0, params[base + 16], params[base + 18]], [0, 0, 1]], np.float64)
+    sx, sy = lens.distort_pixels(np.where(valid, x / np.maximum(z, 1e-12), 0.0),
+                                 np.where(valid, y / np.maximum(z, 1e-12), 0.0),
+                                 K, params[base + 23:base + 28].astype(np.float64))
+    return np.where(valid, sx, -1).astype(np.float32), np.where(valid, sy, -1).astype(np.float32)
 
 
 def warp_coords(params, cam):

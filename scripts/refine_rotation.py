@@ -3,8 +3,8 @@
 The bundle on a grass field is degenerate (focal/R entangled — the last
 session's bundle estimated focal 2125 vs measured 2237 and left a median
 13-28px canvas misalignment between the warps; tile phase-correlation and
-SIFT both confirm). With K fixed from the checkerboard calibration, only the
-RELATIVE rotation between the cameras is unknown.
+SIFT both confirm). With K and the lens distortion fixed from the checkerboard
+calibration, only the RELATIVE rotation between the cameras is unknown.
 
 The cost is what actually shows in the stitched output: for each SIFT match,
 the distance between the two cameras' projections of the point on the SHARED
@@ -29,6 +29,7 @@ from scipy.optimize import least_squares
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from afl_cam import lens  # noqa: E402
 from afl_cam.stitcher import Stitcher  # noqa: E402
 
 INLIER_PX = 2.0
@@ -44,10 +45,13 @@ def rot_perturb(wx, wy, wz):
 
 
 def parse_cams(path):
-    rows = {}
+    rows, dist = {}, {0: np.zeros(5), 1: np.zeros(5)}
     for line in open(path):
         parts = line.split()
         if len(parts) < 2:
+            continue
+        if parts[1] == "dist":     # "cam0 dist k1 k2 p1 p2 k3"
+            dist[int(parts[0][3:])] = np.array(parts[2:], dtype=np.float64)
             continue
         try:
             vals = [float(v) for v in parts[1:]]
@@ -56,7 +60,7 @@ def parse_cams(path):
         rows.setdefault(parts[0], []).append(vals)
     R = {i: np.array(rows[f"R{i}"], dtype=np.float64) for i in (0, 1)}
     K = {i: np.array(rows[f"K{i}"], dtype=np.float64) for i in (0, 1)}
-    return K, R, rows["warp_scale"][0][0]
+    return K, R, dist, rows["warp_scale"][0][0]
 
 
 def two_point_rotation(a1, a2, b1, b2):
@@ -84,24 +88,23 @@ def two_point_rotation(a1, a2, b1, b2):
     return B.T @ A
 
 
-def spherical_uv(R, Ki, pts):
-    """World direction spherical coords (u, v) for image points pts (Nx2)."""
-    d = (R @ (Ki @ np.c_[pts, np.ones(len(pts))].T)).T
+def spherical_uv(R, rays):
+    """World direction spherical coords (u, v) for camera-frame rays (Nx3)."""
+    d = (R @ rays.T).T
     n = np.linalg.norm(d, axis=1)
     u = np.arctan2(d[:, 0], d[:, 2])
     v = np.pi - np.arccos(np.clip(d[:, 1] / n, -1, 1))
     return u, v
 
 
-def canvas_residual(R1, K, R0, pts0, pts1, w_scale):
+def canvas_residual(R1, R0, rays0, rays1, w_scale):
     """Canvas-space distance (px) between the two projections of each match.
 
     The canvas offset is shared (min of bounds), so it cancels from the
     difference: residual = w_scale * hypot(du, dv).
     """
-    K0i, K1i = np.linalg.inv(K[0]), np.linalg.inv(K[1])
-    u0, v0 = spherical_uv(R0, K0i, pts0)
-    u1, v1 = spherical_uv(R1, K1i, pts1)
+    u0, v0 = spherical_uv(R0, rays0)
+    u1, v1 = spherical_uv(R1, rays1)
     return w_scale * np.hypot(u0 - u1, v0 - v1)
 
 
@@ -152,9 +155,8 @@ def main():
         del argv[i:i + 2]
 
     stills = Stitcher()
-    K, R, w_scale = parse_cams(cams_path)
+    K, R, dist, w_scale = parse_cams(cams_path)
     R0, R1 = R[0].copy(), R[1].copy()
-    K0i, K1i = np.linalg.inv(K[0]), np.linalg.inv(K[1])
 
     pts0, pts1 = match_features(stills, f0, f1)
     if (ymin, ymax) != (0.0, 1.0):
@@ -164,12 +166,14 @@ def main():
     print(f"{len(pts0)} matches (SIFT, cross-check + Lowe 0.75, "
           f"band {ymin:.2f}-{ymax:.2f})")
 
-    d0 = (R0 @ (K0i @ np.c_[pts0, np.ones(len(pts0))].T)).T
-    d1 = (R1 @ (K1i @ np.c_[pts1, np.ones(len(pts1))].T)).T
+    rays0 = lens.unproject(pts0, K[0], dist[0])    # undistorted once, not per hypothesis
+    rays1 = lens.unproject(pts1, K[1], dist[1])
+    d0 = (R0 @ rays0.T).T
+    d1 = (R1 @ rays1.T).T
     d0 /= np.linalg.norm(d0, axis=1, keepdims=True)
     d1 /= np.linalg.norm(d1, axis=1, keepdims=True)
 
-    base = canvas_residual(R1, K, R0, pts0, pts1, w_scale)
+    base = canvas_residual(R1, R0, rays0, rays1, w_scale)
     print(f"current alignment: canvas residual median {np.median(base):.1f}px, "
           f"<{INLIER_PX}px: {(base < INLIER_PX).sum()}/{len(pts0)}")
 
@@ -183,7 +187,7 @@ def main():
             continue
         # Rr maps d0->d1; the corrected R1 maps d1 back to d0: R1c = Rr^T @ R1
         R1c = Rr.T @ R1
-        res = canvas_residual(R1c, K, R0, pts0, pts1, w_scale)
+        res = canvas_residual(R1c, R0, rays0, rays1, w_scale)
         ninl = int((res < INLIER_PX).sum())
         if ninl > best_inl:
             best_inl, best_R1 = ninl, R1c
@@ -193,21 +197,21 @@ def main():
         raise SystemExit("no rotation explains the matches — capture better "
                          "stills (more distinctive content in the overlap)")
 
-    inl_mask = canvas_residual(best_R1, K, R0, pts0, pts1, w_scale) < INLIER_PX
-    pts0i, pts1i = pts0[inl_mask], pts1[inl_mask]
-    print(f"refining on {len(pts0i)} inliers")
+    inl_mask = canvas_residual(best_R1, R0, rays0, rays1, w_scale) < INLIER_PX
+    rays0i, rays1i = rays0[inl_mask], rays1[inl_mask]
+    print(f"refining on {len(rays0i)} inliers")
 
     def cost(w):
         Rp = rot_perturb(w[0], w[1], w[2])
-        return canvas_residual(Rp @ best_R1, K, R0, pts0i, pts1i, w_scale)
+        return canvas_residual(Rp @ best_R1, R0, rays0i, rays1i, w_scale)
 
     res = least_squares(cost, np.zeros(3), method="lm", max_nfev=50)
     R1_ref = rot_perturb(res.x[0], res.x[1], res.x[2]) @ best_R1
     if abs(np.linalg.det(R1_ref) - 1.0) > 1e-6:
         raise SystemExit("refined R is not a proper rotation — degenerate data")
 
-    final = canvas_residual(R1_ref, K, R0, pts0i, pts1i, w_scale)
-    all_res = canvas_residual(R1_ref, K, R0, pts0, pts1, w_scale)
+    final = canvas_residual(R1_ref, R0, rays0i, rays1i, w_scale)
+    all_res = canvas_residual(R1_ref, R0, rays0, rays1, w_scale)
     print(f"refined inlier residual: median {np.median(final):.3f}px "
           f"mean {np.mean(final):.3f}px p90 {np.percentile(final, 90):.3f}px")
     print(f"all matches: median {np.median(all_res):.1f}px, "

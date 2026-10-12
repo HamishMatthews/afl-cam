@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Any
 import cv2
 import numpy as np
 
-from . import stitch_maps
+from . import lens, stitch_maps
 from .pairing import pair_frames
 
 log = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ class VideoStitcher:
         scene and roughly 20%+ overlap, else calibration fails)."""
         # Static rig: re-stitch with the live map set itself, so a separate-
         # mode recording stitches exactly as cam2stitch would have (same
-        # geometry, same weights, distortion zeroed). The per-session
+        # geometry, same weights). The per-session
         # bundle below is the fallback for a missing/torn re-align.
         live = None if os.environ.get("AFL_CAM_REBUNDLE") == "1" else stitch_maps.try_load(self._maps_dir)
         if live is not None:
@@ -308,7 +308,8 @@ def _camera_matrices(cam: Any, work_scale: float) -> Tuple[np.ndarray, np.ndarra
     return k, r
 
 
-def _spherical_bounds(cam: Any, work_scale: float, full_size: Tuple[int, int], warp_scale: float) -> Tuple[int, int, int, int]:
+def _spherical_bounds(cam: Any, work_scale: float, full_size: Tuple[int, int], warp_scale: float,
+                      dist: Optional[np.ndarray] = None) -> Tuple[int, int, int, int]:
     k, r = _camera_matrices(cam, work_scale)
     r_kinv = r @ np.linalg.inv(k)
     fw, fh = full_size
@@ -317,6 +318,7 @@ def _spherical_bounds(cam: Any, work_scale: float, full_size: Tuple[int, int], w
                          np.zeros(fh, dtype=np.float64), np.full(fh, fw - 1, dtype=np.float64)])
     ys = np.concatenate([np.zeros(fw, dtype=np.float64), np.full(fw, fh - 1, dtype=np.float64),
                          np.arange(fh, dtype=np.float64), np.arange(fh, dtype=np.float64)])
+    xs, ys = lens.undistort_pixels(xs, ys, k, dist)   # the raw frame's edge, as a pinhole sees it
 
     p = r_kinv @ np.stack([xs, ys, np.ones_like(xs)])
     x, y, z = p[0], p[1], p[2]
@@ -335,6 +337,7 @@ def _spherical_bounds(cam: Any, work_scale: float, full_size: Tuple[int, int], w
         if vy > 0:
             x_ = (k[0, 0] * vx + k[0, 1] * vy) / vz + k[0, 2]
             y_ = k[1, 1] * vy / vz + k[1, 2]
+            x_, y_ = lens.distort_pixels(x_, y_, k, dist)
             if 0 < x_ < fw and 0 < y_ < fh:
                 pole_v = float(np.pi * warp_scale) if sgn > 0 else 0.0
                 tl_u = min(tl_u, 0.0)
@@ -348,10 +351,14 @@ def _spherical_bounds(cam: Any, work_scale: float, full_size: Tuple[int, int], w
 
 
 def _spherical_maps(cam: Any, work_scale: float, full_size: Tuple[int, int], scale_k: float,
-                    undist_maps: Optional[Tuple[np.ndarray, np.ndarray]], warp_scale: float) -> Tuple[np.ndarray, np.ndarray]:
+                    undist_maps: Optional[Tuple[np.ndarray, np.ndarray]], warp_scale: float,
+                    dist: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """dist: the lens (k1, k2, p1, p2, k3) of a camera whose K is `cam`'s; the maps then
+    hold raw source pixels. `undist_maps` is the older route to the same end (cv2's
+    undistort maps) for cameras described by a separate calibration."""
     k_mtx, r_mtx = _camera_matrices(cam, work_scale)
     k_rinv = k_mtx @ r_mtx.T
-    tl_x, tl_y, nat_w, nat_h = _spherical_bounds(cam, work_scale, full_size, warp_scale)
+    tl_x, tl_y, nat_w, nat_h = _spherical_bounds(cam, work_scale, full_size, warp_scale, dist)
 
     tw, th = int(round(nat_w * scale_k)) // 2 * 2, int(round(nat_h * scale_k)) // 2 * 2
 
@@ -371,8 +378,11 @@ def _spherical_maps(cam: Any, work_scale: float, full_size: Tuple[int, int], sca
     z = k_rinv[2, 0] * x_ + k_rinv[2, 1] * y_ + k_rinv[2, 2] * z_
 
     valid = z > 0
-    xmap = np.where(valid, x / np.maximum(z, 1e-12), -1).astype(np.float32)
-    ymap = np.where(valid, y / np.maximum(z, 1e-12), -1).astype(np.float32)
+    xmap = np.where(valid, x / np.maximum(z, 1e-12), 0.0)
+    ymap = np.where(valid, y / np.maximum(z, 1e-12), 0.0)
+    xmap, ymap = lens.distort_pixels(xmap, ymap, k_mtx, dist)
+    xmap = np.where(valid, xmap, -1).astype(np.float32)
+    ymap = np.where(valid, ymap, -1).astype(np.float32)
 
     if undist_maps is not None:
         # Compose with undistortion: the spherical maps point into
