@@ -25,6 +25,8 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   `AGENTS.md` first.** Development happens off the board; the board only
   runs tests (`scripts/rig_test.sh`, queued on a lock). Work on a branch
   per issue and open a PR against `main`; never push to `main` directly.
+- **No AI attribution** in commits or PRs: never add a `Co-Authored-By`
+  trailer or a "Generated with Claude Code" line.
 - Field remote (iPhone): primary = the afl-camd daemon (port 80, web UI +
   WHEP/HLS preview via MediaMTX on :8889/:8888). **Productionised
   (2026-10-09): `scripts/install_field_services.sh` enables systemd units
