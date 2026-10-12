@@ -1,6 +1,6 @@
 [Unit]
 Description=afl-camd field recording daemon (iPhone control + web UI + API)
-Documentation=file:/home/hamish/Documents/afl-cam/iphone-control-plan.md
+Documentation=file:/home/hamish/Documents/afl-cam/docs/archive/iphone-control-plan.md
 After=network-online.target mediamtx.service
 Wants=network-online.target mediamtx.service
 

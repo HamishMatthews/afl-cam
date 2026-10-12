@@ -1,3 +1,5 @@
+> **Historical**: superseded design plan; the single source of truth is [CLAUDE.md](../../CLAUDE.md).
+
 # Hardware Stitching at Record Time — Plan
 
 > **Superseded 2026-08-25 by [live_stitch_plan.md](live_stitch_plan.md).** The RGA

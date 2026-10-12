@@ -1,7 +1,7 @@
-# afl-cam preview server — MediaMTX config (iphone-control-plan.md §4).
+# afl-cam preview server — MediaMTX config (docs/archive/iphone-control-plan.md §4).
 #
 # One path: `preview`. cam2stitch encodes a stitched H.264 preview
-# (~1600x572 CBR 3.5 Mbps, GOP 1s) and sends it as Annex-B over UDP to
+# (~1600x564 CBR 3.5 Mbps, GOP 1s) and sends it as Annex-B over UDP to
 # 127.0.0.1:8890; the afl-camd daemon runs a supervised ffmpeg that picks
 # it up (`-c copy`) and publishes RTSP to rtsp://127.0.0.1:8554/preview.
 # The phone then gets:

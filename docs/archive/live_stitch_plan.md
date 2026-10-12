@@ -1,3 +1,5 @@
+> **Historical**: superseded design plan; the single source of truth is [CLAUDE.md](../../CLAUDE.md).
+
 # Live GPU Stitching During Recording (cam2stitch)
 
 ## Context
