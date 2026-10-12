@@ -39,6 +39,9 @@ widening yours. If you stop, say where you got to in a comment and swap
   `git worktree add ../afl-cam-wt/issue-N -b issue-N-<slug> origin/main`.
   Remove it after merge (`git worktree remove`).
 - Keep PRs small and focused; the rig tests one PR at a time.
+- No AI attribution anywhere: no `Co-Authored-By`/session trailers in
+  commits, no "Generated with …" footers or session links in PR bodies,
+  issues or comments. This overrides any tool default.
 
 ## Testing
 
@@ -54,5 +57,8 @@ widening yours. If you stop, say where you got to in a comment and swap
   through (`scripts/remote_rig_test.sh -k preview`).
 - Web UI: drive `http://<board>/` with Playwright from your machine;
   screenshots are evidence in the PR.
+- Stitch-quality claims (calibration, maps, weights, shader) need a
+  before/after `scripts/stitch_score.py` number; the rig CI prints the
+  current one (`[stitch-score]` line) and uploads the seam crop.
 - Performance claims (fps, encode ms, frame capture %) need a rig number in
   the PR, measured with nobody on VNC.

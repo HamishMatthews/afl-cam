@@ -51,3 +51,4 @@ Thumbs.db
 # MediaMTX auto-generated TLS material (created in cwd at first start)
 auto.crt
 auto.key
+rig-artifacts/

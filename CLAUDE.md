@@ -83,8 +83,11 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - `scripts/recapture_alignment.py` — re-align chain (UI button backend):
   stills → `dump_camera_params.py` (bundle) → `refine_rotation.py` →
   `dump_camera_params.py --r1` (final, atomic writes).
-- `scripts/measure_alignment.py` — overlap misalignment ruler (see metric
-  trap below).
+- `afl_cam/stitch_score.py` + `scripts/stitch_score.py` — THE stitch
+  quality score (overlap misalignment median/p95 px, exposure step, seam
+  crop) on a frame pair + live map set; the rig CI prints it and uploads
+  the crop (`stitch-score` artifact). `scripts/measure_alignment.py`
+  compares alignment variants with the same ruler.
 
 ## Hard-won invariants (violating these cost days last time)
 
@@ -146,10 +149,12 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   per-session bundling as the primary path.
 - **Metric traps**: ray-direction angular residuals measure the cameras'
   toe-in angle, NOT stitch alignment (per-camera `tl` absorbs toe-in) — only
-  canvas-space residuals measure ghosting. Tile phase-correlation over-reads
-  cross-camera shifts (differing exposure/gain decorrelate fine texture) —
-  always Gaussian-blur σ=8 first; validated: same-image synthetic shifts read
-  exactly, blurred cross-camera reads ~0.35 px when aligned.
+  canvas-space residuals measure ghosting. Unblurred tile matching
+  over-reads cross-camera shifts (differing exposure/gain decorrelate fine
+  texture) — always Gaussian-blur σ=8 first. The ruler is normalised
+  cross-correlation with a sub-pixel peak (2026-10-12): the old phase
+  correlation of gradient energy UNDER-read small shifts ~2× (a 2 px ghost
+  read 1.0 px), so older "~0.5 px" figures are optimistic.
 - **Exposure**: the cameras' auto-exposure picks the sensor rate (dim scene =
   ~50 ms exposure = 20 fps); manual exposure without light records BLACK
   frames (no V4L2 gain control exists). The recorder's "auto-settle-then-lock"
@@ -215,7 +220,9 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
 - Live stitch at 5304×1876 canvas, quality parity with `cv2.remap` math
   (Y corr 0.999965), encoder + GPU pipelined ≈ 30 fps capacity.
 - Frozen alignment refined for the static rig: overlap misalignment ~0.5 px
-  median (was 13–70 px before the canvas-space refinement). Near-field grass
+  median by the old (under-reading) ruler; the accurate ruler reads median
+  18 px / p95 33 px and a 1.24× exposure ratio on the re-align stills
+  (2026-10-12) — the rig CI's stitch-score line has the current number (was 13–70 px before the canvas-space refinement). Near-field grass
   (~19 px bottom band) is genuine parallax — physics, not a bug.
 - Re-align button works end-to-end and streams logs; dump writes are atomic.
 - Live preview while recording: the recorders write the raw 4K UVC JPEG

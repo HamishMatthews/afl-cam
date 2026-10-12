@@ -25,6 +25,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from afl_cam.stitch_score import residual_stats  # noqa: E402
 from afl_cam.stitcher import Stitcher, _camera_matrices, _spherical_bounds, _spherical_maps  # noqa: E402
 
 CALIB_DIR = REPO / "calibration"
@@ -83,47 +84,6 @@ def overlap_crops(out_w, m0, m1, off0, off1):
     c0 = (oy0 - off0[1], oy1 - off0[1], ox0 - off0[0], ox1 - off0[0])
     c1 = (oy0 - off1[1], oy1 - off1[1], ox0 - off1[0], ox1 - off1[0])
     return c0, c1, (oy0, oy1, ox0, ox1)
-
-
-def residual_stats(g0, g1, tile=96, stride=48):
-    """Tiled phase-correlation shift |dx| between two aligned patches.
-
-    g0/g1: grayscale float32 arrays of the same shape (the overlap crops).
-    CROSS-CAMERA PITFALL: the two cameras' different exposure/gain give
-    decorrelated fine texture (noise), which phase correlation latches onto
-    and over-reads shifts (3-26px of noise measured on perfectly aligned
-    content). The fix is a lowpass pre-filter (sigma 8) — large-scale
-    content correlates across cameras and reads sub-pixel when aligned.
-    Returns (shifts, tiles) where shifts are (x, y, magnitude) per tile.
-    """
-    g0 = cv2.GaussianBlur(g0, (0, 0), 8)
-    g1 = cv2.GaussianBlur(g1, (0, 0), 8)
-    e0 = cv2.Sobel(g0, cv2.CV_32F, 1, 0, ksize=3) ** 2 + cv2.Sobel(g0, cv2.CV_32F, 0, 1, ksize=3) ** 2
-    e1 = cv2.Sobel(g1, cv2.CV_32F, 1, 0, ksize=3) ** 2 + cv2.Sobel(g1, cv2.CV_32F, 0, 1, ksize=3) ** 2
-    hann = np.hanning(tile)[:, None] * np.hanning(tile)[None, :]
-    shifts = []
-    for y in range(0, g0.shape[0] - tile + 1, stride):
-        for x in range(0, g0.shape[1] - tile + 1, stride):
-            a = e0[y:y + tile, x:x + tile] * hann
-            b = e1[y:y + tile, x:x + tile] * hann
-            if a.std() < 0.5 or b.std() < 0.5:  # textureless tile
-                continue
-            (dx, dy), resp = cv2.phaseCorrelate(a.astype(np.float64), b.astype(np.float64))
-            if resp < 0.05:  # low confidence
-                continue
-            shifts.append((x + tile / 2, y + tile / 2, dx, dy, np.hypot(dx, dy)))
-    if not shifts:
-        return None
-    arr = np.asarray(shifts)
-    mags = arr[:, 4]
-    return {
-        "n_tiles": len(shifts),
-        "median": float(np.median(mags)),
-        "mean": float(np.mean(mags)),
-        "p90": float(np.percentile(mags, 90)),
-        "max": float(np.max(mags)),
-        "tiles": arr,
-    }
 
 
 def measure_variant(label, cams, work_scale, f0, f1, w_scale, k=1.0, tag=""):
