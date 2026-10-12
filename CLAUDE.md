@@ -70,9 +70,13 @@ UVC MJPEG cameras in a static rig. The deliverable C code lives in
   (`calibration/stitch_live_full`), `STITCH_CANVAS_WIDTH=5304`, Vulkan env,
   `build_cam2stitch()`/`vk_env()` helpers (stdlib, shared with the daemon).
 - `afl_cam/engine.py` — spawns recorders, `can_live_stitch()` gate.
-- `afl_cam/stitcher.py` — post-stitch engine; **uses the frozen alignment
-  when `calibration/stitch_live_full/map0.bin` is non-empty**
-  (`AFL_CAM_REBUNDLE=1` restores per-session bundling).
+- `afl_cam/stitch_maps.py` — THE map-set format (params.bin, map0/1.bin,
+  w0/1.bin): one writer (`dump_camera_params.py`), read by cam2stitch and
+  the offline stitcher.
+- `afl_cam/stitcher.py` — separate-mode re-stitch; **warps with the live
+  map set itself** (same geometry + weights as cam2stitch, distortion
+  zeroed), so a re-stitch of per-camera files reproduces the live stitch
+  (`AFL_CAM_REBUNDLE=1` or a missing/torn set → per-session bundling).
 - `afl_cam/ui.py` — GTK3 app; Re-align button streams output to the terminal.
 - `afl_cam/retime.py` — VFR→CFR remux from `.pts` sidecars; HEVC muxes are
   tagged `hvc1` (iPhone/QuickTime refuse `hev1`).

@@ -4,13 +4,13 @@ import logging
 import os
 import subprocess
 import time
-import types
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
 import cv2
 import numpy as np
 
+from . import stitch_maps
 from .pairing import pair_frames
 
 log = logging.getLogger(__name__)
@@ -19,46 +19,12 @@ _PKG_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _PKG_DIR.parent
 _CALIB_DIR = _PROJECT_DIR / "calibration"
 _OUTPUTS_DIR = _PROJECT_DIR / "outputs"
-# Frozen live-stitch alignment (measured K + refined R from the re-align
-# workflow). The rig is static, so the quality path uses these instead of
+# Frozen live-stitch map set (measured K + refined R from the re-align
+# workflow, written by dump_camera_params.py and read by cam2stitch). The rig
+# is static, so re-stitching uses these exact maps + weights instead of
 # re-bundling per session — the 2-view bundle is degenerate on feature-poor
 # scenes (focal/R entangled) and leaves 10-30px ghosting in the overlap.
-_FROZEN_CAMS = _CALIB_DIR / "stitch_live_full" / "cams.txt"
-_FROZEN_MAP0 = _CALIB_DIR / "stitch_live_full" / "map0.bin"
-
-
-def _load_frozen_cams() -> Optional[List[Any]]:
-    """Frozen camera params for the static rig, or None (re-bundle instead).
-
-    Gated on the maps being non-empty: a crashed re-align leaves 0-byte
-    maps (2026-09-01) and the bundle R in that state is garbage. Set
-    AFL_CAM_REBUNDLE=1 to force the per-session bundle.
-    """
-    if os.environ.get("AFL_CAM_REBUNDLE") == "1":
-        return None
-    try:
-        if _FROZEN_MAP0.stat().st_size == 0:
-            return None
-        rows: Dict[str, List[List[float]]] = {}
-        for line in open(_FROZEN_CAMS):
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            try:
-                rows.setdefault(parts[0], []).append([float(v) for v in parts[1:]])
-            except ValueError:
-                continue
-        K = {i: np.array(rows[f"K{i}"], dtype=np.float64) for i in (0, 1)}
-        R = {i: np.array(rows[f"R{i}"], dtype=np.float64) for i in (0, 1)}
-    except (OSError, KeyError, ValueError):
-        return None
-    cams = []
-    for i in (0, 1):
-        m = K[i]
-        cams.append(types.SimpleNamespace(
-            focal=m[0, 0], ppx=m[0, 2], ppy=m[1, 2],
-            aspect=m[1, 1] / m[0, 0], R=R[i].ravel()))
-    return cams
+_LIVE_MAPS_DIR = _CALIB_DIR / "stitch_live_full"
 
 
 class Stitcher:
@@ -112,13 +78,15 @@ class VideoStitcher:
     """Panorama stitching for video frame pairs."""
 
     def __init__(self, calib_dir: Optional[Path] = None, *, mode: str = "quality",
-                 blend_px: int = 300, output_width: int = 3840):
+                 blend_px: int = 300, output_width: int = 3840,
+                 maps_dir: Optional[Path] = None):
         if mode not in ("quality", "fast"):
             raise ValueError(f"mode must be 'quality' or 'fast', got '{mode}'")
         self._mode = mode
         self._stills = Stitcher(calib_dir=calib_dir)
         self._blend_px = blend_px
         self._output_width = output_width
+        self._maps_dir = maps_dir if maps_dir is not None else _LIVE_MAPS_DIR
         self._output_shape: Optional[Tuple[int, int]] = None
         self._out_buffer: Optional[np.ndarray] = None
 
@@ -139,10 +107,6 @@ class VideoStitcher:
         self._dy: float = 0.0
 
     def calibrate(self, left: np.ndarray, right: np.ndarray) -> bool:
-        # One method: the spherical quality path.  Saved camera params are
-        # reused across sessions (the cameras are static); they are verified
-        # against the frames and re-estimated if the cameras moved.  If the
-        # estimate fails, calibrate fails — no fallbacks.
         return self._calibrate_quality(left, right)
 
     def stitch(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
@@ -159,27 +123,26 @@ class VideoStitcher:
         return self._ref_pano
 
     def _calibrate_quality(self, left: np.ndarray, right: np.ndarray) -> bool:
-        """Estimate the camera geometry fresh from these frames.
+        """Set up the warp: the live map set when it exists, otherwise a
+        per-session bundle estimate from these frames (needs a matchable
+        scene and roughly 20%+ overlap, else calibration fails)."""
+        # Static rig: re-stitch with the live map set itself, so a separate-
+        # mode recording stitches exactly as cam2stitch would have (same
+        # geometry, same weights, distortion zeroed). The per-session
+        # bundle below is the fallback for a missing/torn re-align.
+        live = None if os.environ.get("AFL_CAM_REBUNDLE") == "1" else stitch_maps.try_load(self._maps_dir)
+        if live is not None:
+            if (left.shape[1], left.shape[0]) != live.src or right.shape[:2] != left.shape[:2]:
+                raise StitchError(
+                    f"frames are {left.shape[1]}x{left.shape[0]} but the live maps in "
+                    f"{self._maps_dir} expect {live.src[0]}x{live.src[1]} raw camera frames")
+            log.info("using the live map set from %s (rig is static)", self._maps_dir)
+            self._use_live_maps(live)
+            self._ref_pano = self._stitch_quality(left, right).copy()
+            return True
 
-        The cameras are calibrated on every recording — no persisted state,
-        no fallbacks.  The estimator needs a matchable scene and roughly
-        20%+ overlap; otherwise calibration fails and the stitch is refused.
-        """
         left, right = self._stills._undistort_pair(left, right)
         full_w = left.shape[1]
-
-        # Static rig: use the frozen alignment (measured K + refined R) when
-        # it exists. The per-session bundle below is the fallback for a
-        # missing/broken re-align.
-        frozen = _load_frozen_cams()
-        if frozen is not None:
-            log.info("using frozen alignment from %s (rig is static)", _FROZEN_CAMS)
-            if self._build_quality_maps(left, right, frozen, 1.0):
-                ref = self._stitch_quality(left, right)
-                if ref is not None:
-                    self._ref_pano = ref
-                return True
-            log.warning("frozen alignment failed to build maps — re-bundling")
 
         stitcher = None
         cameras = None
@@ -214,6 +177,37 @@ class VideoStitcher:
             self._ref_pano = pano
 
         return self._build_quality_maps(left, right, cameras, work_scale)
+
+    def _use_live_maps(self, live: "stitch_maps.LiveMaps") -> None:
+        """Set up the remap/blend state from a live map set. Outside the two
+        ROIs' intersection the weights are 0/255 (dump_camera_params builds
+        them that way), so blending only that intersection reproduces the
+        GPU's per-pixel w0*cam0 + w1*cam1 exactly."""
+        cw, ch = live.canvas
+        rois, masks, maps = [], [], []
+        for cam in live.cams:
+            mh, mw = cam.map.shape[:2]
+            x0, y0 = cam.off
+            roi = (y0, y0 + mh, x0, x0 + mw)
+            rois.append(roi)
+            masks.append(((cam.weight[roi[0]:roi[1], roi[2]:roi[3]] > 0)
+                          & (cam.map[:, :, 0] >= 0)).astype(np.uint8) * 255)
+            maps.append(cv2.convertMaps(cam.map[:, :, 0], cam.map[:, :, 1], cv2.CV_16SC2))
+        self._map0, self._map1 = maps
+        self._roi0, self._roi1 = rois
+        self._mask0, self._mask1 = masks
+        self._output_shape = (ch, cw)
+        self._out_buffer = np.zeros((ch, cw, 3), dtype=np.uint8)
+
+        r0, r1 = self._roi0, self._roi1
+        oy0, oy1 = max(r0[0], r1[0]), min(r0[1], r1[1])
+        ox0, ox1 = max(r0[2], r1[2]), min(r0[3], r1[3])
+        self._overlap_roi = (oy0, oy1, ox0, ox1)
+        self._overlap_c0 = (oy0 - r0[0], oy1 - r0[0], ox0 - r0[2], ox1 - r0[2])
+        self._overlap_c1 = (oy0 - r1[0], oy1 - r1[0], ox0 - r1[2], ox1 - r1[2])
+        w0, w1 = (cam.weight[oy0:oy1, ox0:ox1] for cam in live.cams)
+        self._w0_color = np.repeat(w0[:, :, np.newaxis], 3, axis=2).astype(np.float32) / 255.0
+        self._w1_color = np.repeat(w1[:, :, np.newaxis], 3, axis=2).astype(np.float32) / 255.0
 
     def _build_quality_maps(self, left: np.ndarray, right: np.ndarray, cameras: List[Any], work_scale: float) -> bool:
         full_size = (left.shape[1], left.shape[0])
