@@ -105,7 +105,6 @@ HTTP_FALLBACK_PORT = 8080
 IDLE_STOP_SECS = float(os.environ.get("AFL_CAM_IDLE_SECS", "600"))
 TEMP_STOP_C = float(os.environ.get("AFL_CAM_TEMP_STOP_C", "80"))
 STORAGE_STOP_GB = float(os.environ.get("AFL_CAM_STORAGE_STOP_GB", "10"))
-SUDO_PASS = os.environ.get("AFL_CAM_SUDO_PASS", "123")
 AUTH_TOKEN = os.environ.get("AFL_CAM_TOKEN", "")
 GPIO_BTN = os.environ.get("AFL_CAM_GPIO_BTN", "")
 GPIO_LED = os.environ.get("AFL_CAM_GPIO_LED", "")
@@ -2315,20 +2314,16 @@ class CamDaemon:
 
     def set_clock(self, epoch_ms: int) -> tuple[bool, str]:
         """Set the board clock from the phone (offline AP = no NTP), but
-        only when it has not synced since boot."""
+        only when it has not synced since boot. Needs CAP_SYS_TIME, granted
+        by the afl-camd.service AmbientCapabilities."""
         if self._clock_synced:
             return True, "already synced"
         stamp = datetime.fromtimestamp(epoch_ms / 1000)
         log.info("clock: setting from phone: %s", stamp)
         try:
-            proc = subprocess.run(
-                ["sudo", "-S", "-p", "", "date", "-s", f"@{epoch_ms // 1000}"],
-                input=SUDO_PASS + "\n", capture_output=True, text=True,
-                timeout=10)
-        except (OSError, subprocess.SubprocessError) as e:
-            return False, f"date failed: {e}"
-        if proc.returncode != 0:
-            return False, f"date refused: {proc.stderr.strip()[:80]}"
+            time.clock_settime(time.CLOCK_REALTIME, epoch_ms / 1000)
+        except OSError as e:
+            return False, f"clock_settime failed: {e}"
         self._clock_synced = True
         return True, ""
 
