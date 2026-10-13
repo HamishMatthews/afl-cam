@@ -61,7 +61,7 @@ def _diagnose():
     for k, d in devs.items():
         print(f"[fps-diag] {k} controls:\n" + _v4l(d, "-L"))
         print(f"[fps-diag] {k} format/fps:\n" + _v4l(d, "--get-fmt-video", "--get-parm"))
-    log = Path("rig-daemon.log")
+    log = Path("outputs/_live/stitch.log")
     if log.exists():
         lines = [l for l in log.read_text(errors="replace").splitlines()
                  if re.search(r"exposure|fps|frame interval|S_PARM", l)]
@@ -82,6 +82,18 @@ def _diagnose():
             _v4l(d, "--set-ctrl=exposure_dynamic_framerate=1")
     else:
         print("[fps-diag] no exposure_dynamic_framerate control on these cameras")
+
+    # frame rate against a fixed exposure (100 us units): is the rate
+    # exposure-limited? Both cameras at once, then back to auto.
+    for exp in (50, 100, 200, 250, 300, 400):
+        for d in devs.values():
+            _v4l(d, "--set-ctrl=auto_exposure=1", f"--set-ctrl=exposure_time_absolute={exp}")
+        time.sleep(3)
+        print(f"[fps-diag] manual exposure {exp} ({exp / 10:.0f} ms):", _rate(6))
+    for d in devs.values():
+        _v4l(d, "--set-ctrl=auto_exposure=3")
+    time.sleep(3)
+    print("[fps-diag] back to auto:", _rate(6))
 
     for k, d in devs.items():
         print(f"[fps-diag] {k} exposure now:",
