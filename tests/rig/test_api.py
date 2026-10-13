@@ -58,3 +58,8 @@ def test_crop_setting_switches_the_canvas():
     finally:
         assert post("/api/crop", {"enabled": False}).get("ok") is True
     assert wait_canvas(False)["canvas"] == full
+    # leave a settled preview behind: the pusher restarts on a size change
+    deadline = time.time() + 60
+    while time.time() < deadline and not (status().get("preview") or {}).get("chain"):
+        time.sleep(1)
+    time.sleep(5)

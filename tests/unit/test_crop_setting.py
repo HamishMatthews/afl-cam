@@ -79,9 +79,11 @@ def test_pipeline_start_uses_the_crop_set_and_falls_back(env):
 def test_changing_it_restarts_an_idle_pipeline(env):
     cam = make_daemon()
     cam.state = "standby"
+    stopped = []
+    cam.preview_chain.stop = lambda: stopped.append(True)   # the pusher restarts on a new size
     assert cam.set_crop(True) == (True, "")
     assert cam.state == "idle" and cam._idle_sigterm
-    assert cam.supervisor.proc.signals == [15]
+    assert cam.supervisor.proc.signals == [15] and stopped == [True]
 
     cam2 = make_daemon()                                # not running: just remembered
     cam2.state = "idle"

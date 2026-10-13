@@ -1761,6 +1761,10 @@ class CamDaemon:
                         self.supervisor.command("QUIT", timeout=3)
                     except Exception:
                         pass
+                # the preview changes size: a running ffmpeg pusher cannot
+                # follow a new resolution mid-stream (it would drop out later,
+                # taking the HLS/WebRTC stream with it), so start it afresh
+                self.preview_chain.stop()
         log.info("crop: %s", "on" if enabled else "off")
         return True, ""
 
