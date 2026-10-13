@@ -28,8 +28,11 @@ def test_each_view_belongs_to_a_tab():
     assert set(TABS) <= views
 
 
-def test_shell_has_state_banner_and_tab_bar():
-    assert 'id="statebar"' in HTML and 'class="tabbar"' in HTML
+def test_shell_has_one_status_indicator_and_tab_bar():
+    # a single pill, top right: no second state bar, no separate live dot
+    assert 'id="chip"' in HTML and 'class="tabbar"' in HTML
+    assert 'id="statebar"' not in HTML and 'id="link"' not in HTML
+    assert 'id="hint"' in HTML
     assert "safe-area-inset-bottom" in HTML
     assert "prefers-reduced-motion" in HTML
 
@@ -75,8 +78,9 @@ def test_readiness_flags_each_problem():
     assert _verdict(_samples(fps=15), GOOD_LAST)["frame rate"] == "warn"
     assert _verdict(_samples(fps=5), GOOD_LAST)["frame rate"] == "fail"
     assert _verdict(_samples(skew=100), GOOD_LAST)["pair skew"] == "fail"
-    assert _verdict(_samples(skip=5), GOOD_LAST)["dropped frames"] == "warn"
-    assert _verdict(_samples(skip=100), GOOD_LAST)["dropped frames"] == "fail"
+    # the cam2stitch skip counter is a pairing statistic, not lost frames (#55)
+    assert "dropped frames" not in _verdict(_samples(skip=100), GOOD_LAST)
+    assert set(_verdict(_samples(skip=100), GOOD_LAST).values()) == {"ok"}
     assert _verdict(_samples(err=3), GOOD_LAST)["camera errors"] == "warn"
     assert _verdict(_samples(mbps=0), GOOD_LAST)["bitrate"] == "fail"
     assert _verdict(_samples(), None)["saved"] == "fail"
@@ -88,10 +92,35 @@ def test_readiness_without_samples_fails():
     assert _verdict([], GOOD_LAST) == {"recording": "fail"}
 
 
-def test_schedule_takes_seconds():
-    for i in ("sched-time", "sched-dur", "unit-s", "unit-m", "sched-set", "sched-clear"):
+def test_schedule_takes_minutes_and_seconds_together():
+    for i in ("sched-time", "sched-min", "sched-sec", "sched-set", "sched-clear"):
         assert f'id="{i}"' in HTML
+    assert 'id="unit-s"' not in HTML and 'id="unit-m"' not in HTML
     assert 'data-sec="30"' in HTML       # the 30 s test recording preset
+    assert 'data-sec="8100"' not in HTML  # no 135 minute preset
+
+
+def _copy_text():
+    """Visible copy: the page's text nodes plus the tooltips, scripts and styles removed."""
+    body = re.sub(r"<(script|style)\b.*?</\1>", "", HTML, flags=re.S)
+    return re.sub(r"<[^>]+>", " ", body)
+
+
+def test_copy_has_no_em_dashes_or_semicolons():
+    text = _copy_text()
+    assert "\u2014" not in text and ";" not in text.replace("&nbsp;", "")
+    code = re.sub(r"/\*.*?\*/|(?<![:\"'])//[^\n]*", "", HTML, flags=re.S)
+    assert "\u2014" not in code, "em dash in a script or style string"
+
+
+def test_explanations_sit_behind_info_controls():
+    assert HTML.count('class="info"') >= 2
+    assert 'id="mode-note"' not in HTML and "dim light" not in HTML
+
+
+def test_separate_mode_has_one_pane_per_camera():
+    for i in ("pane0", "pane1", "snap0", "snap1"):
+        assert f'id="{i}"' in HTML
 
 
 def test_preview_has_full_screen_controls():
