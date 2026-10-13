@@ -25,9 +25,39 @@ from typing import Optional
 
 log = logging.getLogger("afl_cam.resume")
 
-# the fixed names cam2stitch (master + preview) and arecord write per run
+# The fixed names cam2stitch (master + preview) and arecord write per run.
+# Each wav carries a `.start` stamp (kernel monotonic us, the clock the
+# `.pts` sidecars use) so finalize can line the mic up with the video's
+# first frame — see daemon._start_audio.
+AUDIO_MARKER = ".start"
 SEGMENT_FILES = ("stitch.raw.h264", "stitch.pts", "preview.raw.h264",
-                 "preview.pts", "cam0.wav", "cam1.wav")
+                 "preview.pts", "cam0.wav", "cam0.wav" + AUDIO_MARKER,
+                 "cam1.wav", "cam1.wav" + AUDIO_MARKER)
+
+
+def audio_for(raw: Path, cam: str = "cam0") -> Path:
+    """The mic file arecord wrote alongside this segment's raw video."""
+    m = re.match(r".+\.(\d{3})\.raw\.(h264|hevc)$", raw.name)
+    return raw.with_name(f"{cam}.{m.group(1)}.wav" if m else f"{cam}.wav")
+
+
+def audio_marker(wav: Path) -> Path:
+    """When arecord was spawned for this wav (kernel monotonic us)."""
+    return wav.with_name(wav.name + AUDIO_MARKER)
+
+
+def drop_audio(raw: Path, cams: tuple = ("cam0", "cam1")) -> None:
+    """Delete the mic takes beside this segment's video.
+
+    Called once the mux that consumed them succeeded (the caller decides
+    that, and honours AFL_CAM_KEEP_WAV): live sessions keep only cam0's
+    audio in the muxed file, so cam1's is deleted with it rather than
+    left in the session folder for the rest of the season.
+    """
+    for cam in cams:
+        wav = audio_for(raw, cam)
+        wav.unlink(missing_ok=True)
+        audio_marker(wav).unlink(missing_ok=True)
 
 
 def save_intent(path: Path, intent: dict) -> None:

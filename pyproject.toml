@@ -23,6 +23,16 @@ packages = ["afl_cam"]
 dev = [
     "pytest>=9.1.1",
 ]
+# The VFR mux (afl_cam/retime.py) is PyAV, so the fixtures in the unit suite
+# need it. Deliberately NOT in `dev`: the board's project venv is Python
+# 3.14, av 13 (the version the board's own PyAV venv proves — av 18
+# segfaults in add_stream) has no cp314 wheels, and a `uv sync` the rig
+# cannot complete takes the whole rig suite down with it. CI installs this
+# group; the field daemon never installs PyAV at all, it shells out to the
+# board venv at AFL_CAM_RETIME_PY.
+mux = [
+    "av>=13,<14",
+]
 
 [tool.pytest.ini_options]
 markers = [

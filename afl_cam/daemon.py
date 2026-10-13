@@ -73,6 +73,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -105,6 +106,11 @@ HTTP_FALLBACK_PORT = 8080
 IDLE_STOP_SECS = float(os.environ.get("AFL_CAM_IDLE_SECS", "600"))
 TEMP_STOP_C = float(os.environ.get("AFL_CAM_TEMP_STOP_C", "80"))
 STORAGE_STOP_GB = float(os.environ.get("AFL_CAM_STORAGE_STOP_GB", "10"))
+# camera audio muxed into the master + proxy (issue #10). The mic wavs are
+# deleted once the mux that used them succeeded; AFL_CAM_KEEP_WAV=1 keeps
+# them (a mux can fail, and the wav is the only copy of the sound).
+AUDIO_BITRATE_KBPS = int(os.environ.get("AFL_CAM_AUDIO_BITRATE_KBPS", "128"))
+KEEP_WAV = bool(os.environ.get("AFL_CAM_KEEP_WAV"))
 AUTH_TOKEN = os.environ.get("AFL_CAM_TOKEN", "")
 GPIO_BTN = os.environ.get("AFL_CAM_GPIO_BTN", "")
 GPIO_LED = os.environ.get("AFL_CAM_GPIO_LED", "")
@@ -534,12 +540,17 @@ class PreviewChain(threading.Thread):
 
 # --------------------------------------------------------------- finalize --
 
-def _pts_median_fps(pts_path: Path, fallback: float) -> float:
-    """Median frame rate from a .pts sidecar (stdlib retime.load_pts)."""
+def _read_pts(pts_path: Path) -> list[int]:
+    """Kernel timestamps from a .pts sidecar (stdlib retime.load_pts)."""
     try:
-        pts = [int(x) for x in pts_path.read_text().split()]
+        return [int(x) for x in pts_path.read_text().split()]
     except (OSError, ValueError):
-        return fallback
+        return []
+
+
+def _pts_median_fps(pts_path: Path, fallback: float) -> float:
+    """Median frame rate from a .pts sidecar (the stitcher's CFR raws)."""
+    pts = _read_pts(pts_path)
     if len(pts) < 3:
         return fallback
     dts = sorted(
@@ -547,6 +558,119 @@ def _pts_median_fps(pts_path: Path, fallback: float) -> float:
     if not dts:
         return fallback
     return 1e6 / dts[len(dts) // 2]
+
+
+def _pts_bounds(pts_path: Path) -> Optional[tuple[int, float]]:
+    """(first timestamp us, video duration s) from a .pts sidecar.
+
+    The duration is the container's: the last frame's stamp plus its own
+    interval, because playback ends when the last frame's time is up.
+    """
+    pts = _read_pts(pts_path)
+    if len(pts) < 2:
+        return None
+    return pts[0], (pts[-1] - pts[0] + pts[-1] - pts[-2]) / 1e6
+
+
+def _wav_seconds(wav: Path) -> float:
+    """How much audio a wav holds (0.0 when arecord wrote none)."""
+    try:
+        with wave.open(str(wav)) as w:
+            rate = w.getframerate()
+            return w.getnframes() / rate if rate else 0.0
+    except (OSError, EOFError, wave.Error):
+        return 0.0
+
+
+def _audio_offset_s(wav: Path, first_pts_us: int) -> float:
+    """Seconds to DELAY the mic so it lines up with the video's first frame
+    (negative = the mic started late, so its head gets dropped).
+
+    arecord's spawn time rides next to the wav as a `.start` marker, in the
+    same kernel monotonic clock as the `.pts` sidecar. 0.0 when there is no
+    usable marker, or when the offset is longer than the audio itself —
+    that only happens with a marker left over from another run, and padding
+    the whole track with silence would be worse than the unaligned file.
+    """
+    try:
+        start_us = int(resume.audio_marker(wav).read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
+    offset = (first_pts_us - start_us) / 1e6
+    length = _wav_seconds(wav)
+    if length <= 0 or abs(offset) >= length:
+        log.warning("finalize: ignoring %+.3f s mic offset for %s "
+                    "(%.1f s of audio)", offset, wav.name, length)
+        return 0.0
+    return offset
+
+
+def _make_audio_track(wav: Path, first_pts_us: int, duration_s: float,
+                      out: Path) -> bool:
+    """Encode the mic wav to AAC lined up with the video's first frame and
+    trimmed to the video's length, ready for the muxer to copy in."""
+    offset = _audio_offset_s(wav, first_pts_us)
+    args = []
+    if offset < 0:                      # the mic started late: drop its head
+        args += ["-ss", f"{-offset:.3f}"]
+    args += ["-i", str(wav)]
+    if offset > 0:                      # the mic started early: pad the head
+        # one delay per channel (arecord runs -c 2): `all=1` says the same
+        # but only exists from ffmpeg 4.3
+        ms = int(round(offset * 1000))
+        args += ["-af", f"adelay={ms}|{ms}"]
+    args += ["-t", f"{duration_s:.3f}", "-c:a", "aac",
+             "-b:a", f"{AUDIO_BITRATE_KBPS}k", str(out)]
+    ok, err = _run_ffmpeg(args, timeout=600)
+    if ok and out.exists() and out.stat().st_size > 0:
+        log.info("finalize: %s -> AAC, mic offset %+.3f s", wav.name, offset)
+        return True
+    log.error("finalize: audio encode failed for %s: %s", wav.name, err)
+    return False
+
+
+def _mux(raw: Path, pts: Path, out: Path, codec: str,
+         tag: Optional[str], audio: Optional[Path], faststart: bool) -> bool:
+    """Retime a raw elementary stream into `out` from its .pts sidecar,
+    with the camera's mic muxed in when there is one.
+
+    The container carries the sidecar's real per-frame timing, so duration,
+    playback speed and the audio all match the game even when auto-exposure
+    changed the sensor rate mid-game. There is deliberately NO fallback to
+    a fixed frame rate: a mux that cannot use the sidecar fails, and the
+    raw files stay on disk (issue #9).
+    """
+    # local import: retime pulls in numpy, which the daemon itself avoids
+    from .retime import retime_file
+
+    track = None
+    bounds = _pts_bounds(pts) if audio is not None else None
+    if bounds is not None and audio.is_file() and _wav_seconds(audio) > 0.1:
+        track = out.with_suffix(".audio.m4a")
+        if not _make_audio_track(audio, bounds[0], bounds[1], track):
+            track.unlink(missing_ok=True)
+            track = None
+    try:
+        ok = retime_file(raw, pts, out, codec=codec, tag=tag,
+                         faststart=faststart, audio=track)
+    finally:
+        if track is not None:
+            track.unlink(missing_ok=True)
+    if not ok:
+        log.error("finalize: mux failed for %s", raw.name)
+    return ok
+
+
+def mux_master(raw: Path, pts: Path, out: Path,
+               audio: Optional[Path] = None,
+               faststart: bool = False) -> bool:
+    """stitch.raw.h264 (or a separate-mode camN.raw.h264) → .mp4 carrying
+    the real frame timing from the .pts sidecar, plus the camera's audio.
+
+    HEVC masters carry the hvc1 tag — without it iPhone/QuickTime refuse
+    to play the file (docs/archive/iphone-control-plan.md §4)."""
+    return _mux(raw, pts, out, "hevc" if HEVC else "h264",
+                "hvc1" if HEVC else None, audio, faststart)
 
 
 def _segments_report(folder: Optional[Path]) -> Optional[dict]:
@@ -568,40 +692,12 @@ def _run_ffmpeg(args: list[str], timeout: int = 300) -> tuple[bool, str]:
     return result.returncode == 0, result.stderr.strip()
 
 
-def mux_master(raw: Path, pts: Path, out: Path,
-               faststart: bool = False) -> bool:
-    """stitch.raw.h264 (or a separate-mode camN.raw.h264) → .mp4 as CFR
-    at the measured rate.
-
-    HEVC masters carry the hvc1 tag — without it iPhone/QuickTime refuse
-    to play the file (docs/archive/iphone-control-plan.md §4)."""
-    fps = _pts_median_fps(pts, 30.0)
-    args = ["-f", "hevc" if HEVC else "h264",
-            "-r", f"{fps:.4f}", "-i", str(raw),
-            "-c", "copy"]
-    if HEVC:
-        args += ["-tag:v", "hvc1"]
-    if faststart:
-        args += ["-movflags", "+faststart"]
-    args.append(str(out))
-    ok, err = _run_ffmpeg(args)
-    if ok and out.exists() and out.stat().st_size > 0:
-        return True
-    log.error("finalize: master mux failed: %s", err)
-    return False
-
-
-def mux_proxy(raw: Path, pts: Path, out: Path) -> bool:
+def mux_proxy(raw: Path, pts: Path, out: Path,
+              audio: Optional[Path] = None) -> bool:
     """preview.raw.h264 → proxy.mp4 (H.264 avc1, faststart — Safari's
-    seek requirement)."""
-    fps = _pts_median_fps(pts, 15.0)
-    ok, err = _run_ffmpeg([
-        "-f", "h264", "-r", f"{fps:.4f}", "-i", str(raw),
-        "-c", "copy", "-movflags", "+faststart", str(out)])
-    if ok and out.exists() and out.stat().st_size > 0:
-        return True
-    log.error("finalize: proxy mux failed: %s", err)
-    return False
+    seek requirement). The preview encoder is always H.264, whatever the
+    master's codec. Carries the camera's audio too."""
+    return _mux(raw, pts, out, "h264", None, audio, faststart=True)
 
 
 def make_thumb(video: Path, out: Path) -> bool:
@@ -628,11 +724,19 @@ class Finalizer(threading.Thread):
         # the recording resumed after a crash — afl_cam/resume.py)
         master = resume.segments(dir_, "stitch.raw.h264")
         proxy = resume.segments(dir_, "preview.raw.h264")
+
+        # each segment carries the mic take arecord wrote beside it
+        def master_mux(raw, pts, out):
+            return mux_master(raw, pts, out, audio=resume.audio_for(raw))
+
+        def proxy_mux(raw, pts, out):
+            return mux_proxy(raw, pts, out, audio=resume.audio_for(raw))
+
         master_ok, master_all = resume.mux_segments(
-            master, dir_ / "stitch.mp4", mux_master,
+            master, dir_ / "stitch.mp4", master_mux,
             ("-tag:v", "hvc1") if HEVC else ()) if master else (False, False)
         proxy_ok, proxy_all = resume.mux_segments(
-            proxy, dir_ / "proxy.mp4", mux_proxy,
+            proxy, dir_ / "proxy.mp4", proxy_mux,
             ("-movflags", "+faststart")) if proxy else (False, False)
         if proxy_ok:
             make_thumb(dir_ / "proxy.mp4", dir_ / "thumb.jpg")
@@ -646,6 +750,10 @@ class Finalizer(threading.Thread):
         if master_all:
             for raw, _ in master:
                 raw.unlink(missing_ok=True)
+                if not KEEP_WAV:
+                    # the master carries the sound now (a proxy that failed
+                    # is redone from the master, not from the wav)
+                    resume.drop_audio(raw)
         if proxy_all:
             for raw, _ in proxy:
                 raw.unlink(missing_ok=True)
@@ -673,9 +781,12 @@ class Finalizer(threading.Thread):
                 raw = dir_ / f"{cam}.raw.h264"
                 out = dir_ / f"{cam}.mp4"
                 ok[cam] = raw.exists() and mux_master(
-                    raw, dir_ / f"{cam}.pts", out, faststart=cam == "cam0")
+                    raw, dir_ / f"{cam}.pts", out,
+                    audio=resume.audio_for(raw), faststart=cam == "cam0")
                 if ok[cam]:
                     raw.unlink(missing_ok=True)
+                    if not KEEP_WAV:      # this camera's own mic
+                        resume.drop_audio(raw, (cam,))
                     db.update_complete(row_id, s.duration, out.stat().st_size)
                 else:
                     db.update_error(row_id, "mux failed or no frames")
@@ -2134,19 +2245,32 @@ class CamDaemon:
                  session_id, dir_.name)
 
     def _start_audio(self, dir_: Path) -> list:
-        """Camera mics (clap fallback / audio track)."""
+        """Camera mics (clap fallback / audio track). Each wav is stamped
+        with arecord's start (kernel monotonic us — the clock the `.pts`
+        sidecars use) so finalize can line the mic up with the video."""
         audio = []
         for cam in ("cam0", "cam1"):
             dev = AUDIO_DEVICES.get(cam)
             if not dev:
                 continue
+            wav = dir_ / f"{cam}.wav"
             try:
-                audio.append(subprocess.Popen(
+                proc = subprocess.Popen(
                     ["arecord", "-q", "-D", dev, "-f", "S16_LE",
-                     "-c", "2", "-r", "44100", str(dir_ / f"{cam}.wav")],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                     "-c", "2", "-r", "44100", str(wav)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError:
-                pass
+                continue
+            audio.append(proc)
+            # stamped after the fork (arecord opens the device after it
+            # returns; that latency is the offset's residual error). Losing
+            # the stamp costs alignment, never the recording, so it must
+            # not raise into the caller.
+            try:
+                resume.audio_marker(wav).write_text(
+                    f"{time.monotonic_ns() // 1000}\n")
+            except OSError as e:
+                log.warning("audio: cannot stamp %s start: %s", wav.name, e)
         return audio
 
     def _attach_recording(self, st: dict):
