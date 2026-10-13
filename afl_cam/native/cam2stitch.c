@@ -642,6 +642,61 @@ static void gpu_init(gpu_t *g, const char *spv_path,
             g->canvas_w, g->canvas_h, RING_SLOTS);
 }
 
+/* Upload thread: copies a frame pair into the slot's staging buffer, flushes
+ * it and submits the GPU job. Pairing and encoding stay on the main thread,
+ * so the 25 MB copy overlaps them instead of adding to the frame period.
+ * Only this thread touches the queue after setup. The main thread must call
+ * upload_wait() before it releases or advances past the source buffers. */
+typedef struct {
+    gpu_t *g;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int has_job, done, stop;
+    int k;
+    void *src0, *src1;
+    MppBuffer buf0, buf1;
+    volatile int64_t last_us;     /* duration of the last job (stats) */
+} uploader_t;
+
+static void *upload_thread(void *arg) {
+    uploader_t *u = arg;
+    gpu_t *g = u->g;
+    pthread_mutex_lock(&u->mu);
+    for (;;) {
+        while (!u->has_job && !u->stop)
+            pthread_cond_wait(&u->cv, &u->mu);
+        if (!u->has_job)
+            break;
+        int k = u->k;
+        void *s0 = u->src0, *s1 = u->src1;
+        MppBuffer b0 = u->buf0, b1 = u->buf1;
+        pthread_mutex_unlock(&u->mu);
+
+        int64_t t0 = now_us();
+        gpu_slot_t *s = &g->slots[k];
+        /* DMA-written memory via a cached alias: invalidate before reads */
+        mpp_buffer_sync_ro_begin(b0);
+        mpp_buffer_sync_ro_begin(b1);
+        size_t nv12 = (size_t)g->src_w * g->src_h * 3 / 2;
+        memcpy((char *)s->staging_map + s->stage_off[0], s0, nv12);
+        memcpy((char *)s->staging_map + s->stage_off[2], s1, nv12);
+        VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                   .memory = s->staging_mem, .offset = 0, .size = g->stage_size };
+        vkFlushMappedMemoryRanges(g->dev, 1, &mr);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .commandBufferCount = 1, .pCommandBuffers = &s->cb };
+        CHECK(vkQueueSubmit(g->queue, 1, &si, s->fence));
+        u->last_us = now_us() - t0;
+
+        pthread_mutex_lock(&u->mu);
+        u->has_job = 0;
+        u->done = 1;
+        pthread_cond_broadcast(&u->cv);
+    }
+    pthread_mutex_unlock(&u->mu);
+    return NULL;
+}
+
 /* Stitch one frame pair (tight NV12 in) → tight NV12 out (repacked).
  * Blocking: waits the slot's fence before reuse and after submission. */
 static int64_t g_times[5];   /* wait-before, memcpy, submit, wait-after, repack */
@@ -2485,6 +2540,27 @@ int main(int argc, char **argv) {
     /* main-loop stage timers (us, summed over 10 iterations, logged with
      * the "submitted" line): where the frame period goes */
     int64_t acc_take = 0, acc_fence = 0, acc_ack = 0, acc_copy = 0, acc_enc = 0, acc_iter = 0;
+    int64_t acc_upw = 0;
+    uploader_t up = { .g = &g };
+    pthread_mutex_init(&up.mu, NULL);
+    pthread_cond_init(&up.cv, NULL);
+    pthread_t upthread;
+    pthread_create(&upthread, NULL, upload_thread, &up);
+    int up_pending = 0, up_f0 = -1;
+    /* wait for the in-flight upload, then release its cam0 frame */
+#define UPLOAD_WAIT() do { \
+        if (up_pending) { \
+            int64_t _w0 = now_us(); \
+            pthread_mutex_lock(&up.mu); \
+            while (!up.done) \
+                pthread_cond_wait(&up.cv, &up.mu); \
+            pthread_mutex_unlock(&up.mu); \
+            ring_release(&cams[0].ring, up_f0); \
+            up_pending = 0; \
+            acc_upw += now_us() - _w0; \
+            acc_copy += up.last_us; \
+        } \
+    } while (0)
     while (g_running && (frames == 0 || out_count < frames) &&
            !(t_deadline && now_us() > t_deadline)) {
         int64_t t_top = now_us();
@@ -2494,6 +2570,9 @@ int main(int argc, char **argv) {
         int f0_idx = ring_take(&cams[0].ring, &f0, &p0_pts);
         if (f0_idx < 0)
             break;
+        /* the previous pair's copy must finish before the cam1 cursor
+         * moves on (its source buffers may be released below) */
+        UPLOAD_WAIT();
 
         if (cur1_idx < 0 || p0_pts < cams[1].ring.first_pts) {
             /* cam1 not started yet — start trim */
@@ -2545,10 +2624,6 @@ int main(int argc, char **argv) {
         void *y1_ptr = cams[1].ring.slots[pair_idx].map_ptr ?
                        cams[1].ring.slots[pair_idx].map_ptr :
                        mpp_buffer_get_ptr(cams[1].ring.slots[pair_idx].buf);
-        /* DMA-written memory via a cached alias: invalidate before reads */
-        mpp_buffer_sync_ro_begin(cams[0].ring.slots[f0_idx].buf);
-        mpp_buffer_sync_ro_begin(cams[1].ring.slots[pair_idx].buf);
-
         gpu_slot_t *s = &g.slots[g.k];
         int k = g.k;
         /* GPU job for frame i-3 is done → its packed SSBO is readable */
@@ -2579,22 +2654,23 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&w.ack_mu);
         int64_t t_c0 = now_us();
         acc_ack += t_c0 - t_a0;
-        /* copy this frame's pair into staging + submit */
-        size_t nv12 = (size_t)g.src_w * g.src_h * 3 / 2;
-        memcpy((char *)s->staging_map + s->stage_off[0], y0_ptr, nv12);
-        memcpy((char *)s->staging_map + s->stage_off[2], y1_ptr, nv12);
-        {
-            VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                                       .memory = s->staging_mem, .offset = 0, .size = g.stage_size };
-            vkFlushMappedMemoryRanges(g.dev, 1, &mr);
-        }
-        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                            .commandBufferCount = 1, .pCommandBuffers = &s->cb };
-        CHECK(vkQueueSubmit(g.queue, 1, &si, s->fence));
+        /* hand this frame's pair to the upload thread (copy + flush +
+         * submit); the encode below overlaps it */
+        pthread_mutex_lock(&up.mu);
+        up.k = k;
+        up.src0 = y0_ptr;
+        up.src1 = y1_ptr;
+        up.buf0 = cams[0].ring.slots[f0_idx].buf;
+        up.buf1 = cams[1].ring.slots[pair_idx].buf;
+        up.done = 0;
+        up.has_job = 1;
+        pthread_cond_signal(&up.cv);
+        pthread_mutex_unlock(&up.mu);
+        up_pending = 1;
+        up_f0 = f0_idx;
         pend_pts[k] = mid;
         g.k = (g.k + 1) % RING_SLOTS;
         int64_t t_e0 = now_us();
-        acc_copy += t_e0 - t_c0;
         /* encode frame i-3 (repacked by the worker into enc_in[0]) on
          * the MAIN thread — the proven-clean sync path. The drain
          * returns immediately: the encoder finished ~30ms ago. */
@@ -2622,7 +2698,6 @@ int main(int argc, char **argv) {
                 w.empty_drains = 0;
             }
         }
-        ring_release(&cams[0].ring, f0_idx);
         out_count++;
         acc_iter += now_us() - t_top;
         if (out_count % 10 == 0) {
@@ -2630,10 +2705,11 @@ int main(int argc, char **argv) {
                     out_count, (now_us() - t_stage) / 1000.0, w.enc_count);
             /* per-iteration averages over the last 10: pair/wait for cameras,
              * GPU fence, worker ack, copy+submit, encode/preview puts, total */
-            fprintf(stderr, "loop-ms take %.1f fence %.1f ack %.1f copy %.1f enc %.1f iter %.1f\n",
+            fprintf(stderr, "loop-ms take %.1f fence %.1f ack %.1f copy %.1f upwait %.1f enc %.1f iter %.1f\n",
                     acc_take / 10000.0, acc_fence / 10000.0, acc_ack / 10000.0,
-                    acc_copy / 10000.0, acc_enc / 10000.0, acc_iter / 10000.0);
-            acc_take = acc_fence = acc_ack = acc_copy = acc_enc = acc_iter = 0;
+                    acc_copy / 10000.0, acc_upw / 10000.0, acc_enc / 10000.0,
+                    acc_iter / 10000.0);
+            acc_take = acc_fence = acc_ack = acc_copy = acc_upw = acc_enc = acc_iter = 0;
         }
 
         /* daemon: publish status + apply pending REC_START/REC_STOP/QUIT
@@ -2645,6 +2721,12 @@ int main(int argc, char **argv) {
     }
 
     /* ---- stop + EOS (main thread — the old proven-clean path) ---- */
+    UPLOAD_WAIT();
+    pthread_mutex_lock(&up.mu);
+    up.stop = 1;
+    pthread_cond_signal(&up.cv);
+    pthread_mutex_unlock(&up.mu);
+    pthread_join(upthread, NULL);
     g_running = 0;
     for (int i = 0; i < 2; i++) {
         pthread_cond_signal(&cams[i].ring.cv_free);
