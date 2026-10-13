@@ -15,7 +15,7 @@
   :root {
     --bg: #0d1117; --panel: #161b22; --panel2: #1f2630; --raise: #29313d;
     --ink: #e6edf3; --dim: #98a2ae; --line: #30363d;
-    --red: #f85149; --red-deep: #c93c37; --green: #3fb950; --amber: #d29922; --blue: #58a6ff;
+    --red: #f85149; --red-deep: #c93c37; --green: #3fb950; --amber: #d29922; --blue: #58a6ff; --purple: #bc8cff;
     --on-accent: #0d1117;
     --r-sm: 8px; --r-md: 12px; --r-lg: 16px; --r-pill: 999px;
     --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
@@ -42,33 +42,28 @@
   /* ---- app shell: top bar, state banner, views, bottom tab bar ---- */
   .topbar {
     display: flex; align-items: center; gap: var(--s3);
-    padding: calc(var(--s3) + var(--safe-t)) var(--s4) var(--s3);
+    padding: calc(var(--s3) + var(--safe-t)) max(var(--s4), calc((100vw - 860px) / 2 + var(--s4))) var(--s3);
     background: var(--panel); border-bottom: 1px solid var(--line);
     position: sticky; top: 0; z-index: 5;
   }
   .topbar h1 { font-size: 17px; margin: 0; letter-spacing: .04em; }
-  .link { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; }
-  .link i { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
-  .link.up i { background: var(--green); }
-
-  /* state banner: one place that says what the rig is doing */
-  .statebar {
-    display: flex; align-items: center; gap: var(--s3);
-    padding: var(--s3) var(--s4); background: var(--panel2); border-bottom: 1px solid var(--line);
-  }
-  .statebar .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--dim); flex: none; }
-  .statebar .txt { min-width: 0; }
-  .statebar .st { font-weight: 700; text-transform: uppercase; letter-spacing: .06em; font-size: 13px; }
-  .statebar .detail { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
-  .statebar .detail:empty { display: none; }
-  .statebar.s-standby .dot, .statebar.s-ready .dot { background: var(--green); }
-  .statebar.s-busy .dot { background: var(--amber); animation: pulse 1.2s infinite; }
-  .statebar.s-recording { background: #3a1517; border-bottom-color: #7f1d1d; }
-  .statebar.s-recording .dot { background: var(--red); animation: pulse 1.2s infinite; }
-  .statebar.s-error { background: #3d1515; border-bottom-color: #7f1d1d; }
-  .statebar.s-error .dot { background: var(--red); }
-  .statebar.s-error .st { color: #ffa198; }
+  /* the one status indicator: top right */
+  .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; min-height: 30px;
+    padding: 0 12px; border-radius: var(--r-pill); background: var(--panel2); border: 1px solid var(--line);
+    font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+  .pill i { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); flex: none; }
+  .pill.s-standby i, .pill.s-ready i { background: var(--green); }
+  .pill.s-busy i { background: var(--amber); animation: pulse 1.2s infinite; }
+  .pill.s-recording { background: #3a1517; border-color: #7f1d1d; color: #ffb4ae; }
+  .pill.s-recording i { background: var(--red); animation: pulse 1.2s infinite; }
+  .pill.s-error { background: #3d1515; border-color: #7f1d1d; color: #ffa198; }
+  .pill.s-error i { background: var(--red); }
   @keyframes pulse { 50% { opacity: .45; } }
+
+  /* errors only: a callout under the bar, absent while everything is fine */
+  .callout { margin: 0 0 var(--s3); padding: var(--s3) var(--s4); border-radius: var(--r-md);
+    background: #3d1515; border: 1px solid #7f1d1d; color: #ffb4ae; font-size: 14px; overflow-wrap: anywhere; }
+  .callout[hidden] { display: none; }
 
   main { max-width: 860px; margin: 0 auto; padding: var(--s3) var(--s4); }
 
@@ -125,6 +120,25 @@
   .row + .row, .row + .note + .row { border-top: 1px solid var(--line); }
   .row .lab { flex: 1; font-weight: 600; }
   .row .lab small { display: block; color: var(--dim); font-weight: 400; font-size: 12px; }
+  /* a labelled control that needs the full width: label above, toggle below */
+  .row.stack { flex-wrap: wrap; padding: var(--s3) 0; gap: var(--s2) var(--s3); }
+  .row.stack .lab { flex: 1 0 100%; display: flex; align-items: center; gap: var(--s2); }
+  .row.stack .lab small { display: inline; margin-left: auto; font-variant-numeric: tabular-nums; }
+  .seg.full { display: flex; width: 100%; }
+  .seg.full button { flex: 1; min-height: 44px; }
+  .card { position: relative; }
+
+  /* (i): explanation on hover, focus or press */
+  .info { position: static; display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--dim); color: var(--dim);
+    font: italic 700 13px/1 Georgia, serif; text-transform: none; letter-spacing: 0; cursor: help;
+    flex: none; outline-offset: 3px; }
+  .info:hover, .info:focus { color: var(--blue); border-color: var(--blue); }
+  .info .tip { display: none; position: absolute; left: var(--s3); right: var(--s3); top: 44px; z-index: 8;
+    padding: var(--s3) var(--s4); border-radius: var(--r-md); background: var(--raise);
+    border: 1px solid var(--line); box-shadow: 0 8px 24px rgba(0,0,0,.5); color: var(--ink);
+    font: 400 13px/1.45 var(--font); text-align: left; text-transform: none; letter-spacing: 0; cursor: default; }
+  .info:hover .tip, .info:focus .tip, .info:focus-within .tip { display: block; }
 
   .field { background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
     border-radius: var(--r-sm); min-height: 40px; padding: 0 var(--s3); font-size: 15px;
@@ -136,8 +150,7 @@
   .metric { padding: var(--s3) var(--s2); text-align: center; background: var(--panel); }
   .metric .v { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .metric .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
-  .metric:last-child:nth-child(odd) { grid-column: 1 / -1; }
-  @media (min-width: 560px) { .metrics { grid-template-columns: repeat(5, 1fr); } }
+  @media (min-width: 560px) { .metrics { grid-template-columns: repeat(4, 1fr); } }
   .warn .v { color: var(--amber); }
 
   /* ---- health panel ---- */
@@ -153,6 +166,23 @@
   .hmid .bar { flex: 1; }
   .spark { width: 72px; height: 22px; flex: none; }
   .spark polyline { fill: none; stroke: var(--blue); stroke-width: 1.5; stroke-linejoin: round; }
+  /* frame rate chart: one line per camera, bands mark the thresholds */
+  .chart { padding-top: var(--s3); border-top: 1px solid var(--line); }
+  .chart-h { display: flex; align-items: baseline; gap: var(--s3); font-size: 13px; margin-bottom: var(--s2); }
+  .chart-h .hk { color: var(--dim); }
+  .legend { margin-left: auto; display: flex; gap: var(--s4); font-variant-numeric: tabular-nums; }
+  .lg { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); }
+  .lg i { width: 14px; height: 3px; border-radius: 2px; }
+  .lg.c0 i { background: var(--blue); } .lg.c1 i { background: var(--purple); }
+  .lg b { font-weight: 700; }
+  .plot { position: relative; height: 96px; margin-left: 26px; }
+  .plot svg { width: 100%; height: 100%; display: block; border-radius: var(--r-sm); background: var(--panel2); }
+  .plot .z-bad { fill: rgba(248,81,73,.14); } .plot .z-warn { fill: rgba(210,153,34,.13); }
+  .plot .grid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+  .plot polyline { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+  .plot .l0 { stroke: var(--blue); } .plot .l1 { stroke: var(--purple); }
+  .plot .ax { position: absolute; left: -26px; width: 22px; text-align: right; font-size: 10px;
+    color: var(--dim); transform: translateY(-50%); font-variant-numeric: tabular-nums; }
   .cores { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; margin: 2px 0 6px 84px; }
   .cores .bar { height: 26px; border-radius: 3px; display: flex; align-items: flex-end; }
   .cores .bar i { width: 100%; height: 0; transition: height .4s; }
@@ -179,11 +209,22 @@
   #recBtn:disabled { opacity: .5; }
   #hint { margin-top: var(--s2); color: var(--dim); font-size: 13px; }
   #hint:empty { display: none; }
-  #mode-note, #crop-note { text-align: left; }
+  .lastrec { margin-top: var(--s3); color: var(--dim); font-size: 13px; }
+  .lastrec:empty { display: none; }
 
   /* separate-mode recording: 4K snapshots instead of the stitched stream */
-  #snaps { position: absolute; inset: 0; display: none; background: #000; }
-  #snaps img { width: 50%; height: 100%; object-fit: cover; float: left; }
+  #snaps { display: none; grid-template-columns: 1fr 1fr; gap: 2px; background: #000; }
+  body[data-mode="separate"] #snaps { display: grid; }
+  body[data-mode="separate"] #vid, body[data-mode="separate"] #preview-state,
+  body[data-mode="separate"] #pv-full { display: none !important; }
+  .pane { position: relative; aspect-ratio: 16 / 9; background: #0a0d12; overflow: hidden; }
+  .pane img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: none; }
+  .pane.has img { display: block; }
+  .pane .ph { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--dim); font-size: 12px; text-align: center; padding: 0 var(--s2); }
+  .pane.has .ph { display: none; }
+  .pane .cap { position: absolute; left: 6px; top: 6px; z-index: 1; padding: 1px 8px; border-radius: var(--r-pill);
+    background: rgba(0,0,0,.55); font-size: 11px; font-weight: 600; }
 
   /* ---- preview ---- */
   #preview { position: relative; background: #000; border-radius: var(--r-lg); overflow: hidden;
@@ -200,7 +241,7 @@
     touch-action: none; }
   body.pv-full #stage { width: 100%; height: 100%; }
   body.pv-full #vid { width: 100%; height: 100%; aspect-ratio: auto !important; object-fit: contain; }
-  body.pv-full #guides, body.pv-full #snaps { display: none; }
+  body.pv-full #guides, body.pv-full #snaps { display: none !important; }
   body.pv-full #pv-full { display: none; }
   body.pv-full #pv-close { display: flex; top: calc(var(--s2) + var(--safe-t)); left: var(--s2); right: auto; }
   body.pv-full #pv-hud { display: flex; align-items: center; gap: var(--s2); position: absolute; z-index: 2;
@@ -213,11 +254,12 @@
     color: var(--dim); font-size: 14px; text-align: center; padding: 0 var(--s5);
   }
   /* framing guides: positions come from /api/framing (canvas fractions) */
-  #guides { position: absolute; inset: 0; pointer-events: none; }
+  #guides { position: absolute; inset: 0; pointer-events: none; display: none; }
+  body.pv-live[data-tab="setup"] #guides { display: block; }
   #g-overlap { position: absolute; top: 0; bottom: 0; background: rgba(88,166,255,.10);
     border-left: 1px dashed rgba(88,166,255,.5); border-right: 1px dashed rgba(88,166,255,.5); display: none; }
   #g-seam { position: absolute; top: 8%; height: 84%; left: 50%; width: 1px; background: rgba(255,255,255,.35); }
-  #g-seam::before { content: "seam"; position: absolute; top: -14px; left: -14px; font-size: 9px; color: rgba(255,255,255,.5); }
+  #g-seam::before { content: "seam"; position: absolute; top: 2px; left: 4px; font-size: 9px; color: rgba(255,255,255,.5); }
   #g-horizon { position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed rgba(210,153,34,.8); display: none; }
   #g-horizon::before { content: "horizon"; position: absolute; left: 6px; top: -14px; font-size: 9px; color: rgba(210,153,34,.9); }
   body[data-tab="setup"] #g-overlap.known, body[data-tab="setup"] #g-horizon.known { display: block; }
@@ -226,6 +268,10 @@
   .check { display: grid; grid-template-columns: 22px 116px 1fr; gap: 6px; padding: 8px 0;
     border-top: 1px solid var(--line); font-size: 14px; }
   .check .n { font-weight: 600; }
+  .check .n::first-letter { text-transform: uppercase; }
+  #st-level { font-size: 12px; font-weight: 600; text-transform: none; letter-spacing: 0; white-space: nowrap; }
+  #rd-progress { margin: 0 0 var(--s2); }
+  #rd-progress:empty { display: none; }
   .check .d { color: var(--dim); }
   #ra-log { background: #000; color: #c9d1d9; font: 11px/1.4 var(--mono);
     padding: 8px 10px; border-radius: var(--r-sm); max-height: 220px; overflow: auto; white-space: pre-wrap;
@@ -236,7 +282,8 @@
   #ra-score th { color: var(--dim); font-weight: 500; font-size: 12px; }
   #ra-score td:first-child, #ra-score th:first-child { text-align: left; }
   #ra-crop { width: 100%; border-radius: var(--r-sm); margin-top: 10px; display: none; }
-  #ra-state { font-size: 13px; }
+  #ra-state { font-size: 13px; margin-top: var(--s2); }
+  #ra-state:empty { display: none; }
 
   /* ---- schedule ---- */
   .sched-grid { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; }
@@ -248,6 +295,8 @@
     border: 1px solid var(--line); color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; }
   .chipbtn.on { border-color: var(--blue); color: var(--blue); }
   #sched-status { color: var(--green); font-size: 13px; }
+  .dur { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
+  .dur .field { width: 64px; text-align: center; }
 
   /* ---- recordings ---- */
   .rec {
@@ -269,10 +318,10 @@
   .menu { position: relative; }
   .menu summary { list-style: none; cursor: pointer; }
   .menu summary::-webkit-details-marker { display: none; }
-  .menu .pop { position: absolute; right: 0; top: calc(100% + 6px); z-index: 4; min-width: 200px;
+  .menu .pop { position: absolute; right: 0; top: calc(100% + 6px); z-index: 4; min-width: 248px;
     background: var(--raise); border: 1px solid var(--line); border-radius: var(--r-md);
     box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow: hidden; }
-  .menu .item { display: flex; justify-content: space-between; gap: var(--s3); width: 100%;
+  .menu .item { display: flex; justify-content: space-between; gap: var(--s4); width: 100%; white-space: nowrap;
     min-height: var(--tap); align-items: center; padding: 0 var(--s4); background: none; border: none;
     color: var(--ink); font-size: 14px; text-decoration: none; text-align: left; cursor: pointer; }
   .menu .item + .item { border-top: 1px solid var(--line); }
@@ -294,28 +343,25 @@
 <body data-tab="record">
 <header class="topbar">
   <h1>afl-cam</h1>
-  <span id="link" class="link"><i></i><span id="link-txt">connecting</span></span>
+  <span id="chip" class="pill s-connecting"><i></i><span id="chip-txt">connecting</span></span>
 </header>
-<div id="statebar" class="statebar">
-  <span class="dot"></span>
-  <div class="txt">
-    <div class="st" id="chip">connecting</div>
-    <div class="detail" id="banner"></div>
-  </div>
-</div>
 
 <main>
+  <div id="banner" class="callout" role="alert" hidden></div>
   <section id="preview" data-view="all">
     <div id="stage">
       <video id="vid" playsinline muted autoplay></video>
-      <div id="snaps"><img id="snap0" alt=""><img id="snap1" alt=""></div>
+      <div id="snaps">
+        <div class="pane" id="pane0"><span class="cap">Left camera</span><span class="ph">No picture until recording starts</span><img id="snap0" alt=""></div>
+        <div class="pane" id="pane1"><span class="cap">Right camera</span><span class="ph">No picture until recording starts</span><img id="snap1" alt=""></div>
+      </div>
       <div id="guides">
         <div id="g-overlap"></div>
         <div id="g-horizon"></div>
         <div id="g-seam"></div>
       </div>
     </div>
-    <div id="preview-state">preview connecting…</div>
+    <div id="preview-state">Connecting</div>
     <button id="pv-full" class="pv-btn" aria-label="Full screen">
       <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
     <button id="pv-close" class="pv-btn" aria-label="Exit full screen">×</button>
@@ -327,6 +373,7 @@
     <div id="elapsed">0:00:00</div>
     <button id="recBtn" disabled>…</button>
     <div id="hint"></div>
+    <div id="st-last" class="lastrec"></div>
   </section>
 
   <section id="stats" class="metrics" data-view="record">
@@ -334,7 +381,6 @@
     <div class="metric" id="st-temp"><div class="v">–</div><div class="k">board °C</div></div>
     <div class="metric" id="st-fps"><div class="v">–</div><div class="k">cam fps</div></div>
     <div class="metric" id="st-skew"><div class="v">–</div><div class="k">pair skew</div></div>
-    <div class="metric" id="st-last"><div class="v">–</div><div class="k">last recording</div></div>
   </section>
 
   <section id="health" class="card" data-view="record">
@@ -349,30 +395,48 @@
     <div class="hrow"><span class="hk">GPU</span>
       <div class="hmid"><div class="bar" id="h-gpu-bar"><i></i></div></div>
       <span class="hv" id="h-gpu">–</span></div>
-    <div class="hrow"><span class="hk">Frame rate</span>
-      <div class="hmid"><svg class="spark" id="h-fps-spark" viewBox="0 0 60 22" preserveAspectRatio="none" style="width:100%"><polyline points=""/></svg></div>
-      <span class="hv" id="h-fps">–</span></div>
-    <div class="chips" id="h-chips"></div>
+    <div class="chart" id="h-fps-chart">
+      <div class="chart-h"><span class="hk">Frame rate</span>
+        <span class="legend">
+          <span class="lg c0"><i></i>cam0 <b id="h-fps0">–</b></span>
+          <span class="lg c1"><i></i>cam1 <b id="h-fps1">–</b></span>
+          <span class="lg">fps</span>
+        </span></div>
+      <div class="plot">
+        <svg id="h-fps-svg" viewBox="0 0 300 80" preserveAspectRatio="none" role="img" aria-label="Frame rate per camera">
+          <rect class="z-warn" x="0" y="34.3" width="300" height="18.3"/>
+          <rect class="z-bad" x="0" y="52.6" width="300" height="27.4"/>
+          <line class="grid" x1="0" x2="300" y1="34.3" y2="34.3"/>
+          <line class="grid" x1="0" x2="300" y1="52.6" y2="52.6"/>
+          <polyline class="l0" id="h-fps-l0" points=""/>
+          <polyline class="l1" id="h-fps-l1" points=""/>
+        </svg>
+        <span class="ax" style="top:0">35</span>
+        <span class="ax" style="top:42.9%">20</span>
+        <span class="ax" style="top:65.7%">12</span>
+        <span class="ax" style="top:100%">0</span>
+      </div>
+    </div>
+    <div class="chips" id="h-chips" style="margin-top:var(--s3)"></div>
   </section>
 
   <section class="card" data-view="record">
     <h2>Recording</h2>
-    <div class="row">
-      <div class="lab">Mode</div>
-      <div class="seg" id="mode">
+    <div class="row stack">
+      <div class="lab">Mode
+        <span class="info" tabindex="0" role="button" aria-label="About recording modes">i<span class="tip">Live stitch records one panoramic file. Separate records a 4K file from each camera and stitches afterwards from the Recordings tab.</span></span></div>
+      <div class="seg full" id="mode">
         <button id="mode-live" class="on">Live stitch</button>
         <button id="mode-separate">Separate</button>
       </div>
     </div>
-    <div class="note" id="mode-note"></div>
-    <div class="row" id="crop-row">
-      <div class="lab">Output</div>
-      <div class="seg" id="crop">
+    <div class="row stack" id="crop-row">
+      <div class="lab">Output <small id="crop-note"></small></div>
+      <div class="seg full" id="crop">
         <button id="crop-off" class="on">Full canvas</button>
         <button id="crop-on">Crop</button>
       </div>
     </div>
-    <div class="note" id="crop-note"></div>
   </section>
 
   <section id="sched" class="card" data-view="record">
@@ -387,11 +451,10 @@
       <button class="chipbtn" data-in="900">in 15 min</button>
     </div>
     <div class="row">
-      <label class="lab" for="sched-dur">Record for</label>
-      <input class="field" type="number" id="sched-dur" min="1" max="360" step="any" value="135" inputmode="decimal" style="width:84px">
-      <div class="seg" id="sched-unit">
-        <button id="unit-s">sec</button>
-        <button id="unit-m" class="on">min</button>
+      <label class="lab" for="sched-min">Record for</label>
+      <div class="dur">
+        <input class="field" type="number" id="sched-min" min="0" max="360" step="1" value="90" inputmode="numeric" aria-label="Minutes">min
+        <input class="field" type="number" id="sched-sec" min="0" max="59" step="1" value="0" inputmode="numeric" aria-label="Seconds">sec
       </div>
     </div>
     <div class="chiprow" id="sched-dur-chips" aria-label="Duration presets">
@@ -400,7 +463,6 @@
       <button class="chipbtn" data-sec="300">5 min</button>
       <button class="chipbtn" data-sec="900">15 min</button>
       <button class="chipbtn" data-sec="5400">90 min</button>
-      <button class="chipbtn" data-sec="8100">135 min</button>
     </div>
     <div class="sched-grid">
       <div class="actions">
@@ -413,13 +475,13 @@
 
   <section id="recs" class="card" data-view="recs">
     <h2>Recordings</h2>
-    <div id="rec-list"><div class="empty">loading…</div></div>
+    <div id="rec-list"><div class="empty">Loading</div></div>
   </section>
 
   <section id="selftest" class="card" data-view="setup">
     <div class="card-h">Readiness <span id="st-level"></span><button class="btn sm" id="st-run">Refresh</button></div>
-    <div id="st-list"><div class="empty">checking…</div></div>
-    <div class="row"><div class="lab">Test recording<small>records 10 s, then checks what was written</small></div>
+    <div id="st-list"><div class="empty">Checking</div></div>
+    <div class="row"><div class="lab">Test recording<small>Records 10 s, then checks what was written</small></div>
       <button class="btn primary sm" id="rd-run">Run</button></div>
     <div id="rd-progress" class="note"></div>
     <div id="rd-list"></div>
@@ -427,11 +489,9 @@
   </section>
 
   <section id="realign" class="card" data-view="setup">
-    <div class="card-h">Re-align cameras <button class="btn sm" id="ra-run">Re-align</button></div>
-    <p class="note">Run this after the rig has been knocked or re-aimed. It closes the preview, captures a
-      still from each camera and refits the stitch (about 2 minutes). Stand someone in the
-      overlap at playing distance so the fit has something to lock onto. The guides on the
-      preview show the overlap (blue), the seam and the horizon.</p>
+    <div class="card-h">Re-align cameras
+      <span class="info" tabindex="0" role="button" aria-label="About re-aligning">i<span class="tip">Run after the rig has been knocked or re-aimed. It captures a still from each camera and refits the stitch, which takes about 2 minutes, and the preview stops meanwhile. Stand someone in the overlap at playing distance so the fit has something to lock onto. The guides on the preview show the overlap (blue), the seam and the horizon.</span></span>
+      <button class="btn sm" id="ra-run">Re-align</button></div>
     <div id="ra-state"></div>
     <table id="ra-score">
       <tr><th></th><th>before</th><th>after</th></tr>
@@ -488,19 +548,20 @@ function applyStatus(s) {
     btn.disabled = !(s.state === "standby" || s.state === "idle");
   }
   $("elapsed").textContent = s.elapsed_hms || "0:00:00";
-  $("hint").textContent = s.state === "idle" ? "pipeline asleep — press RECORD (cameras take a few seconds to wake)"
-    : s.state === "starting" ? "cameras waking up…"
-    : s.state === "finalizing" ? "saving the last recording…"
-    : s.state === "realigning" ? "re-aligning the cameras — recording is off until it finishes"
-    : s.state === "standby" && !s.recording ? "standby — framing live" : "";
-  if (rs.pending) $("hint").textContent = "pipeline restarted — the recording resumes on its own";
-  else if (rs.armed) $("hint").textContent = "recording will resume if anything restarts" +
-    (rs.restarts ? ` · resumed ${rs.restarts}×` : "");
+  hintBase = s.state === "idle" ? "Cameras are asleep. Pressing RECORD wakes them."
+    : s.state === "starting" ? "Cameras are waking up"
+    : s.state === "finalizing" ? "Saving the last recording"
+    : s.state === "realigning" ? "Re-aligning the cameras, recording is off until it finishes"
+    : "";
+  if (rs.pending) hintBase = "Pipeline restarted, the recording resumes on its own";
+  else if (rs.armed) hintBase = "Recording resumes on its own if anything restarts" +
+    (rs.restarts ? " (resumed " + rs.restarts + " times)" : "");
+  if (!hintFlash) $("hint").textContent = hintBase;
 
   $("st-storage").querySelector(".v").textContent = s.storage ? s.storage.minutes_left : "–";
   const tc = s.temp || {};
   $("st-temp").querySelector(".v").textContent =
-    (tc.soc_c != null ? tc.soc_c + "°" : "–") + (tc.nvme_c != null ? " · " + tc.nvme_c + "°" : "");
+    (tc.soc_c != null ? tc.soc_c + "°" : "–") + (tc.nvme_c != null ? " / " + tc.nvme_c + "°" : "");
   $("st-temp").classList.toggle("warn", !!tc.critical);
 
   const st = s.stitch;
@@ -512,7 +573,7 @@ function applyStatus(s) {
       const f0 = (st.cam0.frames - prevStitch.cam0.frames) / dt;
       const f1 = (st.cam1.frames - prevStitch.cam1.frames) / dt;
       fpsTxt = Math.round(f0) + " / " + Math.round(f1);
-      fpsNum = Math.min(f0, f1);
+      fpsNum = [f0, f1];
     }
     prevStitch = st; prevStitchAt = now;
     $("st-fps").querySelector(".v").textContent = fpsTxt;
@@ -525,18 +586,21 @@ function applyStatus(s) {
   applyCrop(s);
   applyRestitch(s.restitch);
   const lr = s.last_recording;
-  $("st-last").querySelector(".v").textContent = lr ? (lr.ok ? "✓" : "✗") : "–";
+  $("st-last").innerHTML = lr
+    ? `<span class="${lr.ok ? "lv-ok" : "lv-fail"}">${lr.ok ? "✓" : "✗"}</span> Last recording ${lr.ok ? "saved" : "failed"}`
+    : "";
 
   // the daemon says the picture is gone — drop it and start over. Or the
   // pipeline just came up: connect now rather than sitting out the backoff.
-  if (pv.live && pvPipelineGone()) pvFail();
+  pvWatchConfig(s);
+  if (pv.live && pvPipelineGone()) previewAttempt();
   else if (pv.waiting && pvPipelineUp()) previewAttempt();
 
   // schedule display
   if (s.schedule) {
     const d = new Date(s.schedule.start_at);
-    $("sched-status").textContent = "set: " + d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})
-      + " for " + fmtSpan(s.schedule.stop_after);
+    $("sched-status").textContent = "Set for " + d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})
+      + ", " + fmtSpan(s.schedule.stop_after);
   } else {
     $("sched-status").textContent = "";
   }
@@ -549,9 +613,17 @@ function applyStatus(s) {
   }
 }
 let prevStitch = null, prevStitchAt = 0;
+let hintBase = "", hintFlash = null;
+// a short-lived message from an action (failure, refusal) over the state line
+function flashHint(msg) {
+  $("hint").textContent = msg;
+  hintFlash = msg;
+  setTimeout(() => { if (hintFlash === msg) { hintFlash = null; $("hint").textContent = hintBase; } }, 5000);
+}
 
 /* ---------- health panel ---------- */
-const HIST = {cpu: [], fps: []};
+const HIST = {cpu: [], fps0: [], fps1: []};
+const FPS_OK = 20, FPS_WARN = 12, FPS_MAX = 35;
 const HIST_LEN = 60;
 let prevBytes = null, prevBytesAt = 0;
 function pushHist(k, v) {
@@ -566,6 +638,13 @@ function spark(id, arr, max) {
   el.setAttribute("points", arr.map((v, i) =>
     (i * 60 / (HIST_LEN - 1) + 60 - (arr.length - 1) * 60 / (HIST_LEN - 1)).toFixed(1) + "," +
     (21 - Math.min(1, v / top) * 20).toFixed(1)).join(" "));
+}
+function chart(id, arr) {
+  const el = $(id);
+  if (arr.length < 2) { el.setAttribute("points", ""); return; }
+  el.setAttribute("points", arr.map((v, i) =>
+    (300 - (arr.length - 1 - i) * 300 / (HIST_LEN - 1)).toFixed(1) + "," +
+    (80 - Math.min(1, v / FPS_MAX) * 78 - 1).toFixed(1)).join(" "));
 }
 function setBar(id, pct, warnAt, hotAt) {
   const bar = $(id);
@@ -601,9 +680,14 @@ function applyHealth(s, fpsNow) {
     $("h-gpu").textContent = Math.round(sy.gpu.pct) + "%";
     setBar("h-gpu-bar", sy.gpu.pct, 85, 98);
   } else { $("h-gpu").textContent = "–"; setBar("h-gpu-bar", 0, 101, 101); }
-  if (fpsNow != null) pushHist("fps", fpsNow);
-  spark("h-fps-spark", HIST.fps, 35);
-  $("h-fps").textContent = fpsNow != null ? Math.round(fpsNow) + " fps" : "–";
+  if (fpsNow) { pushHist("fps0", fpsNow[0]); pushHist("fps1", fpsNow[1]); }
+  chart("h-fps-l0", HIST.fps0);
+  chart("h-fps-l1", HIST.fps1);
+  for (const [id, v] of [["h-fps0", fpsNow && fpsNow[0]], ["h-fps1", fpsNow && fpsNow[1]]]) {
+    const el = $(id);
+    el.textContent = v == null ? "–" : Math.round(v);
+    el.className = v == null ? "" : v >= FPS_OK ? "lv-ok" : v >= FPS_WARN ? "lv-warn" : "lv-fail";
+  }
 
   const chips = [];
   for (const [k, c] of Object.entries(sy.temps || {})) {
@@ -621,24 +705,33 @@ function applyHealth(s, fpsNow) {
       chips.push(`<span class="chip"><b>bitrate</b>${mbps.toFixed(0)} Mb/s</span>`);
     }
     prevBytes = s.recording ? st.rec_bytes : null; prevBytesAt = now;
-    chips.push(`<span class="chip${st.skip ? " warn" : ""}"><b>skipped</b>${st.skip || 0}</span>`);
     chips.push(`<span class="chip${(st.cam0.errors + st.cam1.errors) ? " warn" : ""}"><b>cam errors</b>${st.cam0.errors + st.cam1.errors}</span>`);
   }
   $("h-chips").innerHTML = chips.join("");
 }
 
-/* state banner: the one line that says what the rig is doing */
+/* the one status indicator: a pill, top right. Errors get a callout, but
+   only once they persist (a restart in progress reports errors briefly). */
 const STATE_KIND = {recording: "recording", standby: "standby", starting: "busy",
-  finalizing: "busy", realigning: "busy", idle: "ready", error: "error"};
+  finalizing: "busy", realigning: "busy", idle: "ready", error: "error", connecting: "busy"};
+const STATE_TEXT = {recording: "Recording", standby: "Ready", starting: "Starting", finalizing: "Saving",
+  realigning: "Re-aligning", idle: "Asleep", error: "Error", connecting: "Connecting"};
+let linkUp = false, errSince = 0;
 function applyStateBar(s) {
-  const kind = s.recording ? "recording" : (s.error ? "error" : STATE_KIND[s.state] || "busy");
-  $("statebar").className = "statebar s-" + kind;
-  $("chip").textContent = s.recording ? "recording" : s.state;
-  $("banner").textContent = s.error || "";
+  const kind = !linkUp && s.state !== "connecting" ? "error"
+    : s.recording ? "recording" : (s.state === "error" ? "error" : STATE_KIND[s.state] || "busy");
+  $("chip").className = "pill s-" + kind;
+  $("chip-txt").textContent = !linkUp && s.state !== "connecting" ? "Offline"
+    : s.recording ? "Recording" : STATE_TEXT[s.state] || s.state;
+  const err = s.error && (s.state === "error" || Date.now() - (errSince || (errSince = Date.now())) > 4000);
+  if (!s.error) errSince = 0;
+  $("banner").hidden = !err;
+  $("banner").textContent = err ? s.error : "";
 }
 function setLink(up) {
-  $("link").classList.toggle("up", up);
-  $("link-txt").textContent = up ? "live" : "offline";
+  const changed = linkUp !== up;
+  linkUp = up;
+  if (changed && S) applyStateBar(S);
 }
 
 function connectWS() {
@@ -666,7 +759,7 @@ const HLS_URL = "http://" + HOST + ":8888/preview/index.m3u8";
 // One controller: at most one RTCPeerConnection, one Hls instance and one
 // pending timer. `gen` invalidates the callbacks of a superseded attempt.
 const pv = {gen: 0, pc: null, sess: null, hls: null, timer: null, tries: 0,
-            live: false, waiting: false, playing: null};
+            live: false, waiting: false, playing: null, hold: 0};
 
 function pvOverlay(text) {
   const el = $("preview-state");
@@ -674,10 +767,13 @@ function pvOverlay(text) {
   el.style.display = "flex";
 }
 
-// Is there anything to consume? Separate mode has no stitched path at all.
+// Is there anything to consume? Separate mode has no stitched path at all,
+// and for a moment after a mode or crop change the old pipeline is still
+// reporting standby while it is being replaced.
 function pvPipelineUp() {
   const s = (S && S.state) || "";
-  return (s === "standby" || s === "recording") && (!S || S.mode !== "separate");
+  return (s === "standby" || s === "recording") && (!S || S.mode !== "separate")
+      && Date.now() >= pv.hold;
 }
 
 // The daemon says the picture is gone: asleep, failed, re-aligning (which
@@ -688,15 +784,28 @@ function pvPipelineGone() {
       || !!(S && S.mode === "separate");
 }
 
+// Neutral wording only: this is never an error, the daemon is the authority.
 function pvPipelineText() {
   const s = (S && S.state) || "connecting";
-  if (S && S.mode === "separate") return "separate mode — no stitched preview";
-  return s === "starting" ? "starting cameras…"
-       : s === "idle" ? "cameras asleep — waking…"
-       : s === "finalizing" ? "saving the last recording…"
-       : s === "realigning" ? "re-aligning the cameras…"
-       : s === "error" ? "pipeline error — see the banner above"
-       : "connecting preview…";
+  if (pv.hold > Date.now()) return "Applying change";
+  return s === "starting" ? "Starting cameras"
+       : s === "idle" ? "Waking cameras"
+       : s === "finalizing" ? "Saving the last recording"
+       : s === "realigning" ? "Re-aligning the cameras"
+       : s === "error" ? "No picture while the pipeline is in error"
+       : "Connecting";
+}
+
+// A mode or crop change restarts the pipeline: drop the picture at once and
+// give the daemon a moment to publish the new state before reconnecting.
+let pvKey = null;
+function pvWatchConfig(s) {
+  const key = (s.mode || "live") + "|" + !!(s.crop && s.crop.enabled) + "|" + !!(s.crop && s.crop.active);
+  if (pvKey !== null && key !== pvKey) {
+    pv.hold = Date.now() + 2500;
+    previewAttempt();
+  }
+  pvKey = key;
 }
 
 function pvTeardown() {
@@ -719,13 +828,15 @@ function pvLive() {
   clearTimeout(pv.timer);
   pv.timer = null;
   $("preview-state").style.display = "none";
+  document.body.classList.add("pv-live");
 }
 
 // Rebuild from scratch — WebRTC first, HLS second — backing off between tries.
 function pvFail() {
   pv.live = false;
+  document.body.classList.remove("pv-live");
   pv.tries += 1;
-  pvOverlay(pv.tries < 4 ? pvPipelineText() : "preview not streaming — retrying…");
+  pvOverlay(pv.tries < 4 ? pvPipelineText() : "Waiting for the stream");
   clearTimeout(pv.timer);
   pv.timer = setTimeout(previewAttempt,
     Math.min(8000, 600 * Math.pow(2, Math.min(pv.tries - 1, 4))));
@@ -819,12 +930,19 @@ async function previewAttempt() {
   pvTeardown();
   pv.live = false;
   pv.waiting = false;
+  document.body.classList.remove("pv-live");
   clearTimeout(pv.timer);
   pv.timer = null;
   pvOverlay(pvPipelineText());
   // Nothing is published until cam2stitch is up, and loading the page is
   // what wakes it — wait for the daemon instead of flashing an error.
-  if (!pvPipelineUp()) { pv.waiting = true; pvDeadline(gen, 1000); return; }
+  if (!pvPipelineUp()) {
+    pv.waiting = true;
+    pv.tries = 0;                     // waiting on the daemon is not a failure
+    if (!(S && S.mode === "separate"))
+      pv.timer = setTimeout(() => { if (gen === pv.gen) previewAttempt(); }, 1000);
+    return;
+  }
   try {
     await pvWhep(gen);
     if (gen !== pv.gen) return;
@@ -874,7 +992,7 @@ function setFull(on) {
 function applyHud(s) {
   const hud = $("pv-hud");
   hud.classList.toggle("rec", !!s.recording);
-  $("pv-hud-state").textContent = s.recording ? "● REC" : s.state;
+  $("pv-hud-state").textContent = s.recording ? "● REC" : (STATE_TEXT[s.state] || s.state);
   $("pv-hud-time").textContent = s.recording ? (s.elapsed_hms || "") : "";
 }
 $("pv-full").addEventListener("click", () => setFull(true));
@@ -934,26 +1052,22 @@ $("recBtn").addEventListener("click", async () => {
       headers: {"Content-Type": "application/json", ...AUTH},
       body: JSON.stringify({request_id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now())})});
     const j = await r.json();
-    if (!j.ok) $("hint").textContent = j.error || "action failed";
-  } catch (e) { $("hint").textContent = "network error"; }
+    if (!j.ok) flashHint(j.error || "Action failed");
+  } catch (e) { flashHint("Network error"); }
   setTimeout(() => { if (S) applyStatus(S); }, 400);
 });
 
-/* schedule: start time plus a duration in seconds or minutes */
-let schedUnit = 60;                      // seconds per unit shown in the field
-function setUnit(sec) {
-  schedUnit = sec;
-  $("unit-s").classList.toggle("on", sec === 1);
-  $("unit-m").classList.toggle("on", sec === 60);
-  $("sched-dur").max = sec === 1 ? 21600 : 360;
-}
+/* schedule: start time plus one duration, minutes and seconds together */
 function setDurationSec(sec) {
-  const useSec = sec < 120 || sec % 60;
-  setUnit(useSec ? 1 : 60);
-  $("sched-dur").value = useSec ? sec : sec / 60;
+  $("sched-min").value = Math.floor(sec / 60);
+  $("sched-sec").value = sec % 60;
   markPresets();
 }
-function durationSec() { return parseFloat($("sched-dur").value || "0") * schedUnit; }
+function durationSec() {
+  const m = Math.max(0, parseInt($("sched-min").value || "0", 10) || 0);
+  const s = Math.max(0, parseInt($("sched-sec").value || "0", 10) || 0);
+  return m * 60 + s;
+}
 function markPresets() {
   const cur = durationSec();
   document.querySelectorAll("#sched-dur-chips .chipbtn").forEach(b =>
@@ -965,9 +1079,8 @@ function fmtSpan(sec) {
   const m = Math.floor(sec / 60), r = sec % 60;
   return m + " min" + (r ? " " + r + " s" : "");
 }
-$("unit-s").addEventListener("click", () => { setUnit(1); markPresets(); });
-$("unit-m").addEventListener("click", () => { setUnit(60); markPresets(); });
-$("sched-dur").addEventListener("input", markPresets);
+$("sched-min").addEventListener("input", markPresets);
+$("sched-sec").addEventListener("input", markPresets);
 document.querySelectorAll("#sched-dur-chips .chipbtn").forEach(b =>
   b.addEventListener("click", () => setDurationSec(Number(b.dataset.sec))));
 document.querySelectorAll("#sched-start-chips .chipbtn").forEach(b =>
@@ -976,11 +1089,11 @@ document.querySelectorAll("#sched-start-chips .chipbtn").forEach(b =>
     if (t.getSeconds() > 0) t.setMinutes(t.getMinutes() + 1);      // the time field has minute steps
     $("sched-time").value = String(t.getHours()).padStart(2, "0") + ":" + String(t.getMinutes()).padStart(2, "0");
   }));
-setDurationSec(135 * 60);
+setDurationSec(90 * 60);
 
 $("sched-set").addEventListener("click", async () => {
   const t = $("sched-time").value, secs = durationSec();
-  if (!t || !(secs > 0)) { $("sched-status").textContent = "pick a time and duration"; return; }
+  if (!t || !(secs > 0)) { $("sched-status").textContent = "Pick a start time and a duration"; $("sched-status").style.color = "var(--red)"; return; }
   const [hh, mm] = t.split(":").map(Number);
   const start = new Date();
   start.setHours(hh, mm, 0, 0);
@@ -989,7 +1102,7 @@ $("sched-set").addEventListener("click", async () => {
     headers: {"Content-Type": "application/json", ...AUTH},
     body: JSON.stringify({start_at: start.getTime(), stop_after: secs})});
   const j = await r.json();
-  $("sched-status").textContent = j.ok ? "scheduled ✓" : (j.error || "failed");
+  $("sched-status").textContent = j.ok ? "Scheduled ✓" : (j.error || "Failed");
   $("sched-status").style.color = j.ok ? "" : "var(--red)";
 });
 $("sched-clear").addEventListener("click", async () => {
@@ -1005,22 +1118,21 @@ const RD_SECS = 10;
 // last = the daemon's last_recording. Returns check rows like the self-test's.
 function readinessVerdict(samples, last) {
   const rows = [], row = (name, level, detail) => rows.push({name, level, detail});
-  if (samples.length < 2) { row("recording", "fail", "no frames seen, the pipeline never started recording"); return rows; }
+  if (samples.length < 2) { row("recording", "fail", "No frames seen, the pipeline never started recording"); return rows; }
   const a = samples[0], b = samples[samples.length - 1], dt = Math.max(0.5, b.t - a.t);
   const f0 = (b.c0 - a.c0) / dt, f1 = (b.c1 - a.c1) / dt, lo = Math.min(f0, f1);
   row("frame rate", lo >= 20 ? "ok" : lo >= 12 ? "warn" : "fail",
-    `${f0.toFixed(0)} / ${f1.toFixed(0)} fps` + (lo < 20 ? " (dim light drops the sensor rate)" : ""));
+    `${f0.toFixed(0)} / ${f1.toFixed(0)} fps`);
   const skew = b.skew_ms;
   if (skew != null && skew >= 0) row("pair skew", skew < 40 ? "ok" : skew < 80 ? "warn" : "fail", Math.round(skew) + " ms");
-  const skipped = b.skip - a.skip, errs = b.err - a.err;
-  row("dropped frames", skipped <= 0 ? "ok" : skipped / (lo * dt) < 0.05 ? "warn" : "fail", skipped + " skipped");
+  const errs = b.err - a.err;
   row("camera errors", errs <= 0 ? "ok" : "warn", String(errs));
   const mbps = (b.bytes - a.bytes) * 8 / 1e6 / dt;
   row("bitrate", mbps > 1 ? "ok" : "fail", mbps.toFixed(0) + " Mb/s written");
-  if (!last) row("saved", "fail", "the recording never finished saving");
+  if (!last) row("saved", "fail", "The recording never finished saving");
   else {
-    row("saved", last.ok ? "ok" : "fail", last.ok ? "master file written" : "master file missing");
-    row("proxy", last.has_proxy ? "ok" : "warn", last.has_proxy ? "preview copy made" : "no proxy file");
+    row("saved", last.ok ? "ok" : "fail", last.ok ? "Master file written" : "Master file missing");
+    row("proxy", last.has_proxy ? "ok" : "warn", last.has_proxy ? "Preview copy made" : "No proxy file");
     if (last.duration_s != null) row("duration", Math.abs(last.duration_s - RD_SECS) <= 3 ? "ok" : "warn",
       last.duration_s.toFixed(1) + " s for a " + RD_SECS + " s test");
   }
@@ -1043,17 +1155,17 @@ async function runReadiness() {
   const prog = $("rd-progress"), btn = $("rd-run");
   if (!S || S.recording || (S.mode || "live") !== "live" ||
       !["standby", "idle"].includes(S.state)) {
-    prog.textContent = "needs live-stitch mode and an idle rig (not recording, not busy)";
+    prog.textContent = "Needs live stitch mode and an idle rig";
     return;
   }
   btn.disabled = true; $("rd-delete").style.display = "none"; rdRender([]);
   const before = S.last_recording ? S.last_recording.session_id : null;
   try {
-    prog.textContent = "starting…";
+    prog.textContent = "Starting";
     const j = await recPost("start");
-    if (!j.ok) throw new Error(j.error || "could not start");
+    if (!j.ok) throw new Error(j.error || "Could not start");
     for (let i = 0; i < 60 && !(S && S.recording); i++) await sleep(500);   // cameras may need to wake
-    if (!(S && S.recording)) throw new Error("the rig never started recording");
+    if (!(S && S.recording)) throw new Error("The rig never started recording");
     const samples = [];
     const t0 = Date.now();
     while ((Date.now() - t0) / 1000 < RD_SECS) {
@@ -1061,10 +1173,10 @@ async function runReadiness() {
       if (st) samples.push({t: (Date.now() - t0) / 1000, c0: st.cam0.frames, c1: st.cam1.frames,
         bytes: st.rec_bytes || 0, skip: st.skip || 0, err: st.cam0.errors + st.cam1.errors,
         skew_ms: st.skew_avg_us >= 0 ? st.skew_avg_us / 1000 : null});
-      prog.textContent = "recording… " + Math.max(0, RD_SECS - Math.round((Date.now() - t0) / 1000)) + " s";
+      prog.textContent = "Recording, " + Math.max(0, RD_SECS - Math.round((Date.now() - t0) / 1000)) + " s left";
       await sleep(1000);
     }
-    prog.textContent = "stopping and saving…";
+    prog.textContent = "Stopping and saving";
     await recPost("stop");
     let last = null;
     for (let i = 0; i < 120; i++) {
@@ -1073,10 +1185,10 @@ async function runReadiness() {
     }
     rdSession = last ? last.session_id : null;
     rdRender(readinessVerdict(samples, last));
-    prog.textContent = "done";
+    prog.textContent = "Done";
     if (rdSession != null) $("rd-delete").style.display = "";
   } catch (e) {
-    prog.textContent = "test failed: " + (e.message || e);
+    prog.textContent = "Test failed: " + (e.message || e);
     try { if (S && S.recording) await recPost("stop"); } catch (_) {}
   } finally { btn.disabled = false; }
 }
@@ -1085,7 +1197,7 @@ $("rd-delete").addEventListener("click", async () => {
   if (rdSession == null) return;
   const r = await fetch("/api/recordings/" + rdSession, {method: "DELETE", headers: AUTH});
   const j = await r.json();
-  if (j.ok) { $("rd-delete").style.display = "none"; $("rd-progress").textContent = "test recording deleted"; loadRecordings(); }
+  if (j.ok) { $("rd-delete").style.display = "none"; $("rd-progress").textContent = "Test recording deleted"; loadRecordings(); }
   else $("rd-progress").textContent = j.error || "delete failed";
 });
 
@@ -1131,7 +1243,7 @@ function runSelftest() {
     $("st-list").innerHTML = (j.checks || []).map(c => `
       <div class="check"><span class="lv-${c.level}">${LV_ICON[c.level] || "?"}</span>
         <span class="n">${c.name}</span><span class="d">${esc(c.detail)}</span></div>`).join("");
-  }).catch(() => { $("st-list").innerHTML = '<div class="empty">check failed — network?</div>'; })
+  }).catch(() => { $("st-list").innerHTML = '<div class="empty">Check failed, is the network up?</div>'; })
     .finally(() => { $("st-run").disabled = false; });
 }
 $("st-run").addEventListener("click", runSelftest);
@@ -1149,11 +1261,11 @@ function applyRealign(ra) {
   const st = $("ra-state");
   if (running) {
     st.className = "lv-warn";
-    st.textContent = "re-aligning… " + (ra.started_at ? Math.round(Date.now() / 1000 - ra.started_at) + " s" : "");
+    st.textContent = "Re-aligning " + (ra.started_at ? Math.round(Date.now() / 1000 - ra.started_at) + " s" : "");
   } else if (ra.ok === true) {
-    st.className = "lv-ok"; st.textContent = "✓ alignment updated — the next recording uses it";
+    st.className = "lv-ok"; st.textContent = "✓ Alignment updated, the next recording uses it";
   } else if (ra.ok === false) {
-    st.className = "lv-fail"; st.textContent = "✗ " + (ra.error || "re-align failed");
+    st.className = "lv-fail"; st.textContent = "✗ " + (ra.error || "Re-align failed");
   } else { st.textContent = ""; }
   const logEl = $("ra-log");
   if (ra.log_tail && ra.log_tail.length && running) {
@@ -1194,39 +1306,41 @@ $("ra-run").addEventListener("click", async () => {
       headers: {"Content-Type": "application/json", ...AUTH}, body: "{}"});
     const j = await r.json();
     if (!j.ok) { $("ra-state").className = "lv-fail"; $("ra-state").textContent = j.error || "could not start"; $("ra-run").disabled = false; }
-  } catch (e) { $("ra-state").textContent = "network error"; $("ra-run").disabled = false; }
+  } catch (e) { $("ra-state").textContent = "Network error"; $("ra-run").disabled = false; }
 });
 
 /* ---------- recording mode (live stitch | separate) ---------- */
 let snapTimer = null;
+function snapLoad(n, on) {
+  const pane = $("pane" + n), img = $("snap" + n);
+  if (!on) { pane.classList.remove("has"); return; }
+  img.onload = () => pane.classList.add("has");
+  img.onerror = () => pane.classList.remove("has");
+  img.src = "/api/live/cam" + n + ".jpg?t=" + Date.now();
+}
 function applyMode(s) {
   const mode = s.mode || "live";
+  document.body.dataset.mode = mode;
   $("mode-live").classList.toggle("on", mode === "live");
   $("mode-separate").classList.toggle("on", mode === "separate");
   const locked = !!(s.recording || s.state === "finalizing" || s.state === "realigning");
   $("mode-live").disabled = $("mode-separate").disabled = locked;
-  $("mode-note").textContent = mode === "separate"
-    ? "each camera records its own 4K file; stitch it afterwards from Recordings"
-    : "";
-  const separateLive = s.recording && s.session_kind === "separate";
-  $("snaps").style.display = separateLive ? "block" : "none";
-  if (separateLive && !snapTimer) {
-    const tick = () => {
-      const t = Date.now();
-      $("snap0").src = "/api/live/cam0.jpg?t=" + t;
-      $("snap1").src = "/api/live/cam1.jpg?t=" + t;
-    };
+  // separate mode: one pane per camera, fed by the recorders' snapshots
+  const feed = mode === "separate" && !!s.recording && s.session_kind === "separate";
+  if (feed && !snapTimer) {
+    const tick = () => { snapLoad(0, true); snapLoad(1, true); };
     tick();
     snapTimer = setInterval(tick, 2000);
-  } else if (!separateLive && snapTimer) {
+  } else if (!feed && snapTimer) {
     clearInterval(snapTimer); snapTimer = null;
+    snapLoad(0, false); snapLoad(1, false);
   }
 }
 async function setMode(mode) {
   const r = await fetch("/api/mode", {method: "POST",
     headers: {"Content-Type": "application/json", ...AUTH}, body: JSON.stringify({mode})});
   const j = await r.json();
-  if (!j.ok) $("hint").textContent = j.error || "could not change mode";
+  if (!j.ok) flashHint(j.error || "Could not change mode");
   else if (S) { S.mode = mode; applyMode(S); }
 }
 $("mode-live").addEventListener("click", () => setMode("live"));
@@ -1237,21 +1351,19 @@ function applyCrop(s) {
   const c = s.crop || {};
   const note = $("crop-note");
   const live = (s.mode || "live") === "live";
-  $("crop-row").style.display = note.style.display = live && s.crop ? "" : "none";
+  $("crop-row").style.display = live && s.crop ? "" : "none";
   $("crop-off").classList.toggle("on", !c.enabled);
   $("crop-on").classList.toggle("on", !!c.enabled);
   $("crop-off").disabled = $("crop-on").disabled =
     !!(s.recording || s.state === "finalizing" || s.state === "realigning");
   const size = c.canvas ? c.canvas[0] + "×" + c.canvas[1] : "";
-  note.textContent = c.enabled && !c.active
-    ? "crop is on but the cropped maps could not be built, recording the full canvas"
-    : (c.enabled ? "no black margins, " : "") + (size ? size + " canvas" : "");
+  note.textContent = c.enabled && !c.active ? "crop unavailable, using the full canvas" : size;
 }
 async function setCrop(enabled) {
   const r = await fetch("/api/crop", {method: "POST",
     headers: {"Content-Type": "application/json", ...AUTH}, body: JSON.stringify({enabled})});
   const j = await r.json();
-  if (!j.ok) $("hint").textContent = j.error || "could not change crop";
+  if (!j.ok) flashHint(j.error || "Could not change crop");
   else if (S) { S.crop = {...(S.crop || {}), enabled}; applyCrop(S); }
 }
 $("crop-off").addEventListener("click", () => setCrop(false));
@@ -1265,7 +1377,7 @@ function applyRestitch(rs) {
   document.querySelectorAll("[data-stitch]").forEach(btn => {
     const id = Number(btn.dataset.stitch);
     btn.disabled = running || !!(S && S.recording);
-    btn.textContent = running && rs.session_id === id ? "Stitching…" : "Stitch";
+    btn.textContent = running && rs.session_id === id ? "Stitching" : "Stitch";
   });
   document.querySelectorAll("[data-stitch-progress]").forEach(el => {
     const id = Number(el.dataset.stitchProgress);
@@ -1301,7 +1413,7 @@ function loadRecordings() {
   fetch("/api/recordings").then(r => r.json()).then(j => {
     const list = $("rec-list");
     const recs = (j.recordings || []).slice(0, 30);
-    if (!recs.length) { list.innerHTML = '<div class="empty">nothing yet — first game awaits</div>'; return; }
+    if (!recs.length) { list.innerHTML = '<div class="empty">Nothing recorded yet</div>'; return; }
     if (list.querySelector("details[open]")) return;      // don't close a menu mid-tap
     list.innerHTML = recs.map(r => {
       const sep = r.kind === "separate";
@@ -1309,7 +1421,7 @@ function loadRecordings() {
       const tags = [
         r.recording ? '<span class="badge live">live</span>' : "",
         sep ? '<span class="badge">2 cameras</span>' : "",
-        r.resumed ? `<span class="badge">resumed ${r.resumed.restarts}× · ${Math.round(r.resumed.lost_s)} s gap</span>` : "",
+        r.resumed ? `<span class="badge">Resumed ${r.resumed.restarts} times, ${Math.round(r.resumed.lost_s)} s gap</span>` : "",
         r.error ? '<span class="badge bad">error</span>' : "",
       ].join("");
       const dl = (href, label, bytes) =>
@@ -1319,7 +1431,7 @@ function loadRecordings() {
         ${r.thumb ? `<img class="thumb" src="${r.thumb}" alt="">` : '<div class="thumb"></div>'}
         <div class="meta">
           <div class="t">${when}</div>
-          <div class="s">${fmtDur(r.duration_s)} · ${fmtBytes(r.size_bytes)}</div>
+          <div class="s">${fmtDur(r.duration_s)}, ${fmtBytes(r.size_bytes)}</div>
           ${tags ? `<div class="badges">${tags}</div>` : ""}
           ${sep ? `<div class="s" data-stitch-progress="${r.id}"></div>` : ""}
         </div>
@@ -1353,7 +1465,7 @@ function play(id) {
   v.play().catch(() => {});
 }
 async function mkproxy(id, btn) {
-  btn.disabled = true; btn.textContent = "Making…";
+  btn.disabled = true; btn.textContent = "Making";
   try {
     const r = await fetch("/api/recordings/" + id + "/proxy",
       {method: "POST", headers: {"Content-Type": "application/json", ...AUTH}});
@@ -1370,7 +1482,7 @@ async function mkproxy(id, btn) {
     }
   } catch (e) {
     btn.disabled = false; btn.textContent = "Make proxy";
-    $("hint").textContent = "proxy failed: " + (e.message || e);
+    flashHint("Proxy failed: " + (e.message || e));
   }
 }
 function closePlayer() {
@@ -1380,7 +1492,7 @@ function closePlayer() {
   p.style.display = "none";
 }
 async function del(id, btn) {
-  if (!confirm("Delete this recording? The master is gone too.")) return;
+  if (!confirm("Delete this recording? The master file is deleted too.")) return;
   btn.disabled = true;
   const r = await fetch("/api/recordings/" + id, {method: "DELETE", headers: AUTH});
   const j = await r.json();

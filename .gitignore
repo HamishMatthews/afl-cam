@@ -52,3 +52,4 @@ Thumbs.db
 auto.crt
 auto.key
 rig-artifacts/
+build/
