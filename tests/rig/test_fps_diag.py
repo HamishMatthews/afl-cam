@@ -19,7 +19,7 @@ from .conftest import stitch, wake_standby
 def _devs():
     out = {}
     for k, c in (CAMERAS or {}).items():
-        d = c.get("device") if isinstance(c, dict) else c
+        d = c if isinstance(c, str) else c.get("device")
         if d:
             out[k] = d
     return out
