@@ -25,6 +25,14 @@ Components: `.card`, `.btn` (`.primary`, `.danger`, `.sm`), `.seg` (segmented
 control), `.row` + `.lab` (a setting), `.note`, `.field`, `.metrics`/`.metric`.
 Dim text on the panel colours is at least 4.5:1.
 
+## Health panel
+
+`afl_cam/sysmon.py` samples CPU (total and per core), memory, labelled
+temperatures and GPU load; the daemon puts it in the status feed as `sys`.
+`applyHealth` draws bars, per-core columns, 60 s sparklines and chips for
+temperatures, disk, bitrate, skipped frames and camera errors. To add a
+reading: add it to `SysMon.snapshot`, then a row or chip in `applyHealth`.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.

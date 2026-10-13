@@ -80,7 +80,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-from . import cropsig, framing, selftest
+from . import cropsig, framing, selftest, sysmon
 from .config import (
     ALIGN_PYTHON, ALIGN_SCRIPT, AUDIO_DEVICES, CAMERAS, DB_PATH,
     ENCODE_CODEC, EXPOSURE_TIME, NATIVE_BITRATE_KBPS, OUTPUTS_DIR,
@@ -1622,6 +1622,7 @@ class CamDaemon:
         self._btn_last_edge = 0.0
         self._last_soc_c = self._last_nvme_c = None
         self.started_at = time.time()
+        self.sysmon = sysmon.SysMon()
         self.supervisor = StitchSupervisor(self)
         self.preview_chain = PreviewChain(self)
         self.db = RecordingDB(DB_PATH)
@@ -2760,6 +2761,7 @@ class CamDaemon:
                 "critical": (soc is not None and soc >= TEMP_STOP_C)
                 or (nvme is not None and nvme >= TEMP_STOP_C),
             },
+            "sys": self.sysmon.snapshot(),
             "audio": {
                 "cam0": bool(self.session and len(self.session.audio) > 0),
                 "cam1": bool(self.session and len(self.session.audio) > 1),
