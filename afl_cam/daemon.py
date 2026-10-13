@@ -644,12 +644,19 @@ def _mux(raw: Path, pts: Path, out: Path, codec: str,
     from .retime import retime_file
 
     track = None
-    bounds = _pts_bounds(pts) if audio is not None else None
-    if bounds is not None and audio.is_file() and _wav_seconds(audio) > 0.1:
-        track = out.with_suffix(".audio.m4a")
-        if not _make_audio_track(audio, bounds[0], bounds[1], track):
-            track.unlink(missing_ok=True)
-            track = None
+    if audio is not None:
+        bounds = _pts_bounds(pts)
+        length = _wav_seconds(audio)
+        if bounds is None or length <= 0.1:
+            # say why, or the field report is "the recording has no sound"
+            # with nothing in the log to explain it
+            log.warning("finalize: no mic for %s (%s holds %.1f s) — muxing "
+                        "video only", raw.name, audio.name, length)
+        else:
+            track = out.with_suffix(".audio.m4a")
+            if not _make_audio_track(audio, bounds[0], bounds[1], track):
+                track.unlink(missing_ok=True)
+                track = None
     try:
         ok = retime_file(raw, pts, out, codec=codec, tag=tag,
                          faststart=faststart, audio=track)
