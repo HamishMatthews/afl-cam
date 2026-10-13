@@ -102,6 +102,7 @@ def test_separate_record_cycle(separate):
     assert (folder / "thumb.jpg").is_file()
     rec = separate.recordings()[0]
     assert rec["kind"] == "separate" and rec["has_proxy"] and not rec["has_master"]
+    assert rec["proxy_bytes"] > 0 and rec["master_bytes"] == 0
     rows = separate.db.session_recordings(s.session_id)
     assert {r["status"] for r in rows} == {"complete"}, rows
 

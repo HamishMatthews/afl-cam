@@ -1579,6 +1579,13 @@ def session_master(folder: Path) -> Optional[Path]:
     return None
 
 
+def _file_size(path: Optional[Path]) -> int:
+    try:
+        return path.stat().st_size if path else 0
+    except OSError:
+        return 0
+
+
 class CamDaemon:
     """State machine + API. The tick loop is the single state owner."""
 
@@ -2637,6 +2644,8 @@ class CamDaemon:
                     "has_proxy": bool(proxy and proxy.is_file()
                                       and proxy.stat().st_size > 0),
                     "has_master": master is not None,
+                    "proxy_bytes": _file_size(proxy),
+                    "master_bytes": _file_size(master),
                     "kind": "separate" if separate else "live",
                     "thumb": f"/api/recordings/{s['id']}/thumb.jpg"
                     if proxy and (folder / "thumb.jpg").is_file() else None,

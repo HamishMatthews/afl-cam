@@ -25,6 +25,16 @@ Components: `.card`, `.btn` (`.primary`, `.danger`, `.sm`), `.seg` (segmented
 control), `.row` + `.lab` (a setting), `.note`, `.field`, `.metrics`/`.metric`.
 Dim text on the panel colours is at least 4.5:1.
 
+## Recordings
+
+One compact row per session: thumbnail, date, duration and size, a Play
+button and a menu (`<details class="menu">`) holding Download proxy,
+Download full quality (the master; "stitched" for separate sessions), Make
+proxy, Stitch and Delete, each download labelled with its size
+(`proxy_bytes`, `master_bytes` in `/api/recordings`). Badges show only what
+needs attention: live, resumed, error, two cameras. The list is not
+re-rendered while a menu is open.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.
