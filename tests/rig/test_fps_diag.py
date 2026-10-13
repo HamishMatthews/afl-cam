@@ -46,6 +46,11 @@ def _rate(seconds=10):
         "skip": b.get("skip", 0) - a.get("skip", 0),
         "skew_ms": round(b.get("skew_avg_us", -1) / 1000, 1),
         "errors": [(b.get(k) or {}).get("errors") for k in ("cam0", "cam1")],
+        # cam2stitch capture timing, averages since start: slot_ms = pipeline
+        # behind, dq_ms = waiting on the camera, dec_ms = jpegd, dt_ms = camera
+        # timestamp interval, gap50 = intervals over 50 ms, seq_lost = driver drops
+        "cam0_t": {k: v for k, v in (b.get("cam0") or {}).items() if k not in ("frames", "errors")},
+        "cam1_t": {k: v for k, v in (b.get("cam1") or {}).items() if k not in ("frames", "errors")},
     }
 
 
@@ -85,7 +90,7 @@ def _diagnose():
 
     # frame rate against a fixed exposure (100 us units): is the rate
     # exposure-limited? Both cameras at once, then back to auto.
-    for exp in (50, 100, 200, 250, 300, 400):
+    for exp in (100, 300):
         for d in devs.values():
             _v4l(d, "--set-ctrl=auto_exposure=1", f"--set-ctrl=exposure_time_absolute={exp}")
         time.sleep(3)

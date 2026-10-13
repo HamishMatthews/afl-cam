@@ -1423,6 +1423,18 @@ typedef struct {
     RK_S32 exposure;
     int count;                  /* frames decoded */
     int errors;                 /* decode failures (status reporting) */
+    /* capture-path timing (status "cam*.t"): where the frame rate goes */
+    int64_t t_slot_us;          /* waiting for a free ring slot (pipeline behind) */
+    int64_t t_dq_us;            /* waiting in DQBUF for the camera to deliver */
+    int64_t t_dec_us;           /* jpegd put_packet..get_frame (shared VPU core) */
+    int64_t t_n;                /* frames the three above were summed over */
+    int64_t ts_prev;            /* previous frame's V4L2 timestamp */
+    int64_t ts_dt_sum;          /* sum of intervals between frames */
+    int ts_dt_n;
+    int ts_gap;                 /* intervals above 1.5x the nominal 33.3 ms */
+    uint32_t seq_prev;
+    int seq_valid;
+    int seq_lost;               /* V4L2 sequence numbers skipped by the driver */
     /* exposure state machine (cam2h264.c) */
     int lock_pending, lock_phase, refine_left, refine_rounds;
     double target_luma, luma_acc;
@@ -1600,9 +1612,11 @@ static void *capture_thread(void *arg) {
     cam_t *c = arg;
     while (g_running) {
         /* backpressure: wait for a FREE ring slot BEFORE DQBUF */
+        int64_t t_a = now_us();
         int idx = ring_wait_slot(&c->ring, 0);
         if (idx < 0)
             break;
+        c->t_slot_us += now_us() - t_a;
         ring_slot_t *slot = &c->ring.slots[idx];
 
         if (slot->frame == NULL) {
@@ -1637,6 +1651,7 @@ static void *capture_thread(void *arg) {
         vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         vbuf.memory = V4L2_MEMORY_MMAP;
         int q_ok = 0;
+        int64_t t_b = now_us();
         while (g_running) {
             if (ioctl(c->fd, VIDIOC_DQBUF, &vbuf) < 0) {
                 if (errno == EAGAIN) { usleep(1000); continue; }
@@ -1651,6 +1666,19 @@ static void *capture_thread(void *arg) {
         int64_t pts_us = (int64_t)vbuf.timestamp.tv_sec * 1000000 +
                          vbuf.timestamp.tv_usec;
         size_t jpeg_size = vbuf.bytesused;
+        int64_t t_c = now_us();
+        c->t_dq_us += t_c - t_b;
+        if (c->ts_prev > 0 && pts_us > c->ts_prev) {
+            c->ts_dt_sum += pts_us - c->ts_prev;
+            c->ts_dt_n++;
+            if (pts_us - c->ts_prev > 50000)
+                c->ts_gap++;
+        }
+        c->ts_prev = pts_us;
+        if (c->seq_valid && vbuf.sequence > c->seq_prev + 1)
+            c->seq_lost += (int)(vbuf.sequence - c->seq_prev - 1);
+        c->seq_prev = vbuf.sequence;
+        c->seq_valid = 1;
 
         /* live-preview snapshot: raw UVC JPEG payload straight to disk
          * (full 4K, colors exact — the camera's own JPEG). The jpegenc
@@ -1682,6 +1710,8 @@ static void *capture_thread(void *arg) {
 
         MppFrame dec_frame = NULL;
         r = c->dec_mpi->decode_get_frame(c->dec_ctx, &dec_frame);
+        c->t_dec_us += now_us() - t_c;
+        c->t_n++;
         if (r || !dec_frame) { c->errors++; slot->state = 0; continue; }
         if (mpp_frame_get_info_change(dec_frame)) {
             c->dec_mpi->control(c->dec_ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
@@ -1785,12 +1815,27 @@ static void ctl_reply(ctl_t *c, int fd, const char *msg) {
         send(fd, line, (size_t)n, MSG_NOSIGNAL);
 }
 
+/* per-camera capture timing as JSON fields: mean ms per frame spent waiting
+ * for a ring slot (pipeline behind), waiting for the camera, and in jpegd;
+ * the mean interval between camera timestamps, intervals over 50 ms, and
+ * driver-lost sequence numbers. Averages since the pipeline started. */
+static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
+    double k = c->t_n > 0 ? 1.0 / (double)c->t_n / 1000.0 : 0.0;
+    double dt = c->ts_dt_n > 0 ? (double)c->ts_dt_sum / c->ts_dt_n / 1000.0 : 0.0;
+    snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
+             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d",
+             c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
+             c->ts_gap, c->seq_lost);
+    return buf;
+}
+
 /* called by the MAIN thread once per frame */
 static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
                         int out_count, int dup_count, int skip_count,
                         int skipped_start, int64_t skew_sum, int64_t skew_n) {
     if (!c)
         return;
+    char tbuf0[256], tbuf1[256];
     pthread_mutex_lock(&c->mu);
     c->rec_bytes = w->rec_bytes;
     int64_t elapsed = c->recording ? now_us() - c->rec_start_us : 0;
@@ -1798,8 +1843,8 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
     int n = snprintf(c->status_buf, sizeof c->status_buf,
         "{\"state\":\"%s\",\"rec_dir\":\"%s\",\"rec_elapsed_s\":%lld.%03lld,"
         "\"rec_bytes\":%lld,"
-        "\"cam0\":{\"frames\":%d,\"errors\":%d},"
-        "\"cam1\":{\"frames\":%d,\"errors\":%d},"
+        "\"cam0\":{\"frames\":%d,\"errors\":%d,%s},"
+        "\"cam1\":{\"frames\":%d,\"errors\":%d,%s},"
         "\"paired\":%d,\"dup\":%d,\"skip\":%d,\"start_trim\":%d,"
         "\"skew_avg_us\":%lld,"
         "\"enc\":{\"packets\":%d,\"put\":%d,\"drained\":%d},"
@@ -1809,8 +1854,8 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
         c->recording ? c->rec_dir : "",
         (long long)(elapsed / 1000000), (long long)((elapsed / 1000) % 1000),
         (long long)c->rec_bytes,
-        cams[0].count, cams[0].errors,
-        cams[1].count, cams[1].errors,
+        cams[0].count, cams[0].errors, cam_timing(&cams[0], tbuf0, sizeof tbuf0),
+        cams[1].count, cams[1].errors, cam_timing(&cams[1], tbuf1, sizeof tbuf1),
         out_count, dup_count, skip_count, skipped_start,
         (long long)skew,
         w->enc_count, w->put_total, w->drained_total,
