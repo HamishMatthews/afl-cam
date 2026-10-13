@@ -180,7 +180,7 @@
   body[data-tab="setup"] #g-overlap.known, body[data-tab="setup"] #g-horizon.known { display: block; }
 
   /* ---- setup view ---- */
-  .check { display: grid; grid-template-columns: 22px 92px 1fr; gap: 6px; padding: 8px 0;
+  .check { display: grid; grid-template-columns: 22px 116px 1fr; gap: 6px; padding: 8px 0;
     border-top: 1px solid var(--line); font-size: 14px; }
   .check .n { font-weight: 600; }
   .check .d { color: var(--dim); }
@@ -307,8 +307,13 @@
   </section>
 
   <section id="selftest" class="card" data-view="setup">
-    <div class="card-h">Pre-game check <span id="st-level"></span><button class="btn sm" id="st-run">Run again</button></div>
+    <div class="card-h">Readiness <span id="st-level"></span><button class="btn sm" id="st-run">Refresh</button></div>
     <div id="st-list"><div class="empty">checking…</div></div>
+    <div class="row"><div class="lab">Test recording<small>records 10 s, then checks what was written</small></div>
+      <button class="btn primary sm" id="rd-run">Run</button></div>
+    <div id="rd-progress" class="note"></div>
+    <div id="rd-list"></div>
+    <button class="btn sm danger" id="rd-delete" style="display:none;margin-top:8px">Delete test recording</button>
   </section>
 
   <section id="realign" class="card" data-view="setup">
@@ -684,6 +689,96 @@ $("sched-clear").addEventListener("click", async () => {
     headers: {"Content-Type": "application/json", ...AUTH},
     body: JSON.stringify({start_at: null})});
   $("sched-status").textContent = "";
+});
+
+/* ---------- readiness: a 10 s test recording, judged on what came out ---------- */
+const RD_SECS = 10;
+// Pure: samples [{t (s), c0, c1, bytes, skip, err, skew_ms}] taken while recording,
+// last = the daemon's last_recording. Returns check rows like the self-test's.
+function readinessVerdict(samples, last) {
+  const rows = [], row = (name, level, detail) => rows.push({name, level, detail});
+  if (samples.length < 2) { row("recording", "fail", "no frames seen, the pipeline never started recording"); return rows; }
+  const a = samples[0], b = samples[samples.length - 1], dt = Math.max(0.5, b.t - a.t);
+  const f0 = (b.c0 - a.c0) / dt, f1 = (b.c1 - a.c1) / dt, lo = Math.min(f0, f1);
+  row("frame rate", lo >= 20 ? "ok" : lo >= 12 ? "warn" : "fail",
+    `${f0.toFixed(0)} / ${f1.toFixed(0)} fps` + (lo < 20 ? " (dim light drops the sensor rate)" : ""));
+  const skew = b.skew_ms;
+  if (skew != null && skew >= 0) row("pair skew", skew < 40 ? "ok" : skew < 80 ? "warn" : "fail", Math.round(skew) + " ms");
+  const skipped = b.skip - a.skip, errs = b.err - a.err;
+  row("dropped frames", skipped <= 0 ? "ok" : skipped / (lo * dt) < 0.05 ? "warn" : "fail", skipped + " skipped");
+  row("camera errors", errs <= 0 ? "ok" : "warn", String(errs));
+  const mbps = (b.bytes - a.bytes) * 8 / 1e6 / dt;
+  row("bitrate", mbps > 1 ? "ok" : "fail", mbps.toFixed(0) + " Mb/s written");
+  if (!last) row("saved", "fail", "the recording never finished saving");
+  else {
+    row("saved", last.ok ? "ok" : "fail", last.ok ? "master file written" : "master file missing");
+    row("proxy", last.has_proxy ? "ok" : "warn", last.has_proxy ? "preview copy made" : "no proxy file");
+    if (last.duration_s != null) row("duration", Math.abs(last.duration_s - RD_SECS) <= 3 ? "ok" : "warn",
+      last.duration_s.toFixed(1) + " s for a " + RD_SECS + " s test");
+  }
+  return rows;
+}
+let rdSession = null;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function recPost(action) {
+  const r = await fetch("/api/record/" + action, {method: "POST",
+    headers: {"Content-Type": "application/json", ...AUTH},
+    body: JSON.stringify({request_id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now())})});
+  return r.json();
+}
+function rdRender(rows) {
+  $("rd-list").innerHTML = rows.map(c => `
+    <div class="check"><span class="lv-${c.level}">${LV_ICON[c.level] || "?"}</span>
+      <span class="n">${esc(c.name)}</span><span class="d">${esc(c.detail)}</span></div>`).join("");
+}
+async function runReadiness() {
+  const prog = $("rd-progress"), btn = $("rd-run");
+  if (!S || S.recording || (S.mode || "live") !== "live" ||
+      !["standby", "idle"].includes(S.state)) {
+    prog.textContent = "needs live-stitch mode and an idle rig (not recording, not busy)";
+    return;
+  }
+  btn.disabled = true; $("rd-delete").style.display = "none"; rdRender([]);
+  const before = S.last_recording ? S.last_recording.session_id : null;
+  try {
+    prog.textContent = "starting…";
+    const j = await recPost("start");
+    if (!j.ok) throw new Error(j.error || "could not start");
+    for (let i = 0; i < 60 && !(S && S.recording); i++) await sleep(500);   // cameras may need to wake
+    if (!(S && S.recording)) throw new Error("the rig never started recording");
+    const samples = [];
+    const t0 = Date.now();
+    while ((Date.now() - t0) / 1000 < RD_SECS) {
+      const st = S && S.stitch;
+      if (st) samples.push({t: (Date.now() - t0) / 1000, c0: st.cam0.frames, c1: st.cam1.frames,
+        bytes: st.rec_bytes || 0, skip: st.skip || 0, err: st.cam0.errors + st.cam1.errors,
+        skew_ms: st.skew_avg_us >= 0 ? st.skew_avg_us / 1000 : null});
+      prog.textContent = "recording… " + Math.max(0, RD_SECS - Math.round((Date.now() - t0) / 1000)) + " s";
+      await sleep(1000);
+    }
+    prog.textContent = "stopping and saving…";
+    await recPost("stop");
+    let last = null;
+    for (let i = 0; i < 120; i++) {
+      await sleep(500);
+      if (S && S.last_recording && S.last_recording.session_id !== before && S.state !== "finalizing") { last = S.last_recording; break; }
+    }
+    rdSession = last ? last.session_id : null;
+    rdRender(readinessVerdict(samples, last));
+    prog.textContent = "done";
+    if (rdSession != null) $("rd-delete").style.display = "";
+  } catch (e) {
+    prog.textContent = "test failed: " + (e.message || e);
+    try { if (S && S.recording) await recPost("stop"); } catch (_) {}
+  } finally { btn.disabled = false; }
+}
+$("rd-run").addEventListener("click", runReadiness);
+$("rd-delete").addEventListener("click", async () => {
+  if (rdSession == null) return;
+  const r = await fetch("/api/recordings/" + rdSession, {method: "DELETE", headers: AUTH});
+  const j = await r.json();
+  if (j.ok) { $("rd-delete").style.display = "none"; $("rd-progress").textContent = "test recording deleted"; loadRecordings(); }
+  else $("rd-progress").textContent = j.error || "delete failed";
 });
 
 /* ---------- setup: tabs, framing guides, self-test, re-align ---------- */
