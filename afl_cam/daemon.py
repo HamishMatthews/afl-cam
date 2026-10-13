@@ -79,12 +79,12 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-from . import framing, selftest
+from . import cropsig, framing, selftest
 from .config import (
     ALIGN_PYTHON, ALIGN_SCRIPT, AUDIO_DEVICES, CAMERAS, DB_PATH,
     ENCODE_CODEC, EXPOSURE_TIME, NATIVE_BITRATE_KBPS, OUTPUTS_DIR,
     PREVIEW_INTERVAL_SECS, ROOT_DIR, STITCH_BITRATE_KBPS,
-    STITCH_CANVAS_WIDTH, STITCH_PARAMS_DIR, STITCH_RECORDER_BIN,
+    CROP_PARAMS_DIR, STITCH_CANVAS_WIDTH, STITCH_PARAMS_DIR, STITCH_RECORDER_BIN,
     STITCH_SHADER, _discover_cameras, build_cam2h264, build_cam2stitch,
     rediscover_cameras, vk_env,
 )
@@ -116,6 +116,8 @@ HLS_PORT = 8888
 RESOLUTION = {"width": 3840, "height": 2160, "fps": 30}   # stitch pipeline
 HEVC = ENCODE_CODEC != "h264"
 INTENT_PATH = LIVE_SNAP_DIR / "intent.json"   # afl_cam/resume.py
+SETTINGS_PATH = LIVE_SNAP_DIR / "settings.json"   # persisted phone settings (crop)
+CROP_TIMEOUT_S = 120
 # a reboot later than this after the last heartbeat finalizes the
 # recording instead of resuming it (the game is over; don't record the shed)
 RESUME_MAX_GAP_S = float(os.environ.get("AFL_CAM_RESUME_MAX_GAP_S", "900"))
@@ -155,6 +157,24 @@ def _rediscover_with_kick() -> dict:
     except (OSError, subprocess.SubprocessError):
         pass
     return rediscover_cameras() or {}
+
+
+def _load_settings() -> dict:
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_settings(settings: dict) -> None:
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_PATH.with_name(SETTINGS_PATH.name + ".tmp")
+        tmp.write_text(json.dumps(settings))
+        tmp.replace(SETTINGS_PATH)
+    except OSError as e:
+        log.warning("settings: could not save (%s)", e)
 
 
 class StitchSupervisor(threading.Thread):
@@ -203,8 +223,9 @@ class StitchSupervisor(threading.Thread):
             log.error("stitch: %d/2 cameras found — %s",
                       len(cams), cams or "none")
             return False
-        if not STITCH_PARAMS_DIR.exists():
-            log.error("stitch: params dir missing: %s", STITCH_PARAMS_DIR)
+        params_dir = self.daemon.choose_params_dir()
+        if not params_dir.exists():
+            log.error("stitch: params dir missing: %s", params_dir)
             return False
 
         env = vk_env()
@@ -221,7 +242,7 @@ class StitchSupervisor(threading.Thread):
         cmd = [
             str(STITCH_RECORDER_BIN),
             cams["cam0"], cams["cam1"],
-            str(STITCH_PARAMS_DIR),
+            str(params_dir),
             str(LIVE_SNAP_DIR / "placeholder.raw.h264"),
             "0",                          # frames: run until QUIT/SIGTERM
             str(RESOLUTION["width"]),
@@ -1215,7 +1236,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._serve_file(snap, "image/jpeg")
         if path == "/api/framing":
             return self._json({"ok": True,
-                               "framing": framing.framing(STITCH_PARAMS_DIR)})
+                               "framing": framing.framing(self.daemon.params_dir)})
         if path == "/api/events":
             return self._upgrade_ws()
         if path == "/api/recordings":
@@ -1307,6 +1328,11 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._err("forbidden", status=403)
             ok, msg = self.daemon.set_mode((body or {}).get("mode"))
+            return self._json({"ok": ok, "error": msg})
+        if path == "/api/crop":
+            if not self._authed():
+                return self._err("forbidden", status=403)
+            ok, msg = self.daemon.set_crop((body or {}).get("enabled"))
             return self._json({"ok": ok, "error": msg})
         if path == "/api/realign":
             if not self._authed():
@@ -1454,6 +1480,10 @@ class CamDaemon:
         self._pending_realign = False
         self.realign: Optional[RealignJob] = None
         self.mode = "live"            # live | separate (resets on restart)
+        self.crop_enabled = bool(_load_settings().get("crop"))
+        # the map set the running pipeline was started with (framing guides
+        # and the status canvas must match what the preview shows)
+        self.params_dir = self._settled_params_dir()
         self._cameras_busy: Optional[str] = None   # separate recorders own them
         self.restitch: Optional[RestitchJob] = None
         self._idle_sigterm = False    # we asked the pipeline down (not a crash)
@@ -1662,6 +1692,78 @@ class CamDaemon:
         log.info("mode: %s", mode)
         return True, ""
 
+    # -- crop setting ------------------------------------------------------
+
+    def _settled_params_dir(self) -> Path:
+        """Map set for the current setting without building anything: the
+        crop set only when it exists and matches the live maps."""
+        if self.crop_enabled:
+            if cropsig.current(STITCH_PARAMS_DIR, CROP_PARAMS_DIR) is not None:
+                return CROP_PARAMS_DIR
+        return STITCH_PARAMS_DIR
+
+    def choose_params_dir(self) -> Path:
+        """Map set cam2stitch starts with. Builds (or reuses) the crop set
+        when the setting is on, and falls back to the full canvas when that
+        fails so a bad crop never costs a recording."""
+        if not self.crop_enabled:
+            self.params_dir = STITCH_PARAMS_DIR
+            return self.params_dir
+        try:
+            run = subprocess.run(
+                [sys.executable, "-m", "afl_cam.crop_maps",
+                 str(STITCH_PARAMS_DIR), str(CROP_PARAMS_DIR)],
+                capture_output=True, text=True, timeout=CROP_TIMEOUT_S, cwd=str(ROOT_DIR))
+            if run.returncode == 0:
+                self.params_dir = CROP_PARAMS_DIR
+                log.info("crop: %s", run.stdout.strip())
+                return self.params_dir
+            log.warning("crop: failed (%s) — using the full canvas",
+                        (run.stderr or run.stdout).strip()[-200:])
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("crop: failed (%s) — using the full canvas", e)
+        self.params_dir = STITCH_PARAMS_DIR
+        return self.params_dir
+
+    def crop_status(self) -> dict:
+        guides = framing.framing(self.params_dir)
+        return {"enabled": self.crop_enabled,
+                "active": self.params_dir == CROP_PARAMS_DIR,
+                "canvas": guides["canvas"] if guides else None}
+
+    def set_crop(self, enabled) -> tuple[bool, str]:
+        if not isinstance(enabled, bool):
+            return False, "enabled must be true or false"
+        with self._intents_lock:
+            if self.session is not None or self.state in (
+                    "recording", "finalizing") or self._pending_start:
+                return False, "can't change crop while recording"
+            if enabled == self.crop_enabled:
+                return True, ""
+            self.crop_enabled = enabled
+            settings = _load_settings()
+            settings["crop"] = enabled
+            _save_settings(settings)
+            # a running pipeline restarts on the other map set (the phone's
+            # WebSocket brings it straight back up); the encoder and the
+            # preview take their size from the maps at start
+            if self.state == "standby" and (
+                    self.supervisor.proc is not None or self.supervisor._adopted):
+                log.info("crop: %s — restarting the pipeline", "on" if enabled else "off")
+                self._idle_sigterm = True
+                self._set_state("idle")
+                self._sigterm_sent_at = time.time()
+                self._sigterm_target = self.supervisor.proc
+                if self.supervisor.proc is not None:
+                    self.supervisor.proc.send_signal(15)
+                else:
+                    try:
+                        self.supervisor.command("QUIT", timeout=3)
+                    except Exception:
+                        pass
+        log.info("crop: %s", "on" if enabled else "off")
+        return True, ""
+
     def start_restitch(self, session_id: int) -> tuple[bool, str]:
         if self.restitch is not None and self.restitch.is_alive():
             return False, "a re-stitch is already running"
@@ -1711,7 +1813,7 @@ class CamDaemon:
 
     def selftest(self) -> dict:
         soc, nvme = self._temperatures()
-        guides = framing.framing(STITCH_PARAMS_DIR)
+        guides = framing.framing(self.params_dir)
         checks = [
             selftest.cameras(_discover_cameras() or {},
                              self.supervisor.get_status()),
@@ -2537,6 +2639,7 @@ class CamDaemon:
             "schedule": self.schedule,
             "realign": self.realign_status(),
             "mode": self.mode,
+            "crop": self.crop_status(),
             "session_kind": self.session.kind if self.session else None,
             "restitch": self.restitch.summary() if self.restitch else None,
             "last_recording": self.last_recording,
