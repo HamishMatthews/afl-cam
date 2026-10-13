@@ -183,6 +183,31 @@ def test_audio_offset_ignores_a_stale_marker(tmp_path):
     assert daemon._audio_offset_s(wav, 11_000_000) == 0.0
 
 
+def test_concat_joins_resumed_segments_with_their_audio(es, tmp_path):
+    """A recording that resumed after a crash finalizes as parts joined by
+    the concat demuxer, so the VFR video and the audio both have to
+    survive the join."""
+    raw, pts_side = es / "h264_30to15.264", es / "h264_30to15.pts"
+    wav = tmp_path / "cam0.wav"
+    write_tone(wav, 3.0)
+    resume.audio_marker(wav).write_text(f"{stamps(pts_side)[0]}\n")
+
+    parts = []
+    for i in range(2):
+        part = tmp_path / f"stitch.part{i:03d}.mp4"
+        assert daemon.mux_proxy(raw, pts_side, part, audio=wav) is True
+        parts.append(part)
+
+    out = tmp_path / "stitch.mp4"
+    ok, err = resume.concat(parts, out, ("-movflags", "+faststart"))
+    assert ok, err
+
+    info = probe(out)
+    assert [s["codec_type"] for s in info["streams"]] == ["video", "audio"]
+    assert float(info["format"]["duration"]) == pytest.approx(
+        2 * real_duration(stamps(pts_side)), abs=3 * ONE_FRAME_S)
+
+
 def test_audio_files_follow_the_segment_numbering(tmp_path):
     """A resumed recording's mic takes are numbered with its video."""
     resumed = tmp_path / "stitch.000.raw.h264"
