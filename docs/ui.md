@@ -36,6 +36,14 @@ duration. `readinessVerdict()` is a pure function, unit-tested through node
 in `tests/unit/test_web_ui.py`. The test recording stays in Recordings; a
 button deletes it.
 
+## Health panel
+
+`afl_cam/sysmon.py` samples CPU (total and per core), memory, labelled
+temperatures and GPU load; the daemon puts it in the status feed as `sys`.
+`applyHealth` draws bars, per-core columns, 60 s sparklines and chips for
+temperatures, disk, bitrate, skipped frames and camera errors. To add a
+reading: add it to `SysMon.snapshot`, then a row or chip in `applyHealth`.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.

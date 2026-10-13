@@ -140,6 +140,30 @@
   @media (min-width: 560px) { .metrics { grid-template-columns: repeat(5, 1fr); } }
   .warn .v { color: var(--amber); }
 
+  /* ---- health panel ---- */
+  .hrow { display: grid; grid-template-columns: 76px 1fr 56px; align-items: center; gap: var(--s2);
+    padding: 6px 0; font-size: 13px; }
+  .hrow + .hrow { border-top: 1px solid var(--line); }
+  .hrow .hk { color: var(--dim); }
+  .hrow .hv { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .bar { height: 8px; border-radius: 4px; background: var(--panel2); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--blue); transition: width .4s; }
+  .bar.warn i { background: var(--amber); } .bar.hot i { background: var(--red); }
+  .hmid { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+  .hmid .bar { flex: 1; }
+  .spark { width: 72px; height: 22px; flex: none; }
+  .spark polyline { fill: none; stroke: var(--blue); stroke-width: 1.5; stroke-linejoin: round; }
+  .cores { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; margin: 2px 0 6px 84px; }
+  .cores .bar { height: 26px; border-radius: 3px; display: flex; align-items: flex-end; }
+  .cores .bar i { width: 100%; height: 0; transition: height .4s; }
+  .chips { display: flex; flex-wrap: wrap; gap: var(--s2); padding-top: var(--s2);
+    border-top: 1px solid var(--line); }
+  .chip { font-size: 12px; padding: 3px 9px; border-radius: var(--r-pill); background: var(--panel2);
+    border: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .chip b { color: var(--dim); font-weight: 500; margin-right: 4px; }
+  .chip.hot { border-color: var(--red); color: #ffa198; }
+  .chip.warn { border-color: var(--amber); color: var(--amber); }
+
   .empty { color: var(--dim); text-align: center; padding: var(--s5) 0; }
   .lv-ok { color: var(--green); } .lv-warn { color: var(--amber); } .lv-fail { color: var(--red); }
 
@@ -263,6 +287,24 @@
     <div class="metric" id="st-fps"><div class="v">–</div><div class="k">cam fps</div></div>
     <div class="metric" id="st-skew"><div class="v">–</div><div class="k">pair skew</div></div>
     <div class="metric" id="st-last"><div class="v">–</div><div class="k">last recording</div></div>
+  </section>
+
+  <section id="health" class="card" data-view="record">
+    <h2>Health</h2>
+    <div class="hrow"><span class="hk">CPU</span>
+      <div class="hmid"><div class="bar" id="h-cpu-bar"><i></i></div><svg class="spark" id="h-cpu-spark" viewBox="0 0 60 22" preserveAspectRatio="none"><polyline points=""/></svg></div>
+      <span class="hv" id="h-cpu">–</span></div>
+    <div class="cores" id="h-cores"></div>
+    <div class="hrow"><span class="hk">Memory</span>
+      <div class="hmid"><div class="bar" id="h-mem-bar"><i></i></div></div>
+      <span class="hv" id="h-mem">–</span></div>
+    <div class="hrow"><span class="hk">GPU</span>
+      <div class="hmid"><div class="bar" id="h-gpu-bar"><i></i></div></div>
+      <span class="hv" id="h-gpu">–</span></div>
+    <div class="hrow"><span class="hk">Frame rate</span>
+      <div class="hmid"><svg class="spark" id="h-fps-spark" viewBox="0 0 60 22" preserveAspectRatio="none" style="width:100%"><polyline points=""/></svg></div>
+      <span class="hv" id="h-fps">–</span></div>
+    <div class="chips" id="h-chips"></div>
   </section>
 
   <section class="card" data-view="record">
@@ -395,18 +437,20 @@ function applyStatus(s) {
   const st = s.stitch;
   if (st) {
     const now = Date.now();
-    let fpsTxt = "–";
+    let fpsTxt = "–", fpsNum = null;
     if (prevStitch && st.cam0.frames >= prevStitch.cam0.frames) {
       const dt = Math.max(0.5, (now - prevStitchAt) / 1000);
       const f0 = (st.cam0.frames - prevStitch.cam0.frames) / dt;
       const f1 = (st.cam1.frames - prevStitch.cam1.frames) / dt;
       fpsTxt = Math.round(f0) + " / " + Math.round(f1);
+      fpsNum = Math.min(f0, f1);
     }
     prevStitch = st; prevStitchAt = now;
     $("st-fps").querySelector(".v").textContent = fpsTxt;
     $("st-skew").querySelector(".v").textContent =
       st.skew_avg_us >= 0 ? Math.round(st.skew_avg_us / 1000) + "ms" : "–";
-  }
+    applyHealth(s, fpsNum);
+  } else applyHealth(s, null);
   applyRealign(s.realign);
   applyMode(s);
   applyCrop(s);
@@ -436,6 +480,83 @@ function applyStatus(s) {
   }
 }
 let prevStitch = null, prevStitchAt = 0;
+
+/* ---------- health panel ---------- */
+const HIST = {cpu: [], fps: []};
+const HIST_LEN = 60;
+let prevBytes = null, prevBytesAt = 0;
+function pushHist(k, v) {
+  const a = HIST[k];
+  a.push(v);
+  if (a.length > HIST_LEN) a.shift();
+}
+function spark(id, arr, max) {
+  const el = $(id).querySelector("polyline");
+  if (arr.length < 2) { el.setAttribute("points", ""); return; }
+  const top = max || Math.max(1, ...arr);
+  el.setAttribute("points", arr.map((v, i) =>
+    (i * 60 / (HIST_LEN - 1) + 60 - (arr.length - 1) * 60 / (HIST_LEN - 1)).toFixed(1) + "," +
+    (21 - Math.min(1, v / top) * 20).toFixed(1)).join(" "));
+}
+function setBar(id, pct, warnAt, hotAt) {
+  const bar = $(id);
+  bar.querySelector("i").style.width = Math.max(0, Math.min(100, pct || 0)) + "%";
+  bar.classList.toggle("hot", pct >= hotAt);
+  bar.classList.toggle("warn", pct >= warnAt && pct < hotAt);
+}
+const TEMP_WARN = 75, TEMP_HOT = 82;
+function applyHealth(s, fpsNow) {
+  const sy = s.sys || {};
+  if (sy.cpu) {
+    $("h-cpu").textContent = Math.round(sy.cpu.total) + "%";
+    setBar("h-cpu-bar", sy.cpu.total, 80, 95);
+    pushHist("cpu", sy.cpu.total);
+    spark("h-cpu-spark", HIST.cpu, 100);
+    const box = $("h-cores");
+    if (box.children.length !== sy.cpu.cores.length)
+      box.innerHTML = sy.cpu.cores.map(() => '<div class="bar"><i></i></div>').join("");
+    sy.cpu.cores.forEach((p, i) => {
+      const b = box.children[i];
+      if (!b) return;
+      b.firstChild.style.height = p + "%";
+      b.classList.toggle("hot", p >= 95);
+      b.title = "core " + i + ": " + Math.round(p) + "%";
+    });
+  }
+  if (sy.mem) {
+    $("h-mem").textContent = Math.round(sy.mem.pct) + "%";
+    $("h-mem").title = sy.mem.used_mb + " of " + sy.mem.total_mb + " MB";
+    setBar("h-mem-bar", sy.mem.pct, 80, 92);
+  }
+  if (sy.gpu) {
+    $("h-gpu").textContent = Math.round(sy.gpu.pct) + "%";
+    setBar("h-gpu-bar", sy.gpu.pct, 85, 98);
+  } else { $("h-gpu").textContent = "–"; setBar("h-gpu-bar", 0, 101, 101); }
+  if (fpsNow != null) pushHist("fps", fpsNow);
+  spark("h-fps-spark", HIST.fps, 35);
+  $("h-fps").textContent = fpsNow != null ? Math.round(fpsNow) + " fps" : "–";
+
+  const chips = [];
+  for (const [k, c] of Object.entries(sy.temps || {})) {
+    const lim = k === "nvme" ? 70 : TEMP_WARN;
+    const cls = c >= TEMP_HOT ? " hot" : c >= lim ? " warn" : "";
+    chips.push(`<span class="chip${cls}"><b>${k}</b>${Math.round(c)}°</span>`);
+  }
+  const st = s.stitch;
+  if (s.storage && s.storage.free_gb != null)
+    chips.push(`<span class="chip"><b>disk free</b>${Math.round(s.storage.free_gb)} GB</span>`);
+  if (st) {
+    const now = Date.now();
+    if (s.recording && prevBytes != null && st.rec_bytes >= prevBytes) {
+      const mbps = (st.rec_bytes - prevBytes) * 8 / 1e6 / Math.max(0.5, (now - prevBytesAt) / 1000);
+      chips.push(`<span class="chip"><b>bitrate</b>${mbps.toFixed(0)} Mb/s</span>`);
+    }
+    prevBytes = s.recording ? st.rec_bytes : null; prevBytesAt = now;
+    chips.push(`<span class="chip${st.skip ? " warn" : ""}"><b>skipped</b>${st.skip || 0}</span>`);
+    chips.push(`<span class="chip${(st.cam0.errors + st.cam1.errors) ? " warn" : ""}"><b>cam errors</b>${st.cam0.errors + st.cam1.errors}</span>`);
+  }
+  $("h-chips").innerHTML = chips.join("");
+}
 
 /* state banner: the one line that says what the rig is doing */
 const STATE_KIND = {recording: "recording", standby: "standby", starting: "busy",
