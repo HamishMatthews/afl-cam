@@ -49,7 +49,12 @@ def _rate(seconds=10):
     }
 
 
-def test_fps_diagnostic():
+def test_fps_diagnostic(capsys):
+    with capsys.disabled():      # pytest hides prints of passing tests; CI logs need these
+        _diagnose()
+
+
+def _diagnose():
     wake_standby()
     devs = _devs()
     print("\n[fps-diag] devices:", devs)
