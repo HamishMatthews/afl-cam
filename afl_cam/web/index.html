@@ -140,6 +140,30 @@
   @media (min-width: 560px) { .metrics { grid-template-columns: repeat(5, 1fr); } }
   .warn .v { color: var(--amber); }
 
+  /* ---- health panel ---- */
+  .hrow { display: grid; grid-template-columns: 76px 1fr 56px; align-items: center; gap: var(--s2);
+    padding: 6px 0; font-size: 13px; }
+  .hrow + .hrow { border-top: 1px solid var(--line); }
+  .hrow .hk { color: var(--dim); }
+  .hrow .hv { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .bar { height: 8px; border-radius: 4px; background: var(--panel2); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--blue); transition: width .4s; }
+  .bar.warn i { background: var(--amber); } .bar.hot i { background: var(--red); }
+  .hmid { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+  .hmid .bar { flex: 1; }
+  .spark { width: 72px; height: 22px; flex: none; }
+  .spark polyline { fill: none; stroke: var(--blue); stroke-width: 1.5; stroke-linejoin: round; }
+  .cores { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; margin: 2px 0 6px 84px; }
+  .cores .bar { height: 26px; border-radius: 3px; display: flex; align-items: flex-end; }
+  .cores .bar i { width: 100%; height: 0; transition: height .4s; }
+  .chips { display: flex; flex-wrap: wrap; gap: var(--s2); padding-top: var(--s2);
+    border-top: 1px solid var(--line); }
+  .chip { font-size: 12px; padding: 3px 9px; border-radius: var(--r-pill); background: var(--panel2);
+    border: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .chip b { color: var(--dim); font-weight: 500; margin-right: 4px; }
+  .chip.hot { border-color: var(--red); color: #ffa198; }
+  .chip.warn { border-color: var(--amber); color: var(--amber); }
+
   .empty { color: var(--dim); text-align: center; padding: var(--s5) 0; }
   .lv-ok { color: var(--green); } .lv-warn { color: var(--amber); } .lv-fail { color: var(--red); }
 
@@ -164,6 +188,25 @@
   /* ---- preview ---- */
   #preview { position: relative; background: #000; border-radius: var(--r-lg); overflow: hidden;
     margin-bottom: var(--s3); border: 1px solid var(--line); }
+  #stage { position: relative; transform-origin: 0 0; will-change: transform; }
+  .pv-btn { position: absolute; top: var(--s2); right: var(--s2); width: var(--tap); height: var(--tap);
+    border-radius: 50%; border: none; background: rgba(0,0,0,.55); color: #fff; font-size: 26px;
+    line-height: 1; display: flex; align-items: center; justify-content: center; z-index: 2; cursor: pointer; }
+  .pv-btn svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+  #pv-close, #pv-hud { display: none; }
+  /* full screen: a fixed overlay (iOS Safari only full-screens a bare <video>) */
+  body.pv-full { overflow: hidden; }
+  body.pv-full #preview { position: fixed; inset: 0; z-index: 20; margin: 0; border: none; border-radius: 0;
+    touch-action: none; }
+  body.pv-full #stage { width: 100%; height: 100%; }
+  body.pv-full #vid { width: 100%; height: 100%; aspect-ratio: auto !important; object-fit: contain; }
+  body.pv-full #guides, body.pv-full #snaps { display: none; }
+  body.pv-full #pv-full { display: none; }
+  body.pv-full #pv-close { display: flex; top: calc(var(--s2) + var(--safe-t)); left: var(--s2); right: auto; }
+  body.pv-full #pv-hud { display: flex; align-items: center; gap: var(--s2); position: absolute; z-index: 2;
+    bottom: calc(var(--s3) + var(--safe-b)); left: 50%; transform: translateX(-50%); padding: 4px 12px;
+    border-radius: var(--r-pill); background: rgba(0,0,0,.55); font-size: 13px; font-variant-numeric: tabular-nums; }
+  #pv-hud.rec #pv-hud-state { color: var(--red); font-weight: 700; }
   #vid { display: block; width: 100%; aspect-ratio: 2.8 / 1; background: #000; }
   #preview-state {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -200,20 +243,42 @@
   .sched-grid label { color: var(--dim); font-size: 13px; }
   .sched-grid .actions { display: flex; gap: var(--s2); width: 100%; }
   .sched-grid .actions .btn { flex: 1; }
+  .chiprow { display: flex; flex-wrap: wrap; gap: var(--s2); padding: var(--s2) 0 var(--s3); }
+  .chipbtn { min-height: 36px; padding: 0 var(--s3); border-radius: var(--r-pill); background: var(--panel2);
+    border: 1px solid var(--line); color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; }
+  .chipbtn.on { border-color: var(--blue); color: var(--blue); }
   #sched-status { color: var(--green); font-size: 13px; }
 
   /* ---- recordings ---- */
   .rec {
-    display: grid; grid-template-columns: 108px 1fr auto; gap: var(--s3); align-items: center;
+    display: grid; grid-template-columns: 88px 1fr auto; gap: var(--s3); align-items: center;
     padding: 10px 0; border-top: 1px solid var(--line);
   }
-  .rec .thumb { width: 108px; height: 60px; object-fit: cover; border-radius: var(--r-sm); background: #000; }
-  .rec .meta .t { font-weight: 600; font-size: 14px; }
+  .rec .thumb { width: 88px; height: 50px; object-fit: cover; border-radius: var(--r-sm); background: #000; }
+  .rec .meta { min-width: 0; }
+  .rec .meta .t { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-width: 400px) { .rec { grid-template-columns: 64px 1fr auto; gap: var(--s2); }
+    .rec .thumb { width: 64px; height: 36px; } }
   .rec .meta .s { color: var(--dim); font-size: 12px; margin-top: 2px; }
   .rec .badges { margin-top: 3px; display: flex; gap: 4px; flex-wrap: wrap; }
   .badge { font-size: 10px; padding: 1px 6px; border-radius: var(--r-pill); border: 1px solid var(--line); color: var(--dim); }
-  .badge.ok { color: var(--green); border-color: var(--green); }
-  .rec .acts { display: flex; flex-direction: column; gap: 6px; }
+  .badge.live { color: #fff; background: var(--red-deep); border-color: var(--red-deep); }
+  .badge.bad { color: var(--red); border-color: var(--red); }
+  .rec .acts { display: flex; gap: var(--s2); align-items: center; }
+  .rec .acts .btn { min-width: var(--tap); }
+  .menu { position: relative; }
+  .menu summary { list-style: none; cursor: pointer; }
+  .menu summary::-webkit-details-marker { display: none; }
+  .menu .pop { position: absolute; right: 0; top: calc(100% + 6px); z-index: 4; min-width: 200px;
+    background: var(--raise); border: 1px solid var(--line); border-radius: var(--r-md);
+    box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow: hidden; }
+  .menu .item { display: flex; justify-content: space-between; gap: var(--s3); width: 100%;
+    min-height: var(--tap); align-items: center; padding: 0 var(--s4); background: none; border: none;
+    color: var(--ink); font-size: 14px; text-decoration: none; text-align: left; cursor: pointer; }
+  .menu .item + .item { border-top: 1px solid var(--line); }
+  .menu .item small { color: var(--dim); }
+  .menu .item.danger { color: #ffa198; }
+  .menu .item:disabled { opacity: .5; }
 
   /* player modal */
   #player {
@@ -241,14 +306,21 @@
 
 <main>
   <section id="preview" data-view="all">
-    <video id="vid" playsinline muted autoplay></video>
-    <div id="snaps"><img id="snap0" alt=""><img id="snap1" alt=""></div>
-    <div id="guides">
-      <div id="g-overlap"></div>
-      <div id="g-horizon"></div>
-      <div id="g-seam"></div>
+    <div id="stage">
+      <video id="vid" playsinline muted autoplay></video>
+      <div id="snaps"><img id="snap0" alt=""><img id="snap1" alt=""></div>
+      <div id="guides">
+        <div id="g-overlap"></div>
+        <div id="g-horizon"></div>
+        <div id="g-seam"></div>
+      </div>
     </div>
     <div id="preview-state">preview connecting…</div>
+    <button id="pv-full" class="pv-btn" aria-label="Full screen">
+      <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+    <button id="pv-close" class="pv-btn" aria-label="Exit full screen">×</button>
+    <div id="pv-hud"><span id="pv-hud-state"></span> <span id="pv-hud-time"></span>
+      <button id="pv-reset" class="chipbtn" aria-label="Reset zoom">1×</button></div>
   </section>
 
   <section id="rec" class="card" data-view="record">
@@ -263,6 +335,24 @@
     <div class="metric" id="st-fps"><div class="v">–</div><div class="k">cam fps</div></div>
     <div class="metric" id="st-skew"><div class="v">–</div><div class="k">pair skew</div></div>
     <div class="metric" id="st-last"><div class="v">–</div><div class="k">last recording</div></div>
+  </section>
+
+  <section id="health" class="card" data-view="record">
+    <h2>Health</h2>
+    <div class="hrow"><span class="hk">CPU</span>
+      <div class="hmid"><div class="bar" id="h-cpu-bar"><i></i></div><svg class="spark" id="h-cpu-spark" viewBox="0 0 60 22" preserveAspectRatio="none"><polyline points=""/></svg></div>
+      <span class="hv" id="h-cpu">–</span></div>
+    <div class="cores" id="h-cores"></div>
+    <div class="hrow"><span class="hk">Memory</span>
+      <div class="hmid"><div class="bar" id="h-mem-bar"><i></i></div></div>
+      <span class="hv" id="h-mem">–</span></div>
+    <div class="hrow"><span class="hk">GPU</span>
+      <div class="hmid"><div class="bar" id="h-gpu-bar"><i></i></div></div>
+      <span class="hv" id="h-gpu">–</span></div>
+    <div class="hrow"><span class="hk">Frame rate</span>
+      <div class="hmid"><svg class="spark" id="h-fps-spark" viewBox="0 0 60 22" preserveAspectRatio="none" style="width:100%"><polyline points=""/></svg></div>
+      <span class="hv" id="h-fps">–</span></div>
+    <div class="chips" id="h-chips"></div>
   </section>
 
   <section class="card" data-view="record">
@@ -287,12 +377,32 @@
 
   <section id="sched" class="card" data-view="record">
     <h2>Schedule</h2>
+    <div class="row">
+      <label class="lab" for="sched-time">Start at</label>
+      <input class="field" type="time" id="sched-time" step="60">
+    </div>
+    <div class="chiprow" id="sched-start-chips" aria-label="Start soon">
+      <button class="chipbtn" data-in="60">in 1 min</button>
+      <button class="chipbtn" data-in="300">in 5 min</button>
+      <button class="chipbtn" data-in="900">in 15 min</button>
+    </div>
+    <div class="row">
+      <label class="lab" for="sched-dur">Record for</label>
+      <input class="field" type="number" id="sched-dur" min="1" max="360" step="any" value="135" inputmode="decimal" style="width:84px">
+      <div class="seg" id="sched-unit">
+        <button id="unit-s">sec</button>
+        <button id="unit-m" class="on">min</button>
+      </div>
+    </div>
+    <div class="chiprow" id="sched-dur-chips" aria-label="Duration presets">
+      <button class="chipbtn" data-sec="30">30 s</button>
+      <button class="chipbtn" data-sec="60">1 min</button>
+      <button class="chipbtn" data-sec="300">5 min</button>
+      <button class="chipbtn" data-sec="900">15 min</button>
+      <button class="chipbtn" data-sec="5400">90 min</button>
+      <button class="chipbtn" data-sec="8100">135 min</button>
+    </div>
     <div class="sched-grid">
-      <label for="sched-time">Start at</label>
-      <input class="field" type="time" id="sched-time">
-      <label for="sched-dur">Stop after</label>
-      <input class="field" type="number" id="sched-dur" min="1" max="360" step="15" value="135" style="width:80px">
-      <label for="sched-dur">min</label>
       <div class="actions">
         <button class="btn primary" id="sched-set">Set schedule</button>
         <button class="btn danger" id="sched-clear">Clear</button>
@@ -364,6 +474,7 @@ const AUTH = token ? {"X-AFL-Token": token} : {};
 function applyStatus(s) {
   S = s;
   applyStateBar(s);
+  if (document.body.classList.contains("pv-full")) applyHud(s);
 
   const btn = $("recBtn");
   const rs = s.resume || {};
@@ -395,18 +506,20 @@ function applyStatus(s) {
   const st = s.stitch;
   if (st) {
     const now = Date.now();
-    let fpsTxt = "–";
+    let fpsTxt = "–", fpsNum = null;
     if (prevStitch && st.cam0.frames >= prevStitch.cam0.frames) {
       const dt = Math.max(0.5, (now - prevStitchAt) / 1000);
       const f0 = (st.cam0.frames - prevStitch.cam0.frames) / dt;
       const f1 = (st.cam1.frames - prevStitch.cam1.frames) / dt;
       fpsTxt = Math.round(f0) + " / " + Math.round(f1);
+      fpsNum = Math.min(f0, f1);
     }
     prevStitch = st; prevStitchAt = now;
     $("st-fps").querySelector(".v").textContent = fpsTxt;
     $("st-skew").querySelector(".v").textContent =
       st.skew_avg_us >= 0 ? Math.round(st.skew_avg_us / 1000) + "ms" : "–";
-  }
+    applyHealth(s, fpsNum);
+  } else applyHealth(s, null);
   applyRealign(s.realign);
   applyMode(s);
   applyCrop(s);
@@ -423,7 +536,7 @@ function applyStatus(s) {
   if (s.schedule) {
     const d = new Date(s.schedule.start_at);
     $("sched-status").textContent = "set: " + d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})
-      + " +" + s.schedule.stop_after / 60 + "min";
+      + " for " + fmtSpan(s.schedule.stop_after);
   } else {
     $("sched-status").textContent = "";
   }
@@ -436,6 +549,83 @@ function applyStatus(s) {
   }
 }
 let prevStitch = null, prevStitchAt = 0;
+
+/* ---------- health panel ---------- */
+const HIST = {cpu: [], fps: []};
+const HIST_LEN = 60;
+let prevBytes = null, prevBytesAt = 0;
+function pushHist(k, v) {
+  const a = HIST[k];
+  a.push(v);
+  if (a.length > HIST_LEN) a.shift();
+}
+function spark(id, arr, max) {
+  const el = $(id).querySelector("polyline");
+  if (arr.length < 2) { el.setAttribute("points", ""); return; }
+  const top = max || Math.max(1, ...arr);
+  el.setAttribute("points", arr.map((v, i) =>
+    (i * 60 / (HIST_LEN - 1) + 60 - (arr.length - 1) * 60 / (HIST_LEN - 1)).toFixed(1) + "," +
+    (21 - Math.min(1, v / top) * 20).toFixed(1)).join(" "));
+}
+function setBar(id, pct, warnAt, hotAt) {
+  const bar = $(id);
+  bar.querySelector("i").style.width = Math.max(0, Math.min(100, pct || 0)) + "%";
+  bar.classList.toggle("hot", pct >= hotAt);
+  bar.classList.toggle("warn", pct >= warnAt && pct < hotAt);
+}
+const TEMP_WARN = 75, TEMP_HOT = 82;
+function applyHealth(s, fpsNow) {
+  const sy = s.sys || {};
+  if (sy.cpu) {
+    $("h-cpu").textContent = Math.round(sy.cpu.total) + "%";
+    setBar("h-cpu-bar", sy.cpu.total, 80, 95);
+    pushHist("cpu", sy.cpu.total);
+    spark("h-cpu-spark", HIST.cpu, 100);
+    const box = $("h-cores");
+    if (box.children.length !== sy.cpu.cores.length)
+      box.innerHTML = sy.cpu.cores.map(() => '<div class="bar"><i></i></div>').join("");
+    sy.cpu.cores.forEach((p, i) => {
+      const b = box.children[i];
+      if (!b) return;
+      b.firstChild.style.height = p + "%";
+      b.classList.toggle("hot", p >= 95);
+      b.title = "core " + i + ": " + Math.round(p) + "%";
+    });
+  }
+  if (sy.mem) {
+    $("h-mem").textContent = Math.round(sy.mem.pct) + "%";
+    $("h-mem").title = sy.mem.used_mb + " of " + sy.mem.total_mb + " MB";
+    setBar("h-mem-bar", sy.mem.pct, 80, 92);
+  }
+  if (sy.gpu) {
+    $("h-gpu").textContent = Math.round(sy.gpu.pct) + "%";
+    setBar("h-gpu-bar", sy.gpu.pct, 85, 98);
+  } else { $("h-gpu").textContent = "–"; setBar("h-gpu-bar", 0, 101, 101); }
+  if (fpsNow != null) pushHist("fps", fpsNow);
+  spark("h-fps-spark", HIST.fps, 35);
+  $("h-fps").textContent = fpsNow != null ? Math.round(fpsNow) + " fps" : "–";
+
+  const chips = [];
+  for (const [k, c] of Object.entries(sy.temps || {})) {
+    const lim = k === "nvme" ? 70 : TEMP_WARN;
+    const cls = c >= TEMP_HOT ? " hot" : c >= lim ? " warn" : "";
+    chips.push(`<span class="chip${cls}"><b>${k}</b>${Math.round(c)}°</span>`);
+  }
+  const st = s.stitch;
+  if (s.storage && s.storage.free_gb != null)
+    chips.push(`<span class="chip"><b>disk free</b>${Math.round(s.storage.free_gb)} GB</span>`);
+  if (st) {
+    const now = Date.now();
+    if (s.recording && prevBytes != null && st.rec_bytes >= prevBytes) {
+      const mbps = (st.rec_bytes - prevBytes) * 8 / 1e6 / Math.max(0.5, (now - prevBytesAt) / 1000);
+      chips.push(`<span class="chip"><b>bitrate</b>${mbps.toFixed(0)} Mb/s</span>`);
+    }
+    prevBytes = s.recording ? st.rec_bytes : null; prevBytesAt = now;
+    chips.push(`<span class="chip${st.skip ? " warn" : ""}"><b>skipped</b>${st.skip || 0}</span>`);
+    chips.push(`<span class="chip${(st.cam0.errors + st.cam1.errors) ? " warn" : ""}"><b>cam errors</b>${st.cam0.errors + st.cam1.errors}</span>`);
+  }
+  $("h-chips").innerHTML = chips.join("");
+}
 
 /* state banner: the one line that says what the rig is doing */
 const STATE_KIND = {recording: "recording", standby: "standby", starting: "busy",
@@ -655,6 +845,85 @@ addEventListener("pagehide", () => {
   if (pv.sess) fetch(pv.sess, {method: "DELETE", keepalive: true}).catch(() => {});
 });
 
+/* ---------- full-screen preview with pinch zoom and pan ---------- */
+const zoom = {k: 1, x: 0, y: 0};
+function zoomApply() {
+  const box = $("preview").getBoundingClientRect();
+  zoom.k = Math.max(1, Math.min(6, zoom.k));
+  // keep the picture covering the viewport
+  zoom.x = Math.min(0, Math.max(box.width * (1 - zoom.k), zoom.x));
+  zoom.y = Math.min(0, Math.max(box.height * (1 - zoom.k), zoom.y));
+  $("stage").style.transform = zoom.k === 1 && !zoom.x && !zoom.y ? ""
+    : `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.k})`;
+  $("pv-reset").textContent = zoom.k.toFixed(zoom.k < 10 && zoom.k % 1 ? 1 : 0) + "×";
+}
+function zoomAt(cx, cy, k) {            // zoom to k, keeping the point under (cx, cy) still
+  const box = $("preview").getBoundingClientRect();
+  const px = cx - box.left, py = cy - box.top, r = Math.max(1, Math.min(6, k)) / zoom.k;
+  zoom.x = px - (px - zoom.x) * r;
+  zoom.y = py - (py - zoom.y) * r;
+  zoom.k *= r;
+  zoomApply();
+}
+function setFull(on) {
+  document.body.classList.toggle("pv-full", on);
+  zoom.k = 1; zoom.x = zoom.y = 0;
+  zoomApply();
+  if (on && S) applyHud(S);
+}
+function applyHud(s) {
+  const hud = $("pv-hud");
+  hud.classList.toggle("rec", !!s.recording);
+  $("pv-hud-state").textContent = s.recording ? "● REC" : s.state;
+  $("pv-hud-time").textContent = s.recording ? (s.elapsed_hms || "") : "";
+}
+$("pv-full").addEventListener("click", () => setFull(true));
+$("pv-close").addEventListener("click", () => setFull(false));
+$("pv-reset").addEventListener("click", () => { zoom.k = 1; zoom.x = zoom.y = 0; zoomApply(); });
+addEventListener("keydown", e => { if (e.key === "Escape") setFull(false); });
+(function gestures() {
+  const el = $("preview"), pts = new Map();
+  let lastDist = 0, lastTap = 0;
+  const mid = () => { const v = [...pts.values()];
+    return [(v[0].x + v[1].x) / 2, (v[0].y + v[1].y) / 2, Math.hypot(v[0].x - v[1].x, v[0].y - v[1].y)]; };
+  el.addEventListener("pointerdown", e => {
+    if (!document.body.classList.contains("pv-full") || e.target.closest("button")) return;
+    el.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, {x: e.clientX, y: e.clientY});
+    if (pts.size === 2) lastDist = mid()[2];
+    if (pts.size === 1) {
+      const now = Date.now();
+      if (now - lastTap < 300) {                       // double tap: toggle 1x / 3x
+        if (zoom.k > 1) { zoom.k = 1; zoom.x = zoom.y = 0; zoomApply(); }
+        else zoomAt(e.clientX, e.clientY, 3);
+      }
+      lastTap = now;
+    }
+  });
+  el.addEventListener("pointermove", e => {
+    const p = pts.get(e.pointerId);
+    if (!p) return;
+    if (pts.size === 2) {
+      p.x = e.clientX; p.y = e.clientY;
+      const [cx, cy, d] = mid();
+      if (lastDist) zoomAt(cx, cy, zoom.k * d / lastDist);
+      lastDist = d;
+    } else if (zoom.k > 1) {
+      zoom.x += e.clientX - p.x; zoom.y += e.clientY - p.y;
+      p.x = e.clientX; p.y = e.clientY;
+      zoomApply();
+    }
+  });
+  const up = e => { pts.delete(e.pointerId); lastDist = 0; };
+  el.addEventListener("pointerup", up);
+  el.addEventListener("pointercancel", up);
+  el.addEventListener("wheel", e => {                  // desktop: wheel zooms
+    if (!document.body.classList.contains("pv-full")) return;
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, zoom.k * (e.deltaY < 0 ? 1.15 : 1 / 1.15));
+  }, {passive: false});
+})();
+
 /* ---------- controls ---------- */
 $("recBtn").addEventListener("click", async () => {
   const s = S || {};
@@ -670,16 +939,55 @@ $("recBtn").addEventListener("click", async () => {
   setTimeout(() => { if (S) applyStatus(S); }, 400);
 });
 
+/* schedule: start time plus a duration in seconds or minutes */
+let schedUnit = 60;                      // seconds per unit shown in the field
+function setUnit(sec) {
+  schedUnit = sec;
+  $("unit-s").classList.toggle("on", sec === 1);
+  $("unit-m").classList.toggle("on", sec === 60);
+  $("sched-dur").max = sec === 1 ? 21600 : 360;
+}
+function setDurationSec(sec) {
+  const useSec = sec < 120 || sec % 60;
+  setUnit(useSec ? 1 : 60);
+  $("sched-dur").value = useSec ? sec : sec / 60;
+  markPresets();
+}
+function durationSec() { return parseFloat($("sched-dur").value || "0") * schedUnit; }
+function markPresets() {
+  const cur = durationSec();
+  document.querySelectorAll("#sched-dur-chips .chipbtn").forEach(b =>
+    b.classList.toggle("on", Number(b.dataset.sec) === cur));
+}
+function fmtSpan(sec) {
+  sec = Math.round(sec);
+  if (sec < 60) return sec + " s";
+  const m = Math.floor(sec / 60), r = sec % 60;
+  return m + " min" + (r ? " " + r + " s" : "");
+}
+$("unit-s").addEventListener("click", () => { setUnit(1); markPresets(); });
+$("unit-m").addEventListener("click", () => { setUnit(60); markPresets(); });
+$("sched-dur").addEventListener("input", markPresets);
+document.querySelectorAll("#sched-dur-chips .chipbtn").forEach(b =>
+  b.addEventListener("click", () => setDurationSec(Number(b.dataset.sec))));
+document.querySelectorAll("#sched-start-chips .chipbtn").forEach(b =>
+  b.addEventListener("click", () => {
+    const t = new Date(Date.now() + Number(b.dataset.in) * 1000);
+    if (t.getSeconds() > 0) t.setMinutes(t.getMinutes() + 1);      // the time field has minute steps
+    $("sched-time").value = String(t.getHours()).padStart(2, "0") + ":" + String(t.getMinutes()).padStart(2, "0");
+  }));
+setDurationSec(135 * 60);
+
 $("sched-set").addEventListener("click", async () => {
-  const t = $("sched-time").value, mins = parseFloat($("sched-dur").value || "0");
-  if (!t || mins <= 0) { $("sched-status").textContent = "pick a time and duration"; return; }
+  const t = $("sched-time").value, secs = durationSec();
+  if (!t || !(secs > 0)) { $("sched-status").textContent = "pick a time and duration"; return; }
   const [hh, mm] = t.split(":").map(Number);
   const start = new Date();
   start.setHours(hh, mm, 0, 0);
   if (start.getTime() <= Date.now()) start.setDate(start.getDate() + 1);
   const r = await fetch("/api/schedule", {method: "POST",
     headers: {"Content-Type": "application/json", ...AUTH},
-    body: JSON.stringify({start_at: start.getTime(), stop_after: mins * 60})});
+    body: JSON.stringify({start_at: start.getTime(), stop_after: secs})});
   const j = await r.json();
   $("sched-status").textContent = j.ok ? "scheduled ✓" : (j.error || "failed");
   $("sched-status").style.color = j.ok ? "" : "var(--red)";
@@ -984,41 +1292,59 @@ function fmtBytes(b) {
   return b.toFixed(b >= 100 ? 0 : 1) + u[i];
 }
 function fmtDur(s) { if (s == null) return "?"; s = Math.round(s); return Math.floor(s/60) + ":" + String(s%60).padStart(2,"0"); }
+function fmtWhen(ts) {
+  const d = new Date((ts || "").replace(" ", "T"));
+  if (isNaN(d)) return ts || "";
+  return d.toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+}
 function loadRecordings() {
   fetch("/api/recordings").then(r => r.json()).then(j => {
     const list = $("rec-list");
     const recs = (j.recordings || []).slice(0, 30);
     if (!recs.length) { list.innerHTML = '<div class="empty">nothing yet — first game awaits</div>'; return; }
-    list.innerHTML = recs.map(r => `
+    if (list.querySelector("details[open]")) return;      // don't close a menu mid-tap
+    list.innerHTML = recs.map(r => {
+      const sep = r.kind === "separate";
+      const when = fmtWhen(r.created_at);
+      const tags = [
+        r.recording ? '<span class="badge live">live</span>' : "",
+        sep ? '<span class="badge">2 cameras</span>' : "",
+        r.resumed ? `<span class="badge">resumed ${r.resumed.restarts}× · ${Math.round(r.resumed.lost_s)} s gap</span>` : "",
+        r.error ? '<span class="badge bad">error</span>' : "",
+      ].join("");
+      const dl = (href, label, bytes) =>
+        `<a class="item" href="${href}" download>${label}<small>${fmtBytes(bytes)}</small></a>`;
+      return `
       <div class="rec">
         ${r.thumb ? `<img class="thumb" src="${r.thumb}" alt="">` : '<div class="thumb"></div>'}
         <div class="meta">
-          <div class="t">${(r.created_at || "").replace(" ", " · ")}${r.recording ? " · 🔴 LIVE" : ""}</div>
-          <div class="s">${fmtDur(r.duration_s)} min:sec · ${fmtBytes(r.size_bytes)}</div>
-          <div class="badges">
-            ${r.kind === "separate" ? '<span class="badge ok">separate</span>' : ""}
-            ${r.has_master ? `<span class="badge ok">${r.kind === "separate" ? "stitched" : "master"}</span>`
-                           : (r.kind === "separate" ? "" : '<span class="badge">master –</span>')}
-            ${r.has_proxy ? '<span class="badge ok">proxy</span>' : '<span class="badge">proxy –</span>'}
-            ${r.resumed ? `<span class="badge">resumed ${r.resumed.restarts}× · ${Math.round(r.resumed.lost_s)} s gap</span>` : ""}
-            ${r.error ? '<span class="badge" style="color:var(--red)">error</span>' : ""}
-          </div>
-          ${r.kind === "separate" ? `<div class="s" data-stitch-progress="${r.id}"></div>` : ""}
+          <div class="t">${when}</div>
+          <div class="s">${fmtDur(r.duration_s)} · ${fmtBytes(r.size_bytes)}</div>
+          ${tags ? `<div class="badges">${tags}</div>` : ""}
+          ${sep ? `<div class="s" data-stitch-progress="${r.id}"></div>` : ""}
         </div>
         <div class="acts">
-          ${r.has_proxy ? `<button class="btn sm" onclick="play(${r.id})">Play</button>`
-                        : `<button class="btn sm" onclick="mkproxy(${r.id}, this)">Make proxy</button>`}
-          ${r.has_proxy ? `<a class="btn sm" style="text-decoration:none" href="/api/recordings/${r.id}/proxy.mp4" download>Save</a>` : ""}
-          ${r.kind === "separate" && !r.has_master && !r.recording
-            ? `<button class="btn sm" data-stitch="${r.id}" onclick="restitch(${r.id}, this)">Stitch</button>` : ""}
-          ${r.kind === "separate" && r.has_master
-            ? `<a class="btn sm" style="text-decoration:none" href="/api/recordings/${r.id}/master.mp4" download>Save stitched</a>` : ""}
-          <button class="btn sm danger" ${r.recording ? "disabled" : ""} onclick="del(${r.id}, this)">Delete</button>
+          ${r.has_proxy ? `<button class="btn sm primary" aria-label="Play" onclick="play(${r.id})">Play</button>` : ""}
+          <details class="menu">
+            <summary class="btn sm" aria-label="More actions">⋯</summary>
+            <div class="pop">
+              ${r.has_proxy ? dl(`/api/recordings/${r.id}/proxy.mp4`, "Download proxy", r.proxy_bytes) : ""}
+              ${r.has_master ? dl(`/api/recordings/${r.id}/master.mp4`, sep ? "Download stitched" : "Download full quality", r.master_bytes) : ""}
+              ${!r.has_proxy ? `<button class="item" onclick="mkproxy(${r.id}, this)">Make proxy</button>` : ""}
+              ${sep && !r.has_master && !r.recording
+                ? `<button class="item" data-stitch="${r.id}" onclick="restitch(${r.id}, this)">Stitch</button>` : ""}
+              <button class="item danger" ${r.recording ? "disabled" : ""} onclick="del(${r.id}, this)">Delete</button>
+            </div>
+          </details>
         </div>
-      </div>`).join("");
+      </div>`;
+    }).join("");
     applyRestitch(RS);
   }).catch(() => {});
 }
+document.addEventListener("click", ev => {
+  document.querySelectorAll("#rec-list details[open]").forEach(d => { if (!d.contains(ev.target)) d.open = false; });
+});
 function play(id) {
   const p = $("player");
   p.style.display = "flex";

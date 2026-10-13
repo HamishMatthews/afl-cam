@@ -80,7 +80,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-from . import cropsig, framing, selftest
+from . import cropsig, framing, selftest, sysmon
 from .config import (
     ALIGN_PYTHON, ALIGN_SCRIPT, AUDIO_DEVICES, CAMERAS, DB_PATH,
     ENCODE_CODEC, EXPOSURE_TIME, NATIVE_BITRATE_KBPS, OUTPUTS_DIR,
@@ -1579,6 +1579,13 @@ def session_master(folder: Path) -> Optional[Path]:
     return None
 
 
+def _file_size(path: Optional[Path]) -> int:
+    try:
+        return path.stat().st_size if path else 0
+    except OSError:
+        return 0
+
+
 class CamDaemon:
     """State machine + API. The tick loop is the single state owner."""
 
@@ -1622,6 +1629,7 @@ class CamDaemon:
         self._btn_last_edge = 0.0
         self._last_soc_c = self._last_nvme_c = None
         self.started_at = time.time()
+        self.sysmon = sysmon.SysMon()
         self.supervisor = StitchSupervisor(self)
         self.preview_chain = PreviewChain(self)
         self.db = RecordingDB(DB_PATH)
@@ -2637,6 +2645,8 @@ class CamDaemon:
                     "has_proxy": bool(proxy and proxy.is_file()
                                       and proxy.stat().st_size > 0),
                     "has_master": master is not None,
+                    "proxy_bytes": _file_size(proxy),
+                    "master_bytes": _file_size(master),
                     "kind": "separate" if separate else "live",
                     "thumb": f"/api/recordings/{s['id']}/thumb.jpg"
                     if proxy and (folder / "thumb.jpg").is_file() else None,
@@ -2760,6 +2770,7 @@ class CamDaemon:
                 "critical": (soc is not None and soc >= TEMP_STOP_C)
                 or (nvme is not None and nvme >= TEMP_STOP_C),
             },
+            "sys": self.sysmon.snapshot(),
             "audio": {
                 "cam0": bool(self.session and len(self.session.audio) > 0),
                 "cam1": bool(self.session and len(self.session.audio) > 1),

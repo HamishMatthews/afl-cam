@@ -86,3 +86,17 @@ def test_readiness_flags_each_problem():
 
 def test_readiness_without_samples_fails():
     assert _verdict([], GOOD_LAST) == {"recording": "fail"}
+
+
+def test_schedule_takes_seconds():
+    for i in ("sched-time", "sched-dur", "unit-s", "unit-m", "sched-set", "sched-clear"):
+        assert f'id="{i}"' in HTML
+    assert 'data-sec="30"' in HTML       # the 30 s test recording preset
+
+
+def test_preview_has_full_screen_controls():
+    for i in ("pv-full", "pv-close", "pv-hud", "pv-reset", "stage"):
+        assert f'id="{i}"' in HTML
+    assert "touch-action: none" in HTML       # pinch must not scroll the page
+
+
