@@ -228,16 +228,34 @@
 
   /* ---- recordings ---- */
   .rec {
-    display: grid; grid-template-columns: 108px 1fr auto; gap: var(--s3); align-items: center;
+    display: grid; grid-template-columns: 88px 1fr auto; gap: var(--s3); align-items: center;
     padding: 10px 0; border-top: 1px solid var(--line);
   }
-  .rec .thumb { width: 108px; height: 60px; object-fit: cover; border-radius: var(--r-sm); background: #000; }
-  .rec .meta .t { font-weight: 600; font-size: 14px; }
+  .rec .thumb { width: 88px; height: 50px; object-fit: cover; border-radius: var(--r-sm); background: #000; }
+  .rec .meta { min-width: 0; }
+  .rec .meta .t { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-width: 400px) { .rec { grid-template-columns: 64px 1fr auto; gap: var(--s2); }
+    .rec .thumb { width: 64px; height: 36px; } }
   .rec .meta .s { color: var(--dim); font-size: 12px; margin-top: 2px; }
   .rec .badges { margin-top: 3px; display: flex; gap: 4px; flex-wrap: wrap; }
   .badge { font-size: 10px; padding: 1px 6px; border-radius: var(--r-pill); border: 1px solid var(--line); color: var(--dim); }
-  .badge.ok { color: var(--green); border-color: var(--green); }
-  .rec .acts { display: flex; flex-direction: column; gap: 6px; }
+  .badge.live { color: #fff; background: var(--red-deep); border-color: var(--red-deep); }
+  .badge.bad { color: var(--red); border-color: var(--red); }
+  .rec .acts { display: flex; gap: var(--s2); align-items: center; }
+  .rec .acts .btn { min-width: var(--tap); }
+  .menu { position: relative; }
+  .menu summary { list-style: none; cursor: pointer; }
+  .menu summary::-webkit-details-marker { display: none; }
+  .menu .pop { position: absolute; right: 0; top: calc(100% + 6px); z-index: 4; min-width: 200px;
+    background: var(--raise); border: 1px solid var(--line); border-radius: var(--r-md);
+    box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow: hidden; }
+  .menu .item { display: flex; justify-content: space-between; gap: var(--s3); width: 100%;
+    min-height: var(--tap); align-items: center; padding: 0 var(--s4); background: none; border: none;
+    color: var(--ink); font-size: 14px; text-decoration: none; text-align: left; cursor: pointer; }
+  .menu .item + .item { border-top: 1px solid var(--line); }
+  .menu .item small { color: var(--dim); }
+  .menu .item.danger { color: #ffa198; }
+  .menu .item:disabled { opacity: .5; }
 
   /* player modal */
   #player {
@@ -1105,41 +1123,59 @@ function fmtBytes(b) {
   return b.toFixed(b >= 100 ? 0 : 1) + u[i];
 }
 function fmtDur(s) { if (s == null) return "?"; s = Math.round(s); return Math.floor(s/60) + ":" + String(s%60).padStart(2,"0"); }
+function fmtWhen(ts) {
+  const d = new Date((ts || "").replace(" ", "T"));
+  if (isNaN(d)) return ts || "";
+  return d.toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+}
 function loadRecordings() {
   fetch("/api/recordings").then(r => r.json()).then(j => {
     const list = $("rec-list");
     const recs = (j.recordings || []).slice(0, 30);
     if (!recs.length) { list.innerHTML = '<div class="empty">nothing yet — first game awaits</div>'; return; }
-    list.innerHTML = recs.map(r => `
+    if (list.querySelector("details[open]")) return;      // don't close a menu mid-tap
+    list.innerHTML = recs.map(r => {
+      const sep = r.kind === "separate";
+      const when = fmtWhen(r.created_at);
+      const tags = [
+        r.recording ? '<span class="badge live">live</span>' : "",
+        sep ? '<span class="badge">2 cameras</span>' : "",
+        r.resumed ? `<span class="badge">resumed ${r.resumed.restarts}× · ${Math.round(r.resumed.lost_s)} s gap</span>` : "",
+        r.error ? '<span class="badge bad">error</span>' : "",
+      ].join("");
+      const dl = (href, label, bytes) =>
+        `<a class="item" href="${href}" download>${label}<small>${fmtBytes(bytes)}</small></a>`;
+      return `
       <div class="rec">
         ${r.thumb ? `<img class="thumb" src="${r.thumb}" alt="">` : '<div class="thumb"></div>'}
         <div class="meta">
-          <div class="t">${(r.created_at || "").replace(" ", " · ")}${r.recording ? " · 🔴 LIVE" : ""}</div>
-          <div class="s">${fmtDur(r.duration_s)} min:sec · ${fmtBytes(r.size_bytes)}</div>
-          <div class="badges">
-            ${r.kind === "separate" ? '<span class="badge ok">separate</span>' : ""}
-            ${r.has_master ? `<span class="badge ok">${r.kind === "separate" ? "stitched" : "master"}</span>`
-                           : (r.kind === "separate" ? "" : '<span class="badge">master –</span>')}
-            ${r.has_proxy ? '<span class="badge ok">proxy</span>' : '<span class="badge">proxy –</span>'}
-            ${r.resumed ? `<span class="badge">resumed ${r.resumed.restarts}× · ${Math.round(r.resumed.lost_s)} s gap</span>` : ""}
-            ${r.error ? '<span class="badge" style="color:var(--red)">error</span>' : ""}
-          </div>
-          ${r.kind === "separate" ? `<div class="s" data-stitch-progress="${r.id}"></div>` : ""}
+          <div class="t">${when}</div>
+          <div class="s">${fmtDur(r.duration_s)} · ${fmtBytes(r.size_bytes)}</div>
+          ${tags ? `<div class="badges">${tags}</div>` : ""}
+          ${sep ? `<div class="s" data-stitch-progress="${r.id}"></div>` : ""}
         </div>
         <div class="acts">
-          ${r.has_proxy ? `<button class="btn sm" onclick="play(${r.id})">Play</button>`
-                        : `<button class="btn sm" onclick="mkproxy(${r.id}, this)">Make proxy</button>`}
-          ${r.has_proxy ? `<a class="btn sm" style="text-decoration:none" href="/api/recordings/${r.id}/proxy.mp4" download>Save</a>` : ""}
-          ${r.kind === "separate" && !r.has_master && !r.recording
-            ? `<button class="btn sm" data-stitch="${r.id}" onclick="restitch(${r.id}, this)">Stitch</button>` : ""}
-          ${r.kind === "separate" && r.has_master
-            ? `<a class="btn sm" style="text-decoration:none" href="/api/recordings/${r.id}/master.mp4" download>Save stitched</a>` : ""}
-          <button class="btn sm danger" ${r.recording ? "disabled" : ""} onclick="del(${r.id}, this)">Delete</button>
+          ${r.has_proxy ? `<button class="btn sm primary" aria-label="Play" onclick="play(${r.id})">Play</button>` : ""}
+          <details class="menu">
+            <summary class="btn sm" aria-label="More actions">⋯</summary>
+            <div class="pop">
+              ${r.has_proxy ? dl(`/api/recordings/${r.id}/proxy.mp4`, "Download proxy", r.proxy_bytes) : ""}
+              ${r.has_master ? dl(`/api/recordings/${r.id}/master.mp4`, sep ? "Download stitched" : "Download full quality", r.master_bytes) : ""}
+              ${!r.has_proxy ? `<button class="item" onclick="mkproxy(${r.id}, this)">Make proxy</button>` : ""}
+              ${sep && !r.has_master && !r.recording
+                ? `<button class="item" data-stitch="${r.id}" onclick="restitch(${r.id}, this)">Stitch</button>` : ""}
+              <button class="item danger" ${r.recording ? "disabled" : ""} onclick="del(${r.id}, this)">Delete</button>
+            </div>
+          </details>
         </div>
-      </div>`).join("");
+      </div>`;
+    }).join("");
     applyRestitch(RS);
   }).catch(() => {});
 }
+document.addEventListener("click", ev => {
+  document.querySelectorAll("#rec-list details[open]").forEach(d => { if (!d.contains(ev.target)) d.open = false; });
+});
 function play(id) {
   const p = $("player");
   p.style.display = "flex";

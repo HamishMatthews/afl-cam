@@ -44,6 +44,16 @@ temperatures and GPU load; the daemon puts it in the status feed as `sys`.
 temperatures, disk, bitrate, skipped frames and camera errors. To add a
 reading: add it to `SysMon.snapshot`, then a row or chip in `applyHealth`.
 
+## Recordings
+
+One compact row per session: thumbnail, date, duration and size, a Play
+button and a menu (`<details class="menu">`) holding Download proxy,
+Download full quality (the master; "stitched" for separate sessions), Make
+proxy, Stitch and Delete, each download labelled with its size
+(`proxy_bytes`, `master_bytes` in `/api/recordings`). Badges show only what
+needs attention: live, resumed, error, two cameras. The list is not
+re-rendered while a menu is open.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.
