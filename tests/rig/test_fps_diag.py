@@ -70,6 +70,9 @@ def _diagnose():
         print("[fps-diag] daemon log, exposure lines:\n" + "\n".join(lines[-30:]))
     time.sleep(5)
     base = _rate()
+    if log.exists():
+        loops = [l for l in log.read_text(errors="replace").splitlines() if l.startswith("loop-ms")]
+        print("[fps-diag] main loop (ms per iteration, last 6):\n" + "\n".join(loops[-6:]))
     print("[fps-diag] baseline (auto exposure as the daemon runs it):", base)
 
     changed = {}

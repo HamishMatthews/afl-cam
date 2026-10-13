@@ -2482,8 +2482,12 @@ int main(int argc, char **argv) {
     /* wait for cam1's first frame to learn the start trim */
     cur1_idx = ring_take(&cams[1].ring, &cur1, &cur1_pts);
 
+    /* main-loop stage timers (us, summed over 10 iterations, logged with
+     * the "submitted" line): where the frame period goes */
+    int64_t acc_take = 0, acc_fence = 0, acc_ack = 0, acc_copy = 0, acc_enc = 0, acc_iter = 0;
     while (g_running && (frames == 0 || out_count < frames) &&
            !(t_deadline && now_us() > t_deadline)) {
+        int64_t t_top = now_us();
         /* cam0 frame */
         int64_t p0_pts;
         MppFrame f0 = NULL;
@@ -2532,6 +2536,7 @@ int main(int argc, char **argv) {
         skew_sum += p0_pts > pair_pts ? p0_pts - pair_pts : pair_pts - p0_pts;
         skew_n++;
         int64_t t_stage = now_us();
+        acc_take += t_stage - t_top;
         /* our cached mmap of the decoder buffers (MPP's own mapping is
          * uncached — the 24.9MB staging copy would take ~200ms) */
         void *y0_ptr = cams[0].ring.slots[f0_idx].map_ptr ?
@@ -2547,6 +2552,7 @@ int main(int argc, char **argv) {
         gpu_slot_t *s = &g.slots[g.k];
         int k = g.k;
         /* GPU job for frame i-3 is done → its packed SSBO is readable */
+        int64_t t_f0 = now_us();
         CHECK(vkWaitForFences(g.dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
         CHECK(vkResetFences(g.dev, 1, &s->fence));
         {
@@ -2554,6 +2560,7 @@ int main(int argc, char **argv) {
                                        .memory = s->ssbo_mem, .offset = 0, .size = g.ssbo_size };
             vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
         }
+        acc_fence += now_us() - t_f0;
         /* the slot's previous result (frame i-3) — hand it to the
          * worker for repack, then wait before the GPU overwrites it */
         int64_t put_pts = pend_pts[k];
@@ -2564,11 +2571,14 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&w.q->mu);
         /* the worker must finish repacking slot k's SSBO before the GPU
          * overwrites it with this frame's job (usually already done) */
+        int64_t t_a0 = now_us();
         pthread_mutex_lock(&w.ack_mu);
         while (!w.ack_done[k])
             pthread_cond_wait(&w.ack_cv, &w.ack_mu);
         w.ack_done[k] = 0;
         pthread_mutex_unlock(&w.ack_mu);
+        int64_t t_c0 = now_us();
+        acc_ack += t_c0 - t_a0;
         /* copy this frame's pair into staging + submit */
         size_t nv12 = (size_t)g.src_w * g.src_h * 3 / 2;
         memcpy((char *)s->staging_map + s->stage_off[0], y0_ptr, nv12);
@@ -2583,6 +2593,8 @@ int main(int argc, char **argv) {
         CHECK(vkQueueSubmit(g.queue, 1, &si, s->fence));
         pend_pts[k] = mid;
         g.k = (g.k + 1) % RING_SLOTS;
+        int64_t t_e0 = now_us();
+        acc_copy += t_e0 - t_c0;
         /* encode frame i-3 (repacked by the worker into enc_in[0]) on
          * the MAIN thread — the proven-clean sync path. The drain
          * returns immediately: the encoder finished ~30ms ago. */
@@ -2597,6 +2609,7 @@ int main(int argc, char **argv) {
             if (pv_ok)
                 pv_put_drain(&pv, put_pts);
         }
+        acc_enc += now_us() - t_e0;
         if (w.recording && w.stopping) {
             /* draining the encoder tail: no new puts. Outside the
              * put_pts guard so a stop inside the first 3 frames also
@@ -2611,9 +2624,17 @@ int main(int argc, char **argv) {
         }
         ring_release(&cams[0].ring, f0_idx);
         out_count++;
-        if (out_count % 10 == 0)
+        acc_iter += now_us() - t_top;
+        if (out_count % 10 == 0) {
             fprintf(stderr, "submitted %d frames (main %.1fms, encoded %d)\n",
                     out_count, (now_us() - t_stage) / 1000.0, w.enc_count);
+            /* per-iteration averages over the last 10: pair/wait for cameras,
+             * GPU fence, worker ack, copy+submit, encode/preview puts, total */
+            fprintf(stderr, "loop-ms take %.1f fence %.1f ack %.1f copy %.1f enc %.1f iter %.1f\n",
+                    acc_take / 10000.0, acc_fence / 10000.0, acc_ack / 10000.0,
+                    acc_copy / 10000.0, acc_enc / 10000.0, acc_iter / 10000.0);
+            acc_take = acc_fence = acc_ack = acc_copy = acc_enc = acc_iter = 0;
+        }
 
         /* daemon: publish status + apply pending REC_START/REC_STOP/QUIT
          * (bottom of the iteration — a stop flushes the last packets) */
