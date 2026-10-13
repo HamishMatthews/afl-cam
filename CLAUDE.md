@@ -66,7 +66,9 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
 - `afl_cam/daemon.py` — afl-camd (stdlib only): supervises cam2stitch
   (spawn/restart/adopt a live socket from a previous run/idle-close on
   AFL_CAM_IDLE_SECS), REST + WebSocket API, web UI, finalize (master mux
-  with hvc1 tag + proxy faststart + thumbnail), phone clock sync, auto-stop
+  with hvc1 tag + proxy faststart + thumbnail + the camera audio, aligned
+  to the video's first frame from the `.start` stamp beside each wav; the
+  wavs go once muxed unless AFL_CAM_KEEP_WAV), phone clock sync, auto-stop
   (temp/storage), schedule, GPIO button/LED.
 - `afl_cam/resume.py` — recording that survives a crash: the record intent
   (`outputs/_live/intent.json`, heartbeat 5 s) outlives a cam2stitch crash,
@@ -117,8 +119,16 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   map set itself** (same geometry + weights as cam2stitch), so a re-stitch
   of per-camera files reproduces the live stitch
   (`AFL_CAM_REBUNDLE=1` or a missing/torn set → per-session bundling).
-- `afl_cam/retime.py` — VFR→CFR remux from `.pts` sidecars; HEVC muxes are
-  tagged `hvc1` (iPhone/QuickTime refuse `hev1`).
+- `afl_cam/retime.py` — timing from the `.pts` sidecars, two rules. The
+  per-camera raws the stitcher PAIRS stay CFR at the median measured rate
+  (`mux_with_pts_rate`) — VFR mp4s break frame pairing. The final
+  deliverables a human watches (`retime_file`: stitch.mp4, proxy.mp4) carry
+  the sidecar's real per-frame timing, so duration and playback speed are
+  real time when auto-exposure changes the rate mid-game, and the camera
+  audio muxed in alongside stays in sync. HEVC muxes are tagged `hvc1`
+  (iPhone/QuickTime refuse `hev1`). Needs PyAV: the daemon shells out to
+  the board venv at `AFL_CAM_RETIME_PY` (av 13; av 18 segfaults in
+  `add_stream`).
 - `scripts/recapture_alignment.py` — re-align chain (phone Setup → Re-align):
   stills → `dump_camera_params.py` (bundle) → `refine_rotation.py` →
   `dump_camera_params.py --r1` (final, atomic writes).

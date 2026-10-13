@@ -16,7 +16,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # 3.12: the interpreter the mux runs under in the field (the board's
+      # PyAV venv), and inside av 13's wheel range — av 13 has no cp314
+      # wheels, so leaving uv to pick would break `uv sync --group mux`
       - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
       - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
-      - run: uv sync
+      - run: uv sync --group mux
+      # the mux tests skip without PyAV, so prove the group really landed
+      - run: uv run python -c "import av; print('av', av.__version__)"
       - run: uv run pytest tests/unit -v --durations=15
