@@ -57,6 +57,8 @@ trap 'exit 130' INT TERM
 sudo -n systemctl stop afl-camd
 # a re-align from the tests writes to a scratch dir, never calibration/
 mkdir -p rig-artifacts/realign
+# and so does the derived cropped map set
+AFL_CAM_CROP_DIR="$TREE/rig-artifacts/crop" \
 AFL_CAM_PORT=$PORT AFL_CAM_CTL_SOCK=$SOCK AFL_CAM_ALIGN_OUT="$TREE/rig-artifacts/realign" \
     .venv/bin/python -m afl_cam.cli daemon > rig-daemon.log 2>&1 &
 DPID=$!
@@ -70,4 +72,7 @@ done
 if [ $# -eq 0 ] && [ -z "${RIG_SLOW:-}" ]; then
     set -- -m "not slow"
 fi
-AFL_CAM_TEST_BASE="http://127.0.0.1:$PORT" uv run pytest tests/rig -v "$@"
+# --durations=0 --durations-min=0 prints every test's time, slowest first, at the
+# end of the log: the place to look when the suite is slowing development down
+AFL_CAM_TEST_BASE="http://127.0.0.1:$PORT" uv run pytest tests/rig -v \
+    --durations=0 --durations-min=0 "$@"

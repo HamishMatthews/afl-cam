@@ -19,7 +19,8 @@ works at http://orangepi5-max.local/. (To switch modes by hand:
 - iPhone: join WiFi `afl-cam` (password `aflcam2026`).
 - Open `http://aflcam.local/` (or `http://10.42.0.1/`) — the afl-cam page
   should come up, the chip should go `starting` → `standby`, and the
-  preview should start within ~10 s (WHEP, or HLS after the 3 s fallback).
+  preview should appear about a second after `standby` (the overlay says
+  "starting cameras…" until then). Time it from the tap.
 - Leave the phone on the page for 30+ minutes. The page must stay live
   (status ticking, preview frames) — this catches AP-side disconnects.
 - iOS may show "No Internet Connection" under the WiFi name. Expected —
@@ -40,10 +41,18 @@ works at http://orangepi5-max.local/. (To switch modes by hand:
 This is the one thing the whole preview design hinges on:
 
 1. On the board's AP, open `http://10.42.0.1/` in Safari.
-2. The page attempts WHEP (`:8889`) first and falls back to HLS
-   (`:8888/index.m3u8`) after ~3 s. Note which one wins and the latency
-   (hold a hand in front of a camera: WebRTC ≈ 150–300 ms, HLS ≈ 2–5 s).
-3. If WebRTC works over plain http → stay on http. If Safari blocks it,
+2. The page tries WHEP (`:8889`) and only drops to HLS
+   (`:8888/index.m3u8`) if the handshake fails. Note which one wins: the
+   overlay disappears in about a second on WebRTC, and on HLS the page
+   sits on "connecting preview…" for several seconds first.
+3. Latency, the number this whole design exists for: put a running
+   stopwatch (or a phone timer) in shot and photograph the screen and the
+   stopwatch together. WebRTC ≈ 150–300 ms, HLS ≈ 2–5 s. Do it at 2 m and
+   at 50 m.
+4. Unplug the preview and let it come back: turn the phone's WiFi off for
+   20 s and on again. The page must reconnect on its own, WebRTC first —
+   no reload, no "not running" text.
+5. If WebRTC works over plain http → stay on http. If Safari blocks it,
    either live with HLS (fine for framing) or do the Plex-style HTTPS
    setup from the plan §3.1 (domain + DNS-01 Let's Encrypt) — do NOT use
    a self-signed cert.
