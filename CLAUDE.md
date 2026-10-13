@@ -94,6 +94,15 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   (`calibration/stitch_live_full`), `STITCH_CANVAS_WIDTH=5304`, Vulkan env,
   `build_cam2stitch()`/`vk_env()` helpers (stdlib, shared with the daemon).
 - `afl_cam/engine.py` — per-camera recorder for `afl-cam record` (CLI).
+- `afl_cam/crop_maps.py` (+ stdlib `cropsig.py`) — the phone's Crop setting:
+  derives `calibration/stitch_live_full_crop` from the live map set (largest
+  fully covered rectangle, width % 4, even height; sliced maps/weights, `tl`
+  shifted so the horizon guide still lands). cam2stitch is unchanged, it just
+  gets a smaller canvas. Rebuilt when the live files change (signature in
+  `source.sig`), at pipeline start only; the daemon (`set_crop`, POST
+  `/api/crop`, `outputs/_live/settings.json`) restarts an idle pipeline on
+  change and falls back to the full canvas if the crop can't be built. Tests
+  point `AFL_CAM_CROP_DIR` at a scratch dir.
 - `afl_cam/stitch_maps.py` — THE map-set format (params.bin, map0/1.bin,
   w0/1.bin): one writer (`dump_camera_params.py`), read by cam2stitch and
   the offline stitcher.

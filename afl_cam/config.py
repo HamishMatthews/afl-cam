@@ -186,6 +186,12 @@ STITCH_SHADER = ROOT_DIR / "afl_cam" / "native" / "stitch_nv12.spv"
 # from the frozen maps (currently 5304×1876). Regenerate via:
 #   scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> calibration/stitch_live_full
 STITCH_PARAMS_DIR = ROOT_DIR / "calibration" / "stitch_live_full"
+# The same maps cropped to the largest fully covered rectangle (no black
+# margins), derived from STITCH_PARAMS_DIR by afl_cam/crop_maps.py when the
+# crop setting is on. Never written by hand. The rig tests point it at a
+# scratch dir (calibration/ is shared by every test run).
+CROP_PARAMS_DIR = Path(os.environ.get("AFL_CAM_CROP_DIR")
+                       or ROOT_DIR / "calibration" / "stitch_live_full_crop")
 STITCH_CANVAS_WIDTH = 5304
 # Re-align workflow (phone Setup → Re-align): captures two stills and regenerates the
 # frozen stitch params. Needs the OpenCV 5 venv (the project venv is py3.14

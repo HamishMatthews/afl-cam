@@ -63,6 +63,12 @@
   #mode button.on { background: var(--blue); color: #000; font-weight: 600; }
   #mode button:disabled { opacity: .6; }
   #mode-note { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  #crop { display: inline-flex; margin-top: 10px; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  #crop button { font: inherit; font-size: 13px; padding: 6px 14px; border: none;
+                 background: transparent; color: var(--dim); cursor: pointer; }
+  #crop button.on { background: var(--blue); color: #000; font-weight: 600; }
+  #crop button:disabled { opacity: .6; }
+  #crop-note { color: var(--dim); font-size: 12px; margin-top: 6px; }
 
   /* separate-mode recording: 4K snapshots instead of the stitched stream */
   #snaps { position: absolute; inset: 0; display: none; background: #000; }
@@ -186,6 +192,11 @@
       <button id="mode-separate">Separate</button>
     </div>
     <div id="mode-note"></div>
+    <div id="crop">
+      <button id="crop-off" class="on">Full canvas</button>
+      <button id="crop-on">Crop</button>
+    </div>
+    <div id="crop-note"></div>
   </section>
 
   <section id="stats" class="tab-record">
@@ -320,6 +331,7 @@ function applyStatus(s) {
   }
   applyRealign(s.realign);
   applyMode(s);
+  applyCrop(s);
   applyRestitch(s.restitch);
   const lr = s.last_recording;
   $("st-last").querySelector(".v").textContent = lr ? (lr.ok ? "✓" : "✗") : "–";
@@ -726,6 +738,31 @@ async function setMode(mode) {
 }
 $("mode-live").addEventListener("click", () => setMode("live"));
 $("mode-separate").addEventListener("click", () => setMode("separate"));
+
+/* ---------- crop (full canvas | cropped to the covered rectangle) ---------- */
+function applyCrop(s) {
+  const c = s.crop || {};
+  const wrap = $("crop"), note = $("crop-note");
+  const live = (s.mode || "live") === "live";
+  wrap.style.display = note.style.display = live && s.crop ? "" : "none";
+  $("crop-off").classList.toggle("on", !c.enabled);
+  $("crop-on").classList.toggle("on", !!c.enabled);
+  $("crop-off").disabled = $("crop-on").disabled =
+    !!(s.recording || s.state === "finalizing" || s.state === "realigning");
+  const size = c.canvas ? c.canvas[0] + "×" + c.canvas[1] : "";
+  note.textContent = c.enabled && !c.active
+    ? "crop is on but the cropped maps could not be built, recording the full canvas"
+    : (c.enabled ? "no black margins, " : "") + (size ? size + " canvas" : "");
+}
+async function setCrop(enabled) {
+  const r = await fetch("/api/crop", {method: "POST",
+    headers: {"Content-Type": "application/json", ...AUTH}, body: JSON.stringify({enabled})});
+  const j = await r.json();
+  if (!j.ok) $("hint").textContent = j.error || "could not change crop";
+  else if (S) { S.crop = {...(S.crop || {}), enabled}; applyCrop(S); }
+}
+$("crop-off").addEventListener("click", () => setCrop(false));
+$("crop-on").addEventListener("click", () => setCrop(true));
 
 /* ---------- re-stitch (separate-mode sessions) ---------- */
 let RS = null, rsWasRunning = false;
