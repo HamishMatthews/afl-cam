@@ -63,9 +63,6 @@ def _diagnose():
     wake_standby()
     devs = _devs()
     print("\n[fps-diag] devices:", devs)
-    for k, d in devs.items():
-        print(f"[fps-diag] {k} controls:\n" + _v4l(d, "-L"))
-        print(f"[fps-diag] {k} format/fps:\n" + _v4l(d, "--get-fmt-video", "--get-parm"))
     log = Path("outputs/_live/stitch.log")
     if log.exists():
         lines = [l for l in log.read_text(errors="replace").splitlines()
