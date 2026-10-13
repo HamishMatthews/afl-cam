@@ -25,6 +25,17 @@ Components: `.card`, `.btn` (`.primary`, `.danger`, `.sm`), `.seg` (segmented
 control), `.row` + `.lab` (a setting), `.note`, `.field`, `.metrics`/`.metric`.
 Dim text on the panel colours is at least 4.5:1.
 
+## Readiness
+
+Setup's Readiness card shows the static self-test checks (cameras, alignment,
+storage, temperature, clock) and a **Test recording** that records 10 s in
+live-stitch mode while the page samples the status feed, stops, waits for
+the file to finish saving, and judges what came out: frame rate, pair skew,
+dropped frames, camera errors, bitrate written, master saved, proxy made,
+duration. `readinessVerdict()` is a pure function, unit-tested through node
+in `tests/unit/test_web_ui.py`. The test recording stays in Recordings; a
+button deletes it.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.
