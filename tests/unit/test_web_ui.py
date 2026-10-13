@@ -39,6 +39,7 @@ def test_crop_toggle_survives_the_layout():
         assert f'id="{i}"' in HTML
 
 
+<<<<<<< HEAD
 def _verdict(samples, last):
     """Run the page's readinessVerdict() in node (skips where node is absent)."""
     import json
@@ -86,3 +87,9 @@ def test_readiness_flags_each_problem():
 
 def test_readiness_without_samples_fails():
     assert _verdict([], GOOD_LAST) == {"recording": "fail"}
+=======
+def test_schedule_takes_seconds():
+    for i in ("sched-time", "sched-dur", "unit-s", "unit-m", "sched-set", "sched-clear"):
+        assert f'id="{i}"' in HTML
+    assert 'data-sec="30"' in HTML       # the 30 s test recording preset
+>>>>>>> origin/issue-41-schedule

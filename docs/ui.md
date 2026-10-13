@@ -54,6 +54,12 @@ proxy, Stitch and Delete, each download labelled with its size
 needs attention: live, resumed, error, two cameras. The list is not
 re-rendered while a menu is open.
 
+## Schedule
+
+Start time (with "in 1/5/15 min" shortcuts) and a duration in seconds or
+minutes (presets from 30 s to a 135 min game). The daemon takes
+`stop_after` in seconds up to 6 h, so 30 s test recordings work.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.
