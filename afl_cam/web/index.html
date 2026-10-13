@@ -11,83 +11,163 @@
 <link rel="apple-touch-icon" href="/icon-180.png">
 <title>afl-cam</title>
 <style>
+  /* Design tokens. docs/ui.md describes the shell, components and how to add a view. */
   :root {
-    --bg: #0d1117; --panel: #161b22; --panel2: #1f2630; --ink: #e6edf3;
-    --dim: #8b949e; --line: #30363d; --red: #f85149; --green: #3fb950;
-    --amber: #d29922; --blue: #58a6ff;
+    --bg: #0d1117; --panel: #161b22; --panel2: #1f2630; --raise: #29313d;
+    --ink: #e6edf3; --dim: #98a2ae; --line: #30363d;
+    --red: #f85149; --red-deep: #c93c37; --green: #3fb950; --amber: #d29922; --blue: #58a6ff;
+    --on-accent: #0d1117;
+    --r-sm: 8px; --r-md: 12px; --r-lg: 16px; --r-pill: 999px;
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
+    --tap: 44px;
+    --tabbar-h: 56px;
+    --safe-b: env(safe-area-inset-bottom, 0px);
+    --safe-t: env(safe-area-inset-top, 0px);
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: ui-monospace, Menlo, monospace;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html { color-scheme: dark; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
-    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    padding-bottom: calc(24px + env(safe-area-inset-bottom));
+    font: 15px/1.45 var(--font);
+    padding-bottom: calc(var(--tabbar-h) + var(--safe-b) + var(--s4));
   }
-  h1 { font-size: 18px; margin: 0; letter-spacing: .03em; }
-  header {
-    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+  button, input { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+
+  /* ---- app shell: top bar, state banner, views, bottom tab bar ---- */
+  .topbar {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: calc(var(--s3) + var(--safe-t)) var(--s4) var(--s3);
     background: var(--panel); border-bottom: 1px solid var(--line);
     position: sticky; top: 0; z-index: 5;
   }
-  .state-chip {
-    margin-left: auto; font-size: 12px; font-weight: 600; padding: 3px 10px;
-    border-radius: 999px; border: 1px solid var(--line); color: var(--dim);
-    text-transform: uppercase; letter-spacing: .05em;
+  .topbar h1 { font-size: 17px; margin: 0; letter-spacing: .04em; }
+  .link { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; }
+  .link i { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .link.up i { background: var(--green); }
+
+  /* state banner: one place that says what the rig is doing */
+  .statebar {
+    display: flex; align-items: center; gap: var(--s3);
+    padding: var(--s3) var(--s4); background: var(--panel2); border-bottom: 1px solid var(--line);
   }
-  .state-recording { color: #fff; background: var(--red); border-color: var(--red); }
-  .state-finalizing { color: #000; background: var(--amber); border-color: var(--amber); }
-  .state-error { color: #fff; background: #b62324; border-color: #b62324; animation: pulse 1.2s infinite; }
-  @keyframes pulse { 50% { opacity: .65; } }
+  .statebar .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--dim); flex: none; }
+  .statebar .txt { min-width: 0; }
+  .statebar .st { font-weight: 700; text-transform: uppercase; letter-spacing: .06em; font-size: 13px; }
+  .statebar .detail { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
+  .statebar .detail:empty { display: none; }
+  .statebar.s-standby .dot, .statebar.s-ready .dot { background: var(--green); }
+  .statebar.s-busy .dot { background: var(--amber); animation: pulse 1.2s infinite; }
+  .statebar.s-recording { background: #3a1517; border-bottom-color: #7f1d1d; }
+  .statebar.s-recording .dot { background: var(--red); animation: pulse 1.2s infinite; }
+  .statebar.s-error { background: #3d1515; border-bottom-color: #7f1d1d; }
+  .statebar.s-error .dot { background: var(--red); }
+  .statebar.s-error .st { color: #ffa198; }
+  @keyframes pulse { 50% { opacity: .45; } }
 
-  #banner {
-    display: none; background: #3d1515; color: #ffd7d5; border-bottom: 1px solid #7f1d1d;
-    padding: 10px 16px; font-size: 14px;
+  main { max-width: 860px; margin: 0 auto; padding: var(--s3) var(--s4); }
+
+  .tabbar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 6; display: flex;
+    background: var(--panel); border-top: 1px solid var(--line);
+    padding-bottom: var(--safe-b);
   }
+  .tabbar button {
+    flex: 1; height: var(--tabbar-h); display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 2px;
+    background: none; border: none; color: var(--dim); font-size: 11px; font-weight: 600;
+  }
+  .tabbar button.on { color: var(--blue); }
+  .tabbar svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.8;
+    stroke-linecap: round; stroke-linejoin: round; }
 
-  main { max-width: 860px; margin: 0 auto; padding: 12px 16px; }
-  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 12px; }
+  /* a view is every section carrying data-view; only the active tab's show */
+  body:not([data-tab="record"]) [data-view="record"],
+  body:not([data-tab="recs"]) [data-view="recs"],
+  body:not([data-tab="setup"]) [data-view="setup"] { display: none !important; }
+  /* the preview is shared by Record and Setup (framing guides) */
+  body[data-tab="recs"] #preview { display: none; }
 
-  /* ---- record block ---- */
-  #rec { padding: 16px; text-align: center; }
-  #elapsed { font-variant-numeric: tabular-nums; font-size: 44px; font-weight: 700; margin: 4px 0 12px; }
+  /* ---- components ---- */
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg);
+    margin-bottom: var(--s3); padding: var(--s3) var(--s4); }
+  .card > h2, .card-h { font-size: 13px; margin: 0 0 var(--s2); color: var(--dim);
+    text-transform: uppercase; letter-spacing: .06em; font-weight: 600;
+    display: flex; align-items: center; gap: var(--s2); }
+  .card-h .btn { margin-left: auto; }
+  .note { color: var(--dim); font-size: 13px; margin: var(--s1) 0 0; }
+  .note:empty { display: none; }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    min-height: var(--tap); padding: 0 var(--s4); border-radius: var(--r-md);
+    background: var(--panel2); border: 1px solid var(--line); color: var(--ink);
+    font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer;
+  }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.sm { min-height: 36px; padding: 0 var(--s3); font-size: 13px; border-radius: var(--r-sm); }
+  .btn.primary { background: var(--blue); border-color: var(--blue); color: var(--on-accent); }
+  .btn.danger { color: #ffa198; border-color: #7f1d1d; }
+
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--r-md);
+    overflow: hidden; background: var(--panel2); }
+  .seg button { min-height: 40px; padding: 0 var(--s3); border: none; background: none;
+    color: var(--dim); font-size: 13px; font-weight: 600; cursor: pointer; }
+  .seg button.on { background: var(--blue); color: var(--on-accent); }
+  .seg button:disabled { opacity: .55; cursor: default; }
+
+  .row { display: flex; align-items: center; gap: var(--s3); min-height: var(--tap); }
+  .row + .row, .row + .note + .row { border-top: 1px solid var(--line); }
+  .row .lab { flex: 1; font-weight: 600; }
+  .row .lab small { display: block; color: var(--dim); font-weight: 400; font-size: 12px; }
+
+  .field { background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: var(--r-sm); min-height: 40px; padding: 0 var(--s3); font-size: 15px;
+    color-scheme: dark; }
+
+  .metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px;
+    background: var(--line); border: 1px solid var(--line); border-radius: var(--r-lg);
+    overflow: hidden; margin-bottom: var(--s3); }
+  .metric { padding: var(--s3) var(--s2); text-align: center; background: var(--panel); }
+  .metric .v { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .metric .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  .metric:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  @media (min-width: 560px) { .metrics { grid-template-columns: repeat(5, 1fr); } }
+  .warn .v { color: var(--amber); }
+
+  .empty { color: var(--dim); text-align: center; padding: var(--s5) 0; }
+  .lv-ok { color: var(--green); } .lv-warn { color: var(--amber); } .lv-fail { color: var(--red); }
+
+  /* ---- record view ---- */
+  #rec { text-align: center; }
+  #elapsed { font-variant-numeric: tabular-nums; font-size: 44px; font-weight: 700; line-height: 1.1; margin: 2px 0 var(--s3); }
   #recBtn {
-    width: 100%; max-width: 340px; padding: 18px 0; font-size: 22px; font-weight: 700;
-    border-radius: 999px; border: none; color: #fff; background: var(--red);
-    letter-spacing: .04em;
+    width: 100%; max-width: 340px; min-height: 64px; font-size: 20px; font-weight: 700;
+    border-radius: var(--r-pill); border: none; color: #fff; background: var(--red-deep);
+    letter-spacing: .05em; cursor: pointer;
   }
-  #recBtn.stop { background: #b62324; }
+  #recBtn.stop { background: #8e1c1f; }
   #recBtn:disabled { opacity: .5; }
-  #hint { margin-top: 10px; color: var(--dim); font-size: 13px; }
-  #mode { display: inline-flex; margin-top: 12px; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
-  #mode button { font: inherit; font-size: 13px; padding: 6px 14px; border: none;
-    background: var(--panel2); color: var(--dim); }
-  #mode button.on { background: var(--blue); color: #000; font-weight: 600; }
-  #mode button:disabled { opacity: .6; }
-  #mode-note { color: var(--dim); font-size: 12px; margin-top: 6px; }
-  #crop { display: inline-flex; margin-top: 10px; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
-  #crop button { font: inherit; font-size: 13px; padding: 6px 14px; border: none;
-                 background: transparent; color: var(--dim); cursor: pointer; }
-  #crop button.on { background: var(--blue); color: #000; font-weight: 600; }
-  #crop button:disabled { opacity: .6; }
-  #crop-note { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  #hint { margin-top: var(--s2); color: var(--dim); font-size: 13px; }
+  #hint:empty { display: none; }
+  #mode-note, #crop-note { text-align: left; }
 
   /* separate-mode recording: 4K snapshots instead of the stitched stream */
   #snaps { position: absolute; inset: 0; display: none; background: #000; }
   #snaps img { width: 50%; height: 100%; object-fit: cover; float: left; }
 
-  /* ---- stats ---- */
-  #stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
-  .stat { padding: 12px; border-right: 1px solid var(--line); text-align: center; }
-  .stat:last-child { border-right: none; }
-  .stat .v { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .stat .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
-  .warn .v { color: var(--amber); }
-
   /* ---- preview ---- */
-  #preview { position: relative; background: #000; border-radius: 12px; overflow: hidden; }
+  #preview { position: relative; background: #000; border-radius: var(--r-lg); overflow: hidden;
+    margin-bottom: var(--s3); border: 1px solid var(--line); }
   #vid { display: block; width: 100%; aspect-ratio: 2.8 / 1; background: #000; }
   #preview-state {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    color: var(--dim); font-size: 14px; text-align: center; padding: 0 24px;
+    color: var(--dim); font-size: 14px; text-align: center; padding: 0 var(--s5);
   }
   /* framing guides: positions come from /api/framing (canvas fractions) */
   #guides { position: absolute; inset: 0; pointer-events: none; }
@@ -97,117 +177,70 @@
   #g-seam::before { content: "seam"; position: absolute; top: -14px; left: -14px; font-size: 9px; color: rgba(255,255,255,.5); }
   #g-horizon { position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed rgba(210,153,34,.8); display: none; }
   #g-horizon::before { content: "horizon"; position: absolute; left: 6px; top: -14px; font-size: 9px; color: rgba(210,153,34,.9); }
-  body.setup #g-overlap.known, body.setup #g-horizon.known { display: block; }
+  body[data-tab="setup"] #g-overlap.known, body[data-tab="setup"] #g-horizon.known { display: block; }
 
-  /* ---- tabs ---- */
-  #tabs { display: flex; gap: 6px; max-width: 860px; margin: 12px auto 0; padding: 0 16px; }
-  #tabs button {
-    flex: 1; padding: 9px 0; font: inherit; font-size: 14px; font-weight: 600;
-    background: var(--panel); color: var(--dim); border: 1px solid var(--line); border-radius: 999px;
-  }
-  #tabs button.on { color: var(--ink); background: var(--panel2); border-color: var(--blue); }
-  body:not(.setup) .tab-setup, body.setup .tab-record { display: none !important; }
-
-  /* ---- setup ---- */
-  .card { padding: 12px 16px; }
-  .card h2 { font-size: 15px; margin: 2px 0 6px; display: flex; align-items: center; gap: 8px; }
-  .card h2 .mini-btn { margin-left: auto; }
-  .card p { color: var(--dim); font-size: 13px; margin: 4px 0 10px; }
-  .check { display: grid; grid-template-columns: 22px 92px 1fr; gap: 6px; padding: 6px 0;
+  /* ---- setup view ---- */
+  .check { display: grid; grid-template-columns: 22px 92px 1fr; gap: 6px; padding: 8px 0;
     border-top: 1px solid var(--line); font-size: 14px; }
   .check .n { font-weight: 600; }
   .check .d { color: var(--dim); }
-  .lv-ok { color: var(--green); } .lv-warn { color: var(--amber); } .lv-fail { color: var(--red); }
-  #ra-log { background: #000; color: #c9d1d9; font: 11px/1.4 ui-monospace, Menlo, monospace;
-    padding: 8px 10px; border-radius: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap;
+  #ra-log { background: #000; color: #c9d1d9; font: 11px/1.4 var(--mono);
+    padding: 8px 10px; border-radius: var(--r-sm); max-height: 220px; overflow: auto; white-space: pre-wrap;
     margin: 10px 0 0; display: none; }
   #ra-score { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; display: none; }
   #ra-score td, #ra-score th { padding: 5px 4px; border-top: 1px solid var(--line); text-align: right;
     font-variant-numeric: tabular-nums; }
   #ra-score th { color: var(--dim); font-weight: 500; font-size: 12px; }
   #ra-score td:first-child, #ra-score th:first-child { text-align: left; }
-  #ra-crop { width: 100%; border-radius: 8px; margin-top: 10px; display: none; }
+  #ra-crop { width: 100%; border-radius: var(--r-sm); margin-top: 10px; display: none; }
   #ra-state { font-size: 13px; }
 
   /* ---- schedule ---- */
-  #sched { padding: 12px 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  #sched label { color: var(--dim); font-size: 13px; }
-  #sched input {
-    background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
-    border-radius: 8px; padding: 8px 10px; font-size: 15px; color-scheme: dark;
-  }
-  .mini-btn {
-    background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
-    border-radius: 8px; padding: 8px 14px; font-size: 14px;
-    font: inherit; font-size: 14px;      /* anchors and buttons match */
-  }
-  .mini-btn.danger { color: #ffa198; border-color: #7f1d1d; }
+  .sched-grid { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; }
+  .sched-grid label { color: var(--dim); font-size: 13px; }
+  .sched-grid .actions { display: flex; gap: var(--s2); width: 100%; }
+  .sched-grid .actions .btn { flex: 1; }
   #sched-status { color: var(--green); font-size: 13px; }
 
   /* ---- recordings ---- */
-  #recs { padding: 12px 16px; }
-  #recs h2 { font-size: 15px; margin: 2px 0 10px; }
   .rec {
-    display: grid; grid-template-columns: 108px 1fr auto; gap: 12px; align-items: center;
+    display: grid; grid-template-columns: 108px 1fr auto; gap: var(--s3); align-items: center;
     padding: 10px 0; border-top: 1px solid var(--line);
   }
-  .rec .thumb { width: 108px; height: 60px; object-fit: cover; border-radius: 8px; background: #000; }
+  .rec .thumb { width: 108px; height: 60px; object-fit: cover; border-radius: var(--r-sm); background: #000; }
   .rec .meta .t { font-weight: 600; font-size: 14px; }
   .rec .meta .s { color: var(--dim); font-size: 12px; margin-top: 2px; }
   .rec .badges { margin-top: 3px; display: flex; gap: 4px; flex-wrap: wrap; }
-  .badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: var(--r-pill); border: 1px solid var(--line); color: var(--dim); }
   .badge.ok { color: var(--green); border-color: var(--green); }
   .rec .acts { display: flex; flex-direction: column; gap: 6px; }
-  .empty { color: var(--dim); text-align: center; padding: 18px 0; }
 
   /* player modal */
   #player {
-    position: fixed; inset: 0; background: rgba(0,0,0,.9); z-index: 10;
+    position: fixed; inset: 0; background: rgba(0,0,0,.92); z-index: 10;
     display: none; align-items: center; justify-content: center;
   }
   #player video { width: 100%; max-height: 100vh; }
-  #player .close { position: absolute; top: 12px; right: 16px; color: #fff; font-size: 26px; }
-
-  footer { text-align: center; color: var(--dim); font-size: 12px; padding: 8px; }
+  #player .close { position: absolute; top: calc(var(--s3) + var(--safe-t)); right: var(--s4);
+    width: var(--tap); height: var(--tap); border: none; border-radius: 50%;
+    background: rgba(0,0,0,.6); color: #fff; font-size: 26px; line-height: 1; }
 </style>
 </head>
-<body>
-<header>
+<body data-tab="record">
+<header class="topbar">
   <h1>afl-cam</h1>
-  <span id="chip" class="state-chip">…</span>
+  <span id="link" class="link"><i></i><span id="link-txt">connecting</span></span>
 </header>
-<div id="banner"></div>
-<nav id="tabs">
-  <button id="tab-record" class="on">Record</button>
-  <button id="tab-setup">Setup</button>
-</nav>
+<div id="statebar" class="statebar">
+  <span class="dot"></span>
+  <div class="txt">
+    <div class="st" id="chip">connecting</div>
+    <div class="detail" id="banner"></div>
+  </div>
+</div>
 
 <main>
-  <section id="rec" class="tab-record">
-    <div id="elapsed">0:00:00</div>
-    <button id="recBtn" disabled>…</button>
-    <div id="hint"></div>
-    <div id="mode">
-      <button id="mode-live" class="on">Live stitch</button>
-      <button id="mode-separate">Separate</button>
-    </div>
-    <div id="mode-note"></div>
-    <div id="crop">
-      <button id="crop-off" class="on">Full canvas</button>
-      <button id="crop-on">Crop</button>
-    </div>
-    <div id="crop-note"></div>
-  </section>
-
-  <section id="stats" class="tab-record">
-    <div class="stat" id="st-storage"><div class="v">–</div><div class="k">minutes left</div></div>
-    <div class="stat" id="st-temp"><div class="v">–</div><div class="k">board °C</div></div>
-    <div class="stat" id="st-fps"><div class="v">–</div><div class="k">cam fps</div></div>
-    <div class="stat" id="st-skew"><div class="v">–</div><div class="k">pair skew</div></div>
-    <div class="stat" id="st-last"><div class="v">–</div><div class="k">last recording</div></div>
-  </section>
-
-  <section id="preview">
+  <section id="preview" data-view="all">
     <video id="vid" playsinline muted autoplay></video>
     <div id="snaps"><img id="snap0" alt=""><img id="snap1" alt=""></div>
     <div id="guides">
@@ -218,14 +251,69 @@
     <div id="preview-state">preview connecting…</div>
   </section>
 
-  <section id="selftest" class="card tab-setup">
-    <h2>Pre-game check <span id="st-level"></span><button class="mini-btn" id="st-run">Run again</button></h2>
+  <section id="rec" class="card" data-view="record">
+    <div id="elapsed">0:00:00</div>
+    <button id="recBtn" disabled>…</button>
+    <div id="hint"></div>
+  </section>
+
+  <section id="stats" class="metrics" data-view="record">
+    <div class="metric" id="st-storage"><div class="v">–</div><div class="k">minutes left</div></div>
+    <div class="metric" id="st-temp"><div class="v">–</div><div class="k">board °C</div></div>
+    <div class="metric" id="st-fps"><div class="v">–</div><div class="k">cam fps</div></div>
+    <div class="metric" id="st-skew"><div class="v">–</div><div class="k">pair skew</div></div>
+    <div class="metric" id="st-last"><div class="v">–</div><div class="k">last recording</div></div>
+  </section>
+
+  <section class="card" data-view="record">
+    <h2>Recording</h2>
+    <div class="row">
+      <div class="lab">Mode</div>
+      <div class="seg" id="mode">
+        <button id="mode-live" class="on">Live stitch</button>
+        <button id="mode-separate">Separate</button>
+      </div>
+    </div>
+    <div class="note" id="mode-note"></div>
+    <div class="row" id="crop-row">
+      <div class="lab">Output</div>
+      <div class="seg" id="crop">
+        <button id="crop-off" class="on">Full canvas</button>
+        <button id="crop-on">Crop</button>
+      </div>
+    </div>
+    <div class="note" id="crop-note"></div>
+  </section>
+
+  <section id="sched" class="card" data-view="record">
+    <h2>Schedule</h2>
+    <div class="sched-grid">
+      <label for="sched-time">Start at</label>
+      <input class="field" type="time" id="sched-time">
+      <label for="sched-dur">Stop after</label>
+      <input class="field" type="number" id="sched-dur" min="1" max="360" step="15" value="135" style="width:80px">
+      <label for="sched-dur">min</label>
+      <div class="actions">
+        <button class="btn primary" id="sched-set">Set schedule</button>
+        <button class="btn danger" id="sched-clear">Clear</button>
+      </div>
+      <span id="sched-status"></span>
+    </div>
+  </section>
+
+  <section id="recs" class="card" data-view="recs">
+    <h2>Recordings</h2>
+    <div id="rec-list"><div class="empty">loading…</div></div>
+  </section>
+
+  <section id="selftest" class="card" data-view="setup">
+    <div class="card-h">Pre-game check <span id="st-level"></span><button class="btn sm" id="st-run">Run again</button></div>
     <div id="st-list"><div class="empty">checking…</div></div>
   </section>
 
-  <section id="realign" class="card tab-setup">
-    <h2>Re-align cameras <button class="mini-btn" id="ra-run">Re-align</button></h2>
-    <p>Run this after the rig has been knocked or re-aimed. It closes the preview, captures a
+  <section id="realign" class="card" data-view="setup">
+    <div class="card-h">Re-align cameras <button class="btn sm" id="ra-run">Re-align</button></div>
+    <p class="note">Run this after the rig has been knocked or re-aimed. It closes the preview, captures a
       still from each camera and refits the stitch (about 2 minutes). Stand someone in the
       overlap at playing distance so the fit has something to lock onto. The guides on the
       preview show the overlap (blue), the seam and the horizon.</p>
@@ -239,30 +327,21 @@
     <img id="ra-crop" alt="seam crop after re-align">
     <pre id="ra-log"></pre>
   </section>
-
-  <section id="sched" class="tab-record">
-    <label>Start at</label>
-    <input type="time" id="sched-time">
-    <label>Stop after</label>
-    <input type="number" id="sched-dur" min="1" max="360" step="15" value="135" style="width:74px">
-    <label>min</label>
-    <button class="mini-btn" id="sched-set">Set schedule</button>
-    <button class="mini-btn danger" id="sched-clear">Clear</button>
-    <span id="sched-status"></span>
-  </section>
-
-  <section id="recs" class="tab-record">
-    <h2>Recordings</h2>
-    <div id="rec-list"><div class="empty">loading…</div></div>
-  </section>
 </main>
+
+<nav class="tabbar" aria-label="Views">
+  <button id="tab-record" class="on" aria-label="Record">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>Record</button>
+  <button id="tab-recs" aria-label="Recordings">
+    <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4-2.5z" fill="currentColor"/></svg>Recordings</button>
+  <button id="tab-setup" aria-label="Setup">
+    <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>Setup</button>
+</nav>
 
 <div id="player">
   <video controls playsinline></video>
-  <div class="close" onclick="closePlayer()">×</div>
+  <button class="close" aria-label="Close" onclick="closePlayer()">×</button>
 </div>
-
-<footer>afl-cam · join the rig's WiFi and add this page to your Home Screen</footer>
 
 <script src="/hls.min.js"></script>
 <script>
@@ -279,11 +358,7 @@ const AUTH = token ? {"X-AFL-Token": token} : {};
 /* ---------- status + ws ---------- */
 function applyStatus(s) {
   S = s;
-  const chip = $("chip");
-  chip.textContent = s.state;
-  chip.className = "state-chip" + (s.recording ? " state-recording" :
-    s.state === "finalizing" || s.state === "realigning" ? " state-finalizing" :
-    s.state === "error" ? " state-error" : "");
+  applyStateBar(s);
 
   const btn = $("recBtn");
   const rs = s.resume || {};
@@ -297,8 +372,6 @@ function applyStatus(s) {
     btn.disabled = !(s.state === "standby" || s.state === "idle");
   }
   $("elapsed").textContent = s.elapsed_hms || "0:00:00";
-  $("banner").style.display = s.error ? "block" : "none";
-  $("banner").textContent = "⚠ " + s.error;
   $("hint").textContent = s.state === "idle" ? "pipeline asleep — press RECORD (cameras take a few seconds to wake)"
     : s.state === "starting" ? "cameras waking up…"
     : s.state === "finalizing" ? "saving the last recording…"
@@ -359,16 +432,31 @@ function applyStatus(s) {
 }
 let prevStitch = null, prevStitchAt = 0;
 
+/* state banner: the one line that says what the rig is doing */
+const STATE_KIND = {recording: "recording", standby: "standby", starting: "busy",
+  finalizing: "busy", realigning: "busy", idle: "ready", error: "error"};
+function applyStateBar(s) {
+  const kind = s.recording ? "recording" : (s.error ? "error" : STATE_KIND[s.state] || "busy");
+  $("statebar").className = "statebar s-" + kind;
+  $("chip").textContent = s.recording ? "recording" : s.state;
+  $("banner").textContent = s.error || "";
+}
+function setLink(up) {
+  $("link").classList.toggle("up", up);
+  $("link-txt").textContent = up ? "live" : "offline";
+}
+
 function connectWS() {
   try { ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + HOST + "/api/events"); }
   catch (e) { ws = null; }
   if (!ws) return;
-  ws.onmessage = ev => { try { applyStatus(JSON.parse(ev.data)); } catch (e) {} };
-  ws.onclose = () => { ws = null; setTimeout(pollFallback, 2000); };
+  ws.onopen = () => setLink(true);
+  ws.onmessage = ev => { setLink(true); try { applyStatus(JSON.parse(ev.data)); } catch (e) {} };
+  ws.onclose = () => { ws = null; setLink(false); setTimeout(pollFallback, 2000); };
 }
 function pollFallback() {
   if (ws) return;
-  fetch("/api/status").then(r => r.json()).then(applyStatus).catch(() => {});
+  fetch("/api/status").then(r => r.json()).then(j => { setLink(true); applyStatus(j); }).catch(() => setLink(false));
   setTimeout(pollFallback, 2000);
 }
 
@@ -599,15 +687,17 @@ $("sched-clear").addEventListener("click", async () => {
 });
 
 /* ---------- setup: tabs, framing guides, self-test, re-align ---------- */
-function showTab(setup) {
-  document.body.classList.toggle("setup", setup);
-  $("tab-record").classList.toggle("on", !setup);
-  $("tab-setup").classList.toggle("on", setup);
-  try { localStorage.setItem("aflTab", setup ? "setup" : "record"); } catch (e) {}
-  if (setup) { runSelftest(); loadFraming(); }
+const TABS = ["record", "recs", "setup"];
+function showTab(tab) {
+  if (!TABS.includes(tab)) tab = "record";
+  document.body.dataset.tab = tab;
+  TABS.forEach(t => $("tab-" + t).classList.toggle("on", t === tab));
+  try { localStorage.setItem("aflTab", tab); } catch (e) {}
+  if (tab === "setup") { runSelftest(); loadFraming(); }
+  if (tab === "recs") loadRecordings();
+  scrollTo(0, 0);
 }
-$("tab-record").addEventListener("click", () => showTab(false));
-$("tab-setup").addEventListener("click", () => showTab(true));
+TABS.forEach(t => $("tab-" + t).addEventListener("click", () => showTab(t)));
 
 function loadFraming() {
   fetch("/api/framing").then(r => r.json()).then(j => {
@@ -742,9 +832,9 @@ $("mode-separate").addEventListener("click", () => setMode("separate"));
 /* ---------- crop (full canvas | cropped to the covered rectangle) ---------- */
 function applyCrop(s) {
   const c = s.crop || {};
-  const wrap = $("crop"), note = $("crop-note");
+  const note = $("crop-note");
   const live = (s.mode || "live") === "live";
-  wrap.style.display = note.style.display = live && s.crop ? "" : "none";
+  $("crop-row").style.display = note.style.display = live && s.crop ? "" : "none";
   $("crop-off").classList.toggle("on", !c.enabled);
   $("crop-on").classList.toggle("on", !!c.enabled);
   $("crop-off").disabled = $("crop-on").disabled =
@@ -821,14 +911,14 @@ function loadRecordings() {
           ${r.kind === "separate" ? `<div class="s" data-stitch-progress="${r.id}"></div>` : ""}
         </div>
         <div class="acts">
-          ${r.has_proxy ? `<button class="mini-btn" onclick="play(${r.id})">Play</button>`
-                        : `<button class="mini-btn" onclick="mkproxy(${r.id}, this)">Make proxy</button>`}
-          ${r.has_proxy ? `<a class="mini-btn" style="text-decoration:none" href="/api/recordings/${r.id}/proxy.mp4" download>Save</a>` : ""}
+          ${r.has_proxy ? `<button class="btn sm" onclick="play(${r.id})">Play</button>`
+                        : `<button class="btn sm" onclick="mkproxy(${r.id}, this)">Make proxy</button>`}
+          ${r.has_proxy ? `<a class="btn sm" style="text-decoration:none" href="/api/recordings/${r.id}/proxy.mp4" download>Save</a>` : ""}
           ${r.kind === "separate" && !r.has_master && !r.recording
-            ? `<button class="mini-btn" data-stitch="${r.id}" onclick="restitch(${r.id}, this)">Stitch</button>` : ""}
+            ? `<button class="btn sm" data-stitch="${r.id}" onclick="restitch(${r.id}, this)">Stitch</button>` : ""}
           ${r.kind === "separate" && r.has_master
-            ? `<a class="mini-btn" style="text-decoration:none" href="/api/recordings/${r.id}/master.mp4" download>Save stitched</a>` : ""}
-          <button class="mini-btn danger" ${r.recording ? "disabled" : ""} onclick="del(${r.id}, this)">Delete</button>
+            ? `<a class="btn sm" style="text-decoration:none" href="/api/recordings/${r.id}/master.mp4" download>Save stitched</a>` : ""}
+          <button class="btn sm danger" ${r.recording ? "disabled" : ""} onclick="del(${r.id}, this)">Delete</button>
         </div>
       </div>`).join("");
     applyRestitch(RS);
@@ -881,7 +971,7 @@ async function del(id, btn) {
 applyStatus({state: "connecting", recording: false, error: null,
   storage: {minutes_left: 0}, temp: {}, stitch: null,
   elapsed_hms: "0:00:00", clock: {synced: true}});
-try { if (localStorage.getItem("aflTab") === "setup") showTab(true); } catch (e) {}
+try { showTab(localStorage.getItem("aflTab")); } catch (e) { showTab("record"); }
 loadFraming();
 connectWS();
 pollFallback();
