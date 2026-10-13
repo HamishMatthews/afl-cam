@@ -72,4 +72,7 @@ done
 if [ $# -eq 0 ] && [ -z "${RIG_SLOW:-}" ]; then
     set -- -m "not slow"
 fi
-AFL_CAM_TEST_BASE="http://127.0.0.1:$PORT" uv run pytest tests/rig -v "$@"
+# --durations=0 --durations-min=0 prints every test's time, slowest first, at the
+# end of the log: the place to look when the suite is slowing development down
+AFL_CAM_TEST_BASE="http://127.0.0.1:$PORT" uv run pytest tests/rig -v \
+    --durations=0 --durations-min=0 "$@"

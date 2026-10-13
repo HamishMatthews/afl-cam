@@ -19,4 +19,4 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
       - run: uv sync
-      - run: uv run pytest tests/unit -v
+      - run: uv run pytest tests/unit -v --durations=15
