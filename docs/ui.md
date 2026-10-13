@@ -60,6 +60,15 @@ Start time (with "in 1/5/15 min" shortcuts) and a duration in seconds or
 minutes (presets from 30 s to a 135 min game). The daemon takes
 `stop_after` in seconds up to 6 h, so 30 s test recordings work.
 
+## Full-screen preview
+
+The expand button on the preview turns `#preview` into a fixed overlay (iOS
+Safari only full-screens a bare `<video>`, so the Fullscreen API is not
+used). `#stage` holds the video and takes the zoom transform: pinch, drag
+to pan, double-tap for 3x, mouse wheel on a desktop, a reset chip, Esc or
+the close button to leave. A small HUD shows REC and elapsed time. Guides
+are hidden in full screen. This does not touch the preview transport.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.

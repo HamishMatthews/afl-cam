@@ -40,6 +40,7 @@ def test_crop_toggle_survives_the_layout():
 
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 def _verdict(samples, last):
     """Run the page's readinessVerdict() in node (skips where node is absent)."""
     import json
@@ -93,3 +94,9 @@ def test_schedule_takes_seconds():
         assert f'id="{i}"' in HTML
     assert 'data-sec="30"' in HTML       # the 30 s test recording preset
 >>>>>>> origin/issue-41-schedule
+=======
+def test_preview_has_full_screen_controls():
+    for i in ("pv-full", "pv-close", "pv-hud", "pv-reset", "stage"):
+        assert f'id="{i}"' in HTML
+    assert "touch-action: none" in HTML       # pinch must not scroll the page
+>>>>>>> origin/issue-41-fullscreen
