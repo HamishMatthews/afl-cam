@@ -25,6 +25,15 @@ Components: `.card`, `.btn` (`.primary`, `.danger`, `.sm`), `.seg` (segmented
 control), `.row` + `.lab` (a setting), `.note`, `.field`, `.metrics`/`.metric`.
 Dim text on the panel colours is at least 4.5:1.
 
+## Full-screen preview
+
+The expand button on the preview turns `#preview` into a fixed overlay (iOS
+Safari only full-screens a bare `<video>`, so the Fullscreen API is not
+used). `#stage` holds the video and takes the zoom transform: pinch, drag
+to pan, double-tap for 3x, mouse wheel on a desktop, a reset chip, Esc or
+the close button to leave. A small HUD shows REC and elapsed time. Guides
+are hidden in full screen. This does not touch the preview transport.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.

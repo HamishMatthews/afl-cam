@@ -37,3 +37,9 @@ def test_shell_has_state_banner_and_tab_bar():
 def test_crop_toggle_survives_the_layout():
     for i in ("crop-off", "crop-on", "crop-note", "mode-live", "mode-separate"):
         assert f'id="{i}"' in HTML
+
+
+def test_preview_has_full_screen_controls():
+    for i in ("pv-full", "pv-close", "pv-hud", "pv-reset", "stage"):
+        assert f'id="{i}"' in HTML
+    assert "touch-action: none" in HTML       # pinch must not scroll the page

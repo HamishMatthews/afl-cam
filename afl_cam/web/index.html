@@ -164,6 +164,25 @@
   /* ---- preview ---- */
   #preview { position: relative; background: #000; border-radius: var(--r-lg); overflow: hidden;
     margin-bottom: var(--s3); border: 1px solid var(--line); }
+  #stage { position: relative; transform-origin: 0 0; will-change: transform; }
+  .pv-btn { position: absolute; top: var(--s2); right: var(--s2); width: var(--tap); height: var(--tap);
+    border-radius: 50%; border: none; background: rgba(0,0,0,.55); color: #fff; font-size: 26px;
+    line-height: 1; display: flex; align-items: center; justify-content: center; z-index: 2; cursor: pointer; }
+  .pv-btn svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+  #pv-close, #pv-hud { display: none; }
+  /* full screen: a fixed overlay (iOS Safari only full-screens a bare <video>) */
+  body.pv-full { overflow: hidden; }
+  body.pv-full #preview { position: fixed; inset: 0; z-index: 20; margin: 0; border: none; border-radius: 0;
+    touch-action: none; }
+  body.pv-full #stage { width: 100%; height: 100%; }
+  body.pv-full #vid { width: 100%; height: 100%; aspect-ratio: auto !important; object-fit: contain; }
+  body.pv-full #guides, body.pv-full #snaps { display: none; }
+  body.pv-full #pv-full { display: none; }
+  body.pv-full #pv-close { display: flex; top: calc(var(--s2) + var(--safe-t)); left: var(--s2); right: auto; }
+  body.pv-full #pv-hud { display: flex; align-items: center; gap: var(--s2); position: absolute; z-index: 2;
+    bottom: calc(var(--s3) + var(--safe-b)); left: 50%; transform: translateX(-50%); padding: 4px 12px;
+    border-radius: var(--r-pill); background: rgba(0,0,0,.55); font-size: 13px; font-variant-numeric: tabular-nums; }
+  #pv-hud.rec #pv-hud-state { color: var(--red); font-weight: 700; }
   #vid { display: block; width: 100%; aspect-ratio: 2.8 / 1; background: #000; }
   #preview-state {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -241,14 +260,21 @@
 
 <main>
   <section id="preview" data-view="all">
-    <video id="vid" playsinline muted autoplay></video>
-    <div id="snaps"><img id="snap0" alt=""><img id="snap1" alt=""></div>
-    <div id="guides">
-      <div id="g-overlap"></div>
-      <div id="g-horizon"></div>
-      <div id="g-seam"></div>
+    <div id="stage">
+      <video id="vid" playsinline muted autoplay></video>
+      <div id="snaps"><img id="snap0" alt=""><img id="snap1" alt=""></div>
+      <div id="guides">
+        <div id="g-overlap"></div>
+        <div id="g-horizon"></div>
+        <div id="g-seam"></div>
+      </div>
     </div>
     <div id="preview-state">preview connecting…</div>
+    <button id="pv-full" class="pv-btn" aria-label="Full screen">
+      <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+    <button id="pv-close" class="pv-btn" aria-label="Exit full screen">×</button>
+    <div id="pv-hud"><span id="pv-hud-state"></span> <span id="pv-hud-time"></span>
+      <button id="pv-reset" class="chipbtn" aria-label="Reset zoom">1×</button></div>
   </section>
 
   <section id="rec" class="card" data-view="record">
@@ -359,6 +385,7 @@ const AUTH = token ? {"X-AFL-Token": token} : {};
 function applyStatus(s) {
   S = s;
   applyStateBar(s);
+  if (document.body.classList.contains("pv-full")) applyHud(s);
 
   const btn = $("recBtn");
   const rs = s.resume || {};
@@ -649,6 +676,85 @@ async function previewAttempt() {
 addEventListener("pagehide", () => {
   if (pv.sess) fetch(pv.sess, {method: "DELETE", keepalive: true}).catch(() => {});
 });
+
+/* ---------- full-screen preview with pinch zoom and pan ---------- */
+const zoom = {k: 1, x: 0, y: 0};
+function zoomApply() {
+  const box = $("preview").getBoundingClientRect();
+  zoom.k = Math.max(1, Math.min(6, zoom.k));
+  // keep the picture covering the viewport
+  zoom.x = Math.min(0, Math.max(box.width * (1 - zoom.k), zoom.x));
+  zoom.y = Math.min(0, Math.max(box.height * (1 - zoom.k), zoom.y));
+  $("stage").style.transform = zoom.k === 1 && !zoom.x && !zoom.y ? ""
+    : `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.k})`;
+  $("pv-reset").textContent = zoom.k.toFixed(zoom.k < 10 && zoom.k % 1 ? 1 : 0) + "×";
+}
+function zoomAt(cx, cy, k) {            // zoom to k, keeping the point under (cx, cy) still
+  const box = $("preview").getBoundingClientRect();
+  const px = cx - box.left, py = cy - box.top, r = Math.max(1, Math.min(6, k)) / zoom.k;
+  zoom.x = px - (px - zoom.x) * r;
+  zoom.y = py - (py - zoom.y) * r;
+  zoom.k *= r;
+  zoomApply();
+}
+function setFull(on) {
+  document.body.classList.toggle("pv-full", on);
+  zoom.k = 1; zoom.x = zoom.y = 0;
+  zoomApply();
+  if (on && S) applyHud(S);
+}
+function applyHud(s) {
+  const hud = $("pv-hud");
+  hud.classList.toggle("rec", !!s.recording);
+  $("pv-hud-state").textContent = s.recording ? "● REC" : s.state;
+  $("pv-hud-time").textContent = s.recording ? (s.elapsed_hms || "") : "";
+}
+$("pv-full").addEventListener("click", () => setFull(true));
+$("pv-close").addEventListener("click", () => setFull(false));
+$("pv-reset").addEventListener("click", () => { zoom.k = 1; zoom.x = zoom.y = 0; zoomApply(); });
+addEventListener("keydown", e => { if (e.key === "Escape") setFull(false); });
+(function gestures() {
+  const el = $("preview"), pts = new Map();
+  let lastDist = 0, lastTap = 0;
+  const mid = () => { const v = [...pts.values()];
+    return [(v[0].x + v[1].x) / 2, (v[0].y + v[1].y) / 2, Math.hypot(v[0].x - v[1].x, v[0].y - v[1].y)]; };
+  el.addEventListener("pointerdown", e => {
+    if (!document.body.classList.contains("pv-full") || e.target.closest("button")) return;
+    el.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, {x: e.clientX, y: e.clientY});
+    if (pts.size === 2) lastDist = mid()[2];
+    if (pts.size === 1) {
+      const now = Date.now();
+      if (now - lastTap < 300) {                       // double tap: toggle 1x / 3x
+        if (zoom.k > 1) { zoom.k = 1; zoom.x = zoom.y = 0; zoomApply(); }
+        else zoomAt(e.clientX, e.clientY, 3);
+      }
+      lastTap = now;
+    }
+  });
+  el.addEventListener("pointermove", e => {
+    const p = pts.get(e.pointerId);
+    if (!p) return;
+    if (pts.size === 2) {
+      p.x = e.clientX; p.y = e.clientY;
+      const [cx, cy, d] = mid();
+      if (lastDist) zoomAt(cx, cy, zoom.k * d / lastDist);
+      lastDist = d;
+    } else if (zoom.k > 1) {
+      zoom.x += e.clientX - p.x; zoom.y += e.clientY - p.y;
+      p.x = e.clientX; p.y = e.clientY;
+      zoomApply();
+    }
+  });
+  const up = e => { pts.delete(e.pointerId); lastDist = 0; };
+  el.addEventListener("pointerup", up);
+  el.addEventListener("pointercancel", up);
+  el.addEventListener("wheel", e => {                  // desktop: wheel zooms
+    if (!document.body.classList.contains("pv-full")) return;
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, zoom.k * (e.deltaY < 0 ? 1.15 : 1 / 1.15));
+  }, {passive: false});
+})();
 
 /* ---------- controls ---------- */
 $("recBtn").addEventListener("click", async () => {
