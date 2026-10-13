@@ -110,7 +110,7 @@ STORAGE_STOP_GB = float(os.environ.get("AFL_CAM_STORAGE_STOP_GB", "10"))
 # deleted once the mux that used them succeeded; AFL_CAM_KEEP_WAV=1 keeps
 # them (a mux can fail, and the wav is the only copy of the sound).
 AUDIO_BITRATE_KBPS = int(os.environ.get("AFL_CAM_AUDIO_BITRATE_KBPS", "128"))
-KEEP_WAV = bool(os.environ.get("AFL_CAM_KEEP_WAV"))
+KEEP_WAV = os.environ.get("AFL_CAM_KEEP_WAV") == "1"
 AUTH_TOKEN = os.environ.get("AFL_CAM_TOKEN", "")
 GPIO_BTN = os.environ.get("AFL_CAM_GPIO_BTN", "")
 GPIO_LED = os.environ.get("AFL_CAM_GPIO_LED", "")
