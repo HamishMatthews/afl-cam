@@ -37,3 +37,9 @@ def test_shell_has_state_banner_and_tab_bar():
 def test_crop_toggle_survives_the_layout():
     for i in ("crop-off", "crop-on", "crop-note", "mode-live", "mode-separate"):
         assert f'id="{i}"' in HTML
+
+
+def test_schedule_takes_seconds():
+    for i in ("sched-time", "sched-dur", "unit-s", "unit-m", "sched-set", "sched-clear"):
+        assert f'id="{i}"' in HTML
+    assert 'data-sec="30"' in HTML       # the 30 s test recording preset

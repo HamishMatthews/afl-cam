@@ -25,6 +25,12 @@ Components: `.card`, `.btn` (`.primary`, `.danger`, `.sm`), `.seg` (segmented
 control), `.row` + `.lab` (a setting), `.note`, `.field`, `.metrics`/`.metric`.
 Dim text on the panel colours is at least 4.5:1.
 
+## Schedule
+
+Start time (with "in 1/5/15 min" shortcuts) and a duration in seconds or
+minutes (presets from 30 s to a 135 min game). The daemon takes
+`stop_after` in seconds up to 6 h, so 30 s test recordings work.
+
 ## Adding something
 
 1. New setting: add a `.row` in the Recording card with a `.seg` or `.field`.

@@ -200,6 +200,10 @@
   .sched-grid label { color: var(--dim); font-size: 13px; }
   .sched-grid .actions { display: flex; gap: var(--s2); width: 100%; }
   .sched-grid .actions .btn { flex: 1; }
+  .chiprow { display: flex; flex-wrap: wrap; gap: var(--s2); padding: var(--s2) 0 var(--s3); }
+  .chipbtn { min-height: 36px; padding: 0 var(--s3); border-radius: var(--r-pill); background: var(--panel2);
+    border: 1px solid var(--line); color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; }
+  .chipbtn.on { border-color: var(--blue); color: var(--blue); }
   #sched-status { color: var(--green); font-size: 13px; }
 
   /* ---- recordings ---- */
@@ -287,12 +291,32 @@
 
   <section id="sched" class="card" data-view="record">
     <h2>Schedule</h2>
+    <div class="row">
+      <label class="lab" for="sched-time">Start at</label>
+      <input class="field" type="time" id="sched-time" step="60">
+    </div>
+    <div class="chiprow" id="sched-start-chips" aria-label="Start soon">
+      <button class="chipbtn" data-in="60">in 1 min</button>
+      <button class="chipbtn" data-in="300">in 5 min</button>
+      <button class="chipbtn" data-in="900">in 15 min</button>
+    </div>
+    <div class="row">
+      <label class="lab" for="sched-dur">Record for</label>
+      <input class="field" type="number" id="sched-dur" min="1" max="360" step="any" value="135" inputmode="decimal" style="width:84px">
+      <div class="seg" id="sched-unit">
+        <button id="unit-s">sec</button>
+        <button id="unit-m" class="on">min</button>
+      </div>
+    </div>
+    <div class="chiprow" id="sched-dur-chips" aria-label="Duration presets">
+      <button class="chipbtn" data-sec="30">30 s</button>
+      <button class="chipbtn" data-sec="60">1 min</button>
+      <button class="chipbtn" data-sec="300">5 min</button>
+      <button class="chipbtn" data-sec="900">15 min</button>
+      <button class="chipbtn" data-sec="5400">90 min</button>
+      <button class="chipbtn" data-sec="8100">135 min</button>
+    </div>
     <div class="sched-grid">
-      <label for="sched-time">Start at</label>
-      <input class="field" type="time" id="sched-time">
-      <label for="sched-dur">Stop after</label>
-      <input class="field" type="number" id="sched-dur" min="1" max="360" step="15" value="135" style="width:80px">
-      <label for="sched-dur">min</label>
       <div class="actions">
         <button class="btn primary" id="sched-set">Set schedule</button>
         <button class="btn danger" id="sched-clear">Clear</button>
@@ -418,7 +442,7 @@ function applyStatus(s) {
   if (s.schedule) {
     const d = new Date(s.schedule.start_at);
     $("sched-status").textContent = "set: " + d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})
-      + " +" + s.schedule.stop_after / 60 + "min";
+      + " for " + fmtSpan(s.schedule.stop_after);
   } else {
     $("sched-status").textContent = "";
   }
@@ -665,16 +689,55 @@ $("recBtn").addEventListener("click", async () => {
   setTimeout(() => { if (S) applyStatus(S); }, 400);
 });
 
+/* schedule: start time plus a duration in seconds or minutes */
+let schedUnit = 60;                      // seconds per unit shown in the field
+function setUnit(sec) {
+  schedUnit = sec;
+  $("unit-s").classList.toggle("on", sec === 1);
+  $("unit-m").classList.toggle("on", sec === 60);
+  $("sched-dur").max = sec === 1 ? 21600 : 360;
+}
+function setDurationSec(sec) {
+  const useSec = sec < 120 || sec % 60;
+  setUnit(useSec ? 1 : 60);
+  $("sched-dur").value = useSec ? sec : sec / 60;
+  markPresets();
+}
+function durationSec() { return parseFloat($("sched-dur").value || "0") * schedUnit; }
+function markPresets() {
+  const cur = durationSec();
+  document.querySelectorAll("#sched-dur-chips .chipbtn").forEach(b =>
+    b.classList.toggle("on", Number(b.dataset.sec) === cur));
+}
+function fmtSpan(sec) {
+  sec = Math.round(sec);
+  if (sec < 60) return sec + " s";
+  const m = Math.floor(sec / 60), r = sec % 60;
+  return m + " min" + (r ? " " + r + " s" : "");
+}
+$("unit-s").addEventListener("click", () => { setUnit(1); markPresets(); });
+$("unit-m").addEventListener("click", () => { setUnit(60); markPresets(); });
+$("sched-dur").addEventListener("input", markPresets);
+document.querySelectorAll("#sched-dur-chips .chipbtn").forEach(b =>
+  b.addEventListener("click", () => setDurationSec(Number(b.dataset.sec))));
+document.querySelectorAll("#sched-start-chips .chipbtn").forEach(b =>
+  b.addEventListener("click", () => {
+    const t = new Date(Date.now() + Number(b.dataset.in) * 1000);
+    if (t.getSeconds() > 0) t.setMinutes(t.getMinutes() + 1);      // the time field has minute steps
+    $("sched-time").value = String(t.getHours()).padStart(2, "0") + ":" + String(t.getMinutes()).padStart(2, "0");
+  }));
+setDurationSec(135 * 60);
+
 $("sched-set").addEventListener("click", async () => {
-  const t = $("sched-time").value, mins = parseFloat($("sched-dur").value || "0");
-  if (!t || mins <= 0) { $("sched-status").textContent = "pick a time and duration"; return; }
+  const t = $("sched-time").value, secs = durationSec();
+  if (!t || !(secs > 0)) { $("sched-status").textContent = "pick a time and duration"; return; }
   const [hh, mm] = t.split(":").map(Number);
   const start = new Date();
   start.setHours(hh, mm, 0, 0);
   if (start.getTime() <= Date.now()) start.setDate(start.getDate() + 1);
   const r = await fetch("/api/schedule", {method: "POST",
     headers: {"Content-Type": "application/json", ...AUTH},
-    body: JSON.stringify({start_at: start.getTime(), stop_after: mins * 60})});
+    body: JSON.stringify({start_at: start.getTime(), stop_after: secs})});
   const j = await r.json();
   $("sched-status").textContent = j.ok ? "scheduled ✓" : (j.error || "failed");
   $("sched-status").style.color = j.ok ? "" : "var(--red)";
