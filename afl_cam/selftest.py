@@ -35,7 +35,9 @@ def cameras(found: dict, stitch: Optional[dict]) -> dict:
     if min(frames) <= 0:
         return _check("cameras", "fail", "connected but no frames from "
                       + ("cam0" if frames[0] <= 0 else "cam1"))
-    if max(errors) > 0:
+    # a corrupt frame now and then is normal over a long run; warn when more
+    # than 1% of a camera's frames failed to decode
+    if any(e > 0.01 * max(f, 1) for e, f in zip(errors, frames)):
         return _check("cameras", "warn",
                       f"streaming, capture errors {errors[0]}/{errors[1]}")
     return _check("cameras", "ok", "both streaming")

@@ -8,7 +8,7 @@
 #   /usr/local/bin/mediamtx            MediaMTX v1.21.2 (checksum-verified)
 #   /usr/local/etc/mediamtx.yml        preview server config (deploy/)
 #   hostapd (apt) + /etc/hostapd/afl-cam.conf
-#   systemd units:                     mediamtx, afl-camd, gpu-governor, afl-cam-irq,
+#   systemd units:                     mediamtx, afl-camd, gpu-governor,
 #                                      afl-cam-ap (boot-time field AP)
 #   /etc/avahi/services/aflcam.service aflcam.local mDNS alias
 # AP note (verified 2026-10-09): NM's AP mode hangs on this board's bcmdhd
@@ -42,14 +42,13 @@ $SUDO bash -c "
     cp deploy/systemd/afl-camd.service /etc/systemd/system/
     cp deploy/systemd/gpu-governor.service /etc/systemd/system/
     cp deploy/systemd/afl-cam-ap.service /etc/systemd/system/
-    cp deploy/systemd/afl-cam-irq.service /etc/systemd/system/
     mkdir -p /etc/avahi/services /etc/hostapd
     cp deploy/avahi/aflcam.service /etc/avahi/services/
     cp deploy/avahi/hosts /etc/avahi/hosts
     cp deploy/hostapd-afl-cam.conf /etc/hostapd/afl-cam.conf
     systemctl daemon-reload
-    systemctl enable mediamtx afl-camd gpu-governor afl-cam-ap afl-cam-irq
-    systemctl restart avahi-daemon gpu-governor afl-cam-irq mediamtx afl-camd afl-cam-ap
+    systemctl enable mediamtx afl-camd gpu-governor afl-cam-ap
+    systemctl restart avahi-daemon gpu-governor mediamtx afl-camd afl-cam-ap
 "
 
 echo "[install] hostapd (NM AP mode hangs on this bcmdhd board)…"

@@ -135,6 +135,16 @@ static void set_exposure(int fd, int mode, RK_S32 value)
     }
 }
 
+static void set_ctrl(int fd, __u32 id, RK_S32 value)
+{
+    struct v4l2_control ctrl;
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id = id;
+    ctrl.value = value;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+        fprintf(stderr, "set control 0x%x failed: %s\n", id, strerror(errno));
+}
+
 /* Atomic JPEG snapshot write: the raw UVC MJPEG payload is a complete JPEG —
  * write it straight to *preview_path* via a temp file + rename so the UI
  * (which polls the file) never sees a half-written frame. */
@@ -155,6 +165,34 @@ static void write_preview(const char *preview_path, const void *jpeg, size_t siz
 
 /* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
  * for the auto-settle-then-lock exposure loop (copied from cam2h264.c). */
+/* mean U and V of a decoded NV12 frame (sparse sample) — for comparing the
+ * cameras' colour balance */
+static int frame_chroma(MppFrame frame, double *u, double *v)
+{
+    MppBuffer buf = mpp_frame_get_buffer(frame);
+    if (!buf)
+        return -1;
+    RK_U8 *base = (RK_U8 *)mpp_buffer_get_ptr(buf);
+    RK_U32 hs = mpp_frame_get_hor_stride(frame);
+    RK_U32 vs = mpp_frame_get_ver_stride(frame);
+    RK_U32 w = mpp_frame_get_width(frame);
+    RK_U32 h = mpp_frame_get_height(frame);
+    RK_U8 *uv = base + (size_t)hs * vs;
+    RK_U64 su = 0, sv = 0;
+    RK_U32 n = 0;
+    for (RK_U32 yy = 0; yy < h / 2; yy += 8)
+        for (RK_U32 xx = 0; xx + 1 < w; xx += 16) {
+            su += uv[yy * hs + xx];
+            sv += uv[yy * hs + xx + 1];
+            n++;
+        }
+    if (!n)
+        return -1;
+    *u = (double)su / n;
+    *v = (double)sv / n;
+    return 0;
+}
+
 static double frame_luma(MppFrame frame)
 {
     MppBuffer buf = mpp_frame_get_buffer(frame);
@@ -1530,6 +1568,8 @@ typedef struct {
     int seq_valid;
     int seq_lost;               /* V4L2 sequence numbers skipped by the driver */
     volatile double luma_last;  /* mean Y of a sampled frame (every 30th) */
+    volatile double u_last, v_last;  /* mean U/V of the same frame */
+    int cap_bright, cap_gamma;  /* dim-light lift at the exposure cap */
     /* exposure state machine (cam2h264.c) */
     int lock_pending, lock_phase, refine_left, refine_rounds;
     double target_luma, luma_acc;
@@ -1572,7 +1612,10 @@ static int v4l2_open(cam_t *c) {
     if (c->exposure > 0) {
         set_exposure(fd, V4L2_EXPOSURE_MANUAL, c->exposure);
     } else {
-        /* this camera's auto mode is menu value 3 (cam2h264.c) */
+        /* this camera's auto mode is menu value 3 (cam2h264.c); also drop
+         * any brightness/gamma lift an earlier run left in the camera */
+        set_ctrl(fd, V4L2_CID_BRIGHTNESS, 0);
+        set_ctrl(fd, V4L2_CID_GAMMA, 100);
         set_exposure(fd, 3, 0);
     }
 
@@ -1664,12 +1707,22 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
                 /* frame rate first: auto wants a longer exposure than one
                  * 30 fps frame, which drops the sensor to ~20 fps. Cap at
                  * 30ms (image is darker, rate holds near 28 fps). */
-                c->lock_pending = 0;
                 c->lock_exp = 300;
                 set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
+                /* manual exposure drops the camera's own boost, so the
+                 * picture goes much darker than auto: lift it with the
+                 * camera's brightness (then gamma) until the mean luma
+                 * is back near what auto gave (phase 2) */
+                c->lock_phase = 2;
+                c->refine_left = 40;
+                c->refine_rounds = 0;
+                c->cap_bright = 0;
+                c->cap_gamma = 100;
+                c->luma_acc = 0.0; c->luma_n = 0;
                 fprintf(stderr, "%s: exposure: auto needs %.1fms (>33ms) — "
-                        "capped at 30ms to hold the frame rate\n",
-                        c->dev, (c->dt_sum / c->dt_n) / 1000.0);
+                        "capped at 30ms to hold the frame rate, lifting "
+                        "brightness to luma %.0f\n",
+                        c->dev, (c->dt_sum / c->dt_n) / 1000.0, c->target_luma);
             } else {
                 if (c->dt_n > 0) {
                     c->lock_exp = (RK_S32)((c->dt_sum / c->dt_n) / 100);
@@ -1682,6 +1735,37 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
                 c->luma_acc = 0.0; c->luma_n = 0;
                 fprintf(stderr, "%s: exposure: auto settled at luma %.0f -> manual %d (%dms), refining...\n",
                         c->dev, c->target_luma, c->lock_exp, c->lock_exp / 10);
+            }
+        }
+    } else if (c->lock_phase == 2) {
+        /* the control change takes a few frames: measure the last 15 of 40 */
+        if (--c->refine_left <= 15) { c->luma_acc += l; c->luma_n++; }
+        if (c->refine_left == 0) {
+            double meas = c->luma_n ? c->luma_acc / c->luma_n : c->target_luma;
+            double err = c->target_luma - meas;
+            int done = (err < 0.12 * c->target_luma + 2.0 && err > -0.12 * c->target_luma - 2.0)
+                       || ++c->refine_rounds >= 8;
+            if (done) {
+                c->lock_pending = 0;
+                fprintf(stderr, "%s: exposure: capped at 30ms, brightness %d gamma %d, "
+                        "luma %.0f (target %.0f)\n", c->dev, c->cap_bright,
+                        c->cap_gamma, meas, c->target_luma);
+            } else {
+                if (err > 0 && c->cap_bright >= 64) {
+                    c->cap_gamma += (int)(err / 0.3);
+                    if (c->cap_gamma > 300) c->cap_gamma = 300;
+                    set_ctrl(c->fd, V4L2_CID_GAMMA, c->cap_gamma);
+                } else {
+                    int step = (int)(err / 1.2);
+                    if (step > 24) step = 24;
+                    if (step < -24) step = -24;
+                    c->cap_bright += step;
+                    if (c->cap_bright > 64) c->cap_bright = 64;
+                    if (c->cap_bright < 0) c->cap_bright = 0;
+                    set_ctrl(c->fd, V4L2_CID_BRIGHTNESS, c->cap_bright);
+                }
+                c->refine_left = 40;
+                c->luma_acc = 0.0; c->luma_n = 0;
             }
         }
     } else {
@@ -1830,6 +1914,11 @@ static void *capture_thread(void *arg) {
             double ll = frame_luma(dec_frame);
             if (ll >= 0)
                 c->luma_last = ll;
+            double cu, cv;
+            if (frame_chroma(dec_frame, &cu, &cv) == 0) {
+                c->u_last = cu;
+                c->v_last = cv;
+            }
         }
         exposure_step(c, dec_frame, pts_us);
         ring_push(&c->ring, idx, pts_us);
@@ -1928,9 +2017,9 @@ static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
     double k = c->t_n > 0 ? 1.0 / (double)c->t_n / 1000.0 : 0.0;
     double dt = c->ts_dt_n > 0 ? (double)c->ts_dt_sum / c->ts_dt_n / 1000.0 : 0.0;
     snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
-             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f",
+             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f,\"u\":%.1f,\"v\":%.1f",
              c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
-             c->ts_gap, c->seq_lost, c->luma_last);
+             c->ts_gap, c->seq_lost, c->luma_last, c->u_last, c->v_last);
     return buf;
 }
 

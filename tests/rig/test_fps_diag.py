@@ -99,18 +99,6 @@ def _diagnose():
     else:
         print("[fps-diag] no exposure_dynamic_framerate control on these cameras")
 
-    # the same capture with the USB interrupts on cores 4 and 5 (needs
-    # passwordless sudo; skipped otherwise). Not persistent, a reboot resets it.
-    pin = subprocess.run(["sudo", "-n", "bash", "scripts/pin_usb_irqs.sh"],
-                         capture_output=True, text=True)
-    print("[fps-diag] pin USB irqs:", (pin.stdout + pin.stderr).strip() or pin.returncode)
-    if pin.returncode == 0:
-        time.sleep(3)
-        print("[fps-diag] with USB irqs on cores 4/5:", _rate())
-        print("[fps-diag] usb interrupts per core after:\n" + subprocess.run(
-            "grep -E 'xhci|xhc' /proc/interrupts | cut -c1-90", shell=True,
-            capture_output=True, text=True).stdout)
-
     # frame rate against a fixed exposure (100 us units): is the rate
     # exposure-limited? Both cameras at once, then back to auto.
     for exp in (100, 300):
@@ -141,6 +129,23 @@ def _diagnose():
             _v4l(d, f"--set-ctrl={name}={0 if name == 'brightness' else 100}")
     for d in devs.values():
         _v4l(d, "--set-ctrl=auto_exposure=3")
+
+    # colour balance: mean U/V of each camera (128 = neutral) with the
+    # camera's own auto white balance, then both fixed at the same temperature
+    def _uv(tag):
+        a, b = stitch().get("cam0", {}), stitch().get("cam1", {})
+        print(f"[fps-diag] wb {tag}: cam0 u/v {a.get('u')}/{a.get('v')}  "
+              f"cam1 u/v {b.get('u')}/{b.get('v')}")
+    time.sleep(3)
+    _uv("auto")
+    for t in (4000, 5500, 6500):
+        for d in devs.values():
+            _v4l(d, "--set-ctrl=white_balance_automatic=0",
+                 f"--set-ctrl=white_balance_temperature={t}")
+        time.sleep(4)
+        _uv(f"fixed {t} K")
+    for d in devs.values():
+        _v4l(d, "--set-ctrl=white_balance_automatic=1")
 
     for k, d in devs.items():
         print(f"[fps-diag] {k} exposure now:",
