@@ -1617,6 +1617,20 @@ static int v4l2_open(cam_t *c) {
         set_ctrl(fd, V4L2_CID_BRIGHTNESS, 0);
         set_ctrl(fd, V4L2_CID_GAMMA, 100);
         set_exposure(fd, 3, 0);
+        /* both cameras on the SAME fixed white balance: on the rig their own
+         * auto white balance disagreed by ~15 in U and V (a visible colour
+         * step at the seam), fixed at one temperature they are within ~3.
+         * AFL_CAM_WB_K = kelvin (2800-6500), 0 = leave the cameras on auto */
+        {
+            const char *wbs = getenv("AFL_CAM_WB_K");
+            int wbk = wbs ? atoi(wbs) : 5500;
+            if (wbk >= 2800 && wbk <= 6500) {
+                set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
+                set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, wbk);
+            } else {
+                set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
+            }
+        }
     }
 
     struct v4l2_requestbuffers req;
