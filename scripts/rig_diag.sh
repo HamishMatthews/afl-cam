@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# Read-only board diagnostics: why the last boot ended and the daemon's state.
+# Read-only board diagnostics, round 2.
 S() { echo 123 | sudo -S -p '' "$@"; }
 sec() { echo; echo "===== $* ====="; }
-sec boots; S journalctl --list-boots --no-pager | tail -8
-sec failed units; systemctl --failed --no-pager
-sec afl-camd; systemctl status afl-camd afl-cam-ap mediamtx --no-pager -n 30
-sec root fs; findmnt /; df -h / /home
-sec net; ip -br addr; S iw dev wlan0 info
-sec "previous boot: last 120 lines"; S journalctl -b -1 -n 120 --no-pager
-sec "previous boot: afl-camd"; S journalctl -b -1 -u afl-camd --no-pager | tail -150
-sec "previous boot: warnings"; S journalctl -b -1 -p warning --no-pager | grep -v afl-camd | tail -80
-sec "boot -2: last 40 lines"; S journalctl -b -2 -n 40 --no-pager
-sec "this boot: afl-camd"; S journalctl -b -u afl-camd --no-pager | tail -120
-sec "this boot: afl-cam-ap"; S journalctl -b -u afl-cam-ap --no-pager | tail -40
-sec "this boot: kernel ext4/nvme/usb"; S dmesg | grep -iE 'ext4|nvme|i/o error|under-?volt|brown|over-?current|watchdog' | tail -40
-sec intent; cat /home/hamish/Documents/afl-cam/outputs/_live/intent.json; echo
-ls -lt /home/hamish/Documents/afl-cam/outputs | head -5
-sec latest session; d=$(ls -td /home/hamish/Documents/afl-cam/outputs/2* | head -1); ls -la "$d"; cat "$d"/segments.json 2>/dev/null
-sec http; curl -s -m 5 -o /dev/null -w '%{http_code}\n' http://127.0.0.1/ ; curl -s -m 5 http://127.0.0.1/api/status | head -c 1500; echo
-sec ports; S ss -ltnp | grep -E ':80 |:8080 |:8889 |:8888 '
+F() { grep -av 'mpp_mem_pool\|mpp_buffer_ref_dec\|put_meta\|mpp\[' ; }
+sec uptime; uptime; date; S chronyc tracking | head -4; systemctl status fake-hwclock-load --no-pager -n 10; ls -l /etc/fake-hwclock.data; cat /etc/fake-hwclock.data
+sec journald conf; grep -v '^#' /etc/systemd/journald.conf | grep .; ls /etc/systemd/journald.conf.d/ 2>/dev/null && cat /etc/systemd/journald.conf.d/* 2>/dev/null
+sec "boot lengths (monotonic of last entry)"; for b in -5 -4 -3 -2 -1 0; do echo "boot $b: $(S journalctl -b $b -o short-monotonic -n 1 --no-pager | tail -1 | cut -c1-140)"; done
+sec "last -x"; last -x -F | head -20
+sec "afl-camd all of today, no mpp spam"; S journalctl -u afl-camd -u afl-cam-ap -u mediamtx --since '2026-10-14 17:00' -o short-monotonic --no-pager | F | grep -v 'mediamtx.*INF \[RTSP\]\|mediamtx.*INF \[path\|mediamtx.*INF \[HLS\]\|WebRTC' | tail -400
+sec "boot 0 kernel + NM + hostapd + power"; S journalctl -b 0 -o short-monotonic --no-pager | grep -aiE 'hostapd|dnsmasq|NetworkManager.*(wlan0|Hotspot|afl-cam)|field_wifi|voltage|over-?current|thermal|watchdog|oom|segfault|Killed process' | tail -80
+sec "boot -1 everything after 19:00:03"; S journalctl -b -1 -o short-monotonic --no-pager | tail -25 | cut -c1-200
+sec NM connections; nmcli -t -f NAME,TYPE,AUTOCONNECT,DEVICE con show
+sec session; d=/home/hamish/Documents/afl-cam/outputs/20261014_190718; head -3 $d/stitch.pts; tail -3 $d/stitch.pts; wc -l $d/stitch.pts $d/stitch.000.pts; cat $d/stitch.000.pts | head; ls -la /home/hamish/Documents/afl-cam/outputs/_live
+sec db; python3 -c "
+import sqlite3;c=sqlite3.connect('file:/home/hamish/Documents/afl-cam/recordings.db?mode=ro',uri=True)
+for t in c.execute(\"select name from sqlite_master where type='table'\"): print(t)
+for r in c.execute('select * from sessions order by rowid desc limit 3'): print(r)
+for r in c.execute('select * from recordings order by rowid desc limit 3'): print(r)"
