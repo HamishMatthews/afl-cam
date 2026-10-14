@@ -68,9 +68,15 @@ def save_intent(path: Path, intent: dict) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    # the rename too: without it a power cut can keep the old entry
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
-def load_intent(path: Path) -> Optional[dict]:
+def _read_intent(path: Path) -> Optional[dict]:
     try:
         intent = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -80,11 +86,47 @@ def load_intent(path: Path) -> Optional[dict]:
     return intent
 
 
+def load_intent(path: Path) -> Optional[dict]:
+    """The record intent, or the heartbeat being written when the board
+    lost power (the .tmp beside it)."""
+    return _read_intent(path) \
+        or _read_intent(path.with_name(path.name + ".tmp"))
+
+
+def intent_unreadable(path: Path) -> bool:
+    """An intent file is there but holds no intent. A power cut mid-
+    heartbeat leaves it like this (2026-10-14: 260 NUL bytes, the .tmp
+    too): the recording never stopped, but the file can't say which."""
+    return path.exists() and load_intent(path) is None
+
+
+def intent_from_files(dir_: Path, session_id: int,
+                      recording_id: int) -> dict:
+    """Rebuild a record intent from what the session folder holds, for an
+    intent the power cut wiped: the last write is the last heartbeat, and
+    the .pts sidecars say how much was recorded."""
+    alive_at, elapsed, segs = 0.0, 0.0, 0
+    for pts in dir_.glob("stitch*.pts"):
+        try:
+            alive_at = max(alive_at, pts.stat().st_mtime)
+            stamps = pts.read_text().split()
+            elapsed += (int(stamps[-1]) - int(stamps[0])) / 1e6
+        except (OSError, ValueError, IndexError):
+            continue
+        segs += 1
+    raw = dir_ / "stitch.raw.h264"
+    if raw.exists():
+        alive_at = max(alive_at, raw.stat().st_mtime)
+    return {"dir": str(dir_), "session_id": session_id,
+            "recording_id": recording_id, "elapsed_before": elapsed,
+            "seg_start": alive_at, "restarts": max(0, segs - 1),
+            "gaps": [], "alive_at": alive_at}
+
+
 def clear_intent(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+    # the .tmp too: load_intent falls back to it
+    for p in (path, path.with_name(path.name + ".tmp")):
+        p.unlink(missing_ok=True)
 
 
 def _numbered(name: str, idx: int) -> str:

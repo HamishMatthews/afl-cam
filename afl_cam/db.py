@@ -193,6 +193,16 @@ class RecordingDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def live_recording_in_progress(self) -> Optional[dict]:
+        """The newest live-stitch recording still marked 'recording' (with
+        its session folder): one a power cut interrupted."""
+        row = self.conn.execute(
+            """SELECT r.id AS recording_id, r.session_id, s.folder
+               FROM recordings r JOIN sessions s ON s.id = r.session_id
+               WHERE r.camera = 'stitch' AND r.status = 'recording'
+               ORDER BY r.id DESC LIMIT 1""").fetchone()
+        return dict(row) if row else None
+
     def session_recordings(self, session_id: int) -> list[dict]:
         """Recordings of one session, ordered by camera."""
         rows = self.conn.execute(
