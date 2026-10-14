@@ -1621,9 +1621,14 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
         if (c->count >= 119) {
             c->target_luma = c->luma_n ? c->luma_acc / c->luma_n : 64.0;
             if (c->dt_n > 0 && (c->dt_sum / c->dt_n) > 33333) {
+                /* frame rate first: auto wants a longer exposure than one
+                 * 30 fps frame, which drops the sensor to ~20 fps. Cap at
+                 * 30ms (image is darker, rate holds near 28 fps). */
                 c->lock_pending = 0;
+                c->lock_exp = 300;
+                set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
                 fprintf(stderr, "%s: exposure: auto needs %.1fms (>33ms) — "
-                        "staying in auto for brightness\n",
+                        "capped at 30ms to hold the frame rate\n",
                         c->dev, (c->dt_sum / c->dt_n) / 1000.0);
             } else {
                 if (c->dt_n > 0) {
