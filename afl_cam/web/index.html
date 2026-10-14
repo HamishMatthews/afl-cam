@@ -569,7 +569,11 @@ function applyStatus(s) {
     const now = Date.now();
     let fpsTxt = "–", fpsNum = null;
     if (prevStitch && st.cam0.frames >= prevStitch.cam0.frames) {
-      const dt = Math.max(0.5, (now - prevStitchAt) / 1000);
+      /* the pipeline's own clock when it sends one: arrival times at the
+       * browser jitter and made the rate zigzag (and read above 30) */
+      const dt = (st.t_us && prevStitch.t_us && st.t_us > prevStitch.t_us)
+        ? (st.t_us - prevStitch.t_us) / 1e6
+        : Math.max(0.5, (now - prevStitchAt) / 1000);
       const f0 = (st.cam0.frames - prevStitch.cam0.frames) / dt;
       const f1 = (st.cam1.frames - prevStitch.cam1.frames) / dt;
       fpsTxt = Math.round(f0) + " / " + Math.round(f1);

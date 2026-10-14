@@ -68,8 +68,19 @@ def _diagnose():
         lines = [l for l in log.read_text(errors="replace").splitlines()
                  if re.search(r"exposure|fps|frame interval|S_PARM", l)]
         print("[fps-diag] daemon log, exposure lines:\n" + "\n".join(lines[-30:]))
+    for k, d in list(devs.items())[:1]:
+        # every control the camera offers (is there a gain / brightness / gamma lever?)
+        print(f"[fps-diag] {k} controls:\n" + "\n".join(
+            l.strip()[:110] for l in _v4l(d, "-L").splitlines() if "(" in l or "value=" in l))
     time.sleep(5)
     base = _rate()
+    # which threads of cam2stitch burn CPU, and where the USB IRQs land
+    top = subprocess.run("top -H -b -n 1 -w 200 | head -25", shell=True,
+                         capture_output=True, text=True).stdout
+    print("[fps-diag] busiest threads:\n" + top)
+    irq = subprocess.run("grep -E 'xhci|dwc3' /proc/interrupts | cut -c1-120",
+                         shell=True, capture_output=True, text=True).stdout
+    print("[fps-diag] usb interrupts per core:\n" + irq)
     if log.exists():
         loops = [l for l in log.read_text(errors="replace").splitlines() if l.startswith("loop-ms")]
         print("[fps-diag] main loop (ms per iteration, last 6):\n" + "\n".join(loops[-6:]))
