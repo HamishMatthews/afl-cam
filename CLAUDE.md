@@ -178,6 +178,9 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   `shutdown_request` (ThreadingMixIn's `shutdown(SHUT_WR)` FINs upgraded
   connections) and pass `socket.dup()` straight to the WS wrapper (a
   double-wrapped fd gets closed by the intermediate object's `__del__`).
+- **Recording files are fdatasync'd every ~2 s by `sync_thread`** (opens the
+  live session's files by name, touches no encoder or FILE*), so a power cut
+  loses seconds, not the page cache; REC_STOP syncs once more after closing.
 - **Encoder packet group limit must exceed the rotating buffers** (8 with a
   4-ring): exhaustion makes SPS/PPS header gets fail and packets alias stale
   memory.

@@ -2065,6 +2065,20 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
     pthread_mutex_unlock(&c->mu);
 }
 
+static void sync_rec_files(const char *dir) {
+    static const char *names[] = { "stitch.raw.h264", "stitch.pts",
+                                   "preview.raw.h264", "preview.pts" };
+    char path[1100];
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;
+        fdatasync(fd);
+        close(fd);
+    }
+}
+
 /* called by the MAIN thread once the encoder drain has gone quiet while
  * stopping: flush + close the recording files (proxy included) */
 static void ctl_finish_stop(ctl_t *c, worker_ctx_t *w, pv_t *pv) {
@@ -2092,6 +2106,7 @@ static void ctl_finish_stop(ctl_t *c, worker_ctx_t *w, pv_t *pv) {
     pthread_mutex_unlock(&c->mu);
     fprintf(stderr, "ctl: REC_STOP — closed %s (%lld bytes)\n",
             closed_dir, (long long)bytes);
+    sync_rec_files(closed_dir);
 }
 
 /* called by the MAIN thread at the bottom of each loop iteration:
@@ -2210,6 +2225,28 @@ static int ctl_handle_line(ctl_t *c, int fd, char *line) {
     return 1;
 }
 
+/* Power-loss safety (#21): the recording files are fflush()ed per packet, so
+ * a process crash loses nothing, but a power cut loses whatever sits in the
+ * page cache. Every ~2 s this thread opens each file of the live recording by
+ * name and fdatasync()s it. It only touches files (never the encoder or the
+ * main thread's FILE*s), so the CLAUDE.md main-thread rule does not apply. */
+static void *sync_thread(void *arg) {
+    ctl_t *c = arg;
+    for (;;) {
+        struct timespec ts = { 2, 0 };
+        nanosleep(&ts, NULL);
+        char dir[512];
+        pthread_mutex_lock(&c->mu);
+        int rec = c->recording;
+        strncpy(dir, c->rec_dir, sizeof dir - 1);
+        dir[sizeof dir - 1] = 0;
+        pthread_mutex_unlock(&c->mu);
+        if (rec && dir[0])
+            sync_rec_files(dir);
+    }
+    return NULL;
+}
+
 static void *ctl_thread(void *arg) {
     ctl_t *c = arg;
     int64_t last_push = 0;
@@ -2325,6 +2362,8 @@ static ctl_t *ctl_start(const char *sock_path) {
     chmod(sock_path, 0660);
     pthread_t th;
     pthread_create(&th, NULL, ctl_thread, c);
+    pthread_t sth;
+    pthread_create(&sth, NULL, sync_thread, c);
     fprintf(stderr, "ctl: listening on %s\n", sock_path);
     return c;
 }
