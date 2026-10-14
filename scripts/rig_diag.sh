@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Read-only: did the deployed daemon recover the power-cut session?
+# Read-only: why can't afl-camd read afl_cam/web/index.html?
 S() { echo 123 | sudo -S -p '' "$@"; }
-sleep 240   # deploy + finalize
-S journalctl -u afl-camd --since '-10 min' --no-pager | grep -av 'mpp' | grep -aiE 'intent|resum|finaliz|recover|retime|mux|concat|error' | tail -40
-d=/home/hamish/Documents/afl-cam/outputs/20261014_190718; ls -la $d
-python3 -c "
-import sqlite3;c=sqlite3.connect('file:/home/hamish/Documents/afl-cam/recordings.db?mode=ro',uri=True)
-print(c.execute('select id,status,duration_sec,file_size_bytes from recordings where id=123').fetchall())
-print(c.execute('select id,stitch_status from sessions where id=91').fetchall())"
-ls -la /home/hamish/Documents/afl-cam/outputs/_live/ | grep intent
-ffprobe -v error -show_entries format=duration,size -of compact "$d/stitch.mp4" 2>&1
-ffprobe -v error -show_entries format=duration,size -of compact "$d/proxy.mp4" 2>&1
-cat "$d/segments.json" 2>/dev/null
+sec() { echo; echo "===== $* ====="; }
+R=/home/hamish/Documents/afl-cam
+sec uptime; uptime; date
+sec boots; S journalctl --list-boots --no-pager | tail -6
+sec web dir; ls -la $R/afl_cam/web; stat $R/afl_cam/web/index.html; head -c 200 $R/afl_cam/web/index.html | od -c | head -5
+sec git; cd $R && git log -1 --oneline && git status --short | head -30; git fsck --no-dangling 2>&1 | head -20
+sec mounts; findmnt /
+sec "kernel ext4/nvme/io errors"; S dmesg | grep -iE 'ext4|nvme|i/o error|remount' | tail -30
+sec "afl-camd this boot"; S journalctl -b -u afl-camd --no-pager | grep -av mpp | head -40
+sec "afl-camd previous boot tail"; S journalctl -b -1 -u afl-camd --no-pager | grep -av mpp | tail -20
+sec "deploys in the journal"; S journalctl --since '-14h' --no-pager | grep -a '\[deploy\]' | tail -10
+sec http; curl -s -m 5 http://127.0.0.1/ | head -c 200; echo
