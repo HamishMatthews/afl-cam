@@ -656,7 +656,37 @@ typedef struct {
     void *src0, *src1;
     MppBuffer buf0, buf1;
     volatile int64_t last_us;     /* duration of the last job (stats) */
+    /* helper thread: copies the cam1 frame while the upload thread copies
+     * cam0 (one core moves ~1 GB/s here, so the pair takes half as long) */
+    pthread_mutex_t mu2;
+    pthread_cond_t cv2;
+    int has_job2, done2, stop2;
 } uploader_t;
+
+static void *upload_helper(void *arg) {
+    uploader_t *u = arg;
+    gpu_t *g = u->g;
+    pthread_mutex_lock(&u->mu2);
+    for (;;) {
+        while (!u->has_job2 && !u->stop2)
+            pthread_cond_wait(&u->cv2, &u->mu2);
+        if (!u->has_job2)
+            break;
+        void *s1 = u->src1;
+        MppBuffer b1 = u->buf1;
+        gpu_slot_t *s = &g->slots[u->k];
+        pthread_mutex_unlock(&u->mu2);
+        mpp_buffer_sync_ro_begin(b1);
+        size_t nv12 = (size_t)g->src_w * g->src_h * 3 / 2;
+        memcpy((char *)s->staging_map + s->stage_off[2], s1, nv12);
+        pthread_mutex_lock(&u->mu2);
+        u->has_job2 = 0;
+        u->done2 = 1;
+        pthread_cond_broadcast(&u->cv2);
+    }
+    pthread_mutex_unlock(&u->mu2);
+    return NULL;
+}
 
 static void *upload_thread(void *arg) {
     uploader_t *u = arg;
@@ -674,12 +704,21 @@ static void *upload_thread(void *arg) {
 
         int64_t t0 = now_us();
         gpu_slot_t *s = &g->slots[k];
+        (void)b1; (void)s1;
+        /* cam1 on the helper thread, cam0 here, then join */
+        pthread_mutex_lock(&u->mu2);
+        u->done2 = 0;
+        u->has_job2 = 1;
+        pthread_cond_signal(&u->cv2);
+        pthread_mutex_unlock(&u->mu2);
         /* DMA-written memory via a cached alias: invalidate before reads */
         mpp_buffer_sync_ro_begin(b0);
-        mpp_buffer_sync_ro_begin(b1);
         size_t nv12 = (size_t)g->src_w * g->src_h * 3 / 2;
         memcpy((char *)s->staging_map + s->stage_off[0], s0, nv12);
-        memcpy((char *)s->staging_map + s->stage_off[2], s1, nv12);
+        pthread_mutex_lock(&u->mu2);
+        while (!u->done2)
+            pthread_cond_wait(&u->cv2, &u->mu2);
+        pthread_mutex_unlock(&u->mu2);
         VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                    .memory = s->staging_mem, .offset = 0, .size = g->stage_size };
         vkFlushMappedMemoryRanges(g->dev, 1, &mr);
@@ -1490,6 +1529,7 @@ typedef struct {
     uint32_t seq_prev;
     int seq_valid;
     int seq_lost;               /* V4L2 sequence numbers skipped by the driver */
+    volatile double luma_last;  /* mean Y of a sampled frame (every 30th) */
     /* exposure state machine (cam2h264.c) */
     int lock_pending, lock_phase, refine_left, refine_rounds;
     double target_luma, luma_acc;
@@ -1786,6 +1826,11 @@ static void *capture_thread(void *arg) {
             continue;
         }
         c->count++;
+        if (c->count % 30 == 0) {
+            double ll = frame_luma(dec_frame);
+            if (ll >= 0)
+                c->luma_last = ll;
+        }
         exposure_step(c, dec_frame, pts_us);
         ring_push(&c->ring, idx, pts_us);
     }
@@ -1883,9 +1928,9 @@ static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
     double k = c->t_n > 0 ? 1.0 / (double)c->t_n / 1000.0 : 0.0;
     double dt = c->ts_dt_n > 0 ? (double)c->ts_dt_sum / c->ts_dt_n / 1000.0 : 0.0;
     snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
-             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d",
+             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f",
              c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
-             c->ts_gap, c->seq_lost);
+             c->ts_gap, c->seq_lost, c->luma_last);
     return buf;
 }
 
@@ -2551,6 +2596,10 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&up.mu, NULL);
     pthread_cond_init(&up.cv, NULL);
     pthread_t upthread;
+    pthread_mutex_init(&up.mu2, NULL);
+    pthread_cond_init(&up.cv2, NULL);
+    pthread_t uphelper;
+    pthread_create(&uphelper, NULL, upload_helper, &up);
     pthread_create(&upthread, NULL, upload_thread, &up);
     int up_pending = 0, up_f0 = -1;
     /* wait for the in-flight upload, then release its cam0 frame */
@@ -2733,6 +2782,11 @@ int main(int argc, char **argv) {
     pthread_cond_signal(&up.cv);
     pthread_mutex_unlock(&up.mu);
     pthread_join(upthread, NULL);
+    pthread_mutex_lock(&up.mu2);
+    up.stop2 = 1;
+    pthread_cond_signal(&up.cv2);
+    pthread_mutex_unlock(&up.mu2);
+    pthread_join(uphelper, NULL);
     g_running = 0;
     for (int i = 0; i < 2; i++) {
         pthread_cond_signal(&cams[i].ring.cv_free);

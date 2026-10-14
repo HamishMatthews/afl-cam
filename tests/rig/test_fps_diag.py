@@ -99,6 +99,18 @@ def _diagnose():
     else:
         print("[fps-diag] no exposure_dynamic_framerate control on these cameras")
 
+    # the same capture with the USB interrupts on cores 4 and 5 (needs
+    # passwordless sudo; skipped otherwise). Not persistent, a reboot resets it.
+    pin = subprocess.run(["sudo", "-n", "bash", "scripts/pin_usb_irqs.sh"],
+                         capture_output=True, text=True)
+    print("[fps-diag] pin USB irqs:", (pin.stdout + pin.stderr).strip() or pin.returncode)
+    if pin.returncode == 0:
+        time.sleep(3)
+        print("[fps-diag] with USB irqs on cores 4/5:", _rate())
+        print("[fps-diag] usb interrupts per core after:\n" + subprocess.run(
+            "grep -E 'xhci|xhc' /proc/interrupts | cut -c1-90", shell=True,
+            capture_output=True, text=True).stdout)
+
     # frame rate against a fixed exposure (100 us units): is the rate
     # exposure-limited? Both cameras at once, then back to auto.
     for exp in (100, 300):
@@ -110,6 +122,25 @@ def _diagnose():
         _v4l(d, "--set-ctrl=auto_exposure=3")
     time.sleep(3)
     print("[fps-diag] back to auto:", _rate(6))
+
+    # does the camera's own image processing lift a dim picture at a fixed
+    # exposure? mean luma (cam2stitch samples every 30th frame) and fps for
+    # each setting, with the exposure at 30 ms
+    for d in devs.values():
+        _v4l(d, "--set-ctrl=auto_exposure=1", "--set-ctrl=exposure_time_absolute=300")
+    for name, vals in (("gamma", (100, 160, 220)), ("brightness", (0, 32, 64))):
+        for v in vals:
+            for d in devs.values():
+                _v4l(d, f"--set-ctrl={name}={v}")
+            time.sleep(4)
+            r = _rate(5)
+            s0, s1 = stitch().get("cam0", {}), stitch().get("cam1", {})
+            print(f"[fps-diag] {name}={v}: luma {s0.get('luma')} / {s1.get('luma')}, "
+                  f"fps {r['cam0_fps']} / {r['cam1_fps']}")
+        for d in devs.values():
+            _v4l(d, f"--set-ctrl={name}={0 if name == 'brightness' else 100}")
+    for d in devs.values():
+        _v4l(d, "--set-ctrl=auto_exposure=3")
 
     for k, d in devs.items():
         print(f"[fps-diag] {k} exposure now:",
