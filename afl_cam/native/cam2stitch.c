@@ -642,6 +642,61 @@ static void gpu_init(gpu_t *g, const char *spv_path,
             g->canvas_w, g->canvas_h, RING_SLOTS);
 }
 
+/* Upload thread: copies a frame pair into the slot's staging buffer, flushes
+ * it and submits the GPU job. Pairing and encoding stay on the main thread,
+ * so the 25 MB copy overlaps them instead of adding to the frame period.
+ * Only this thread touches the queue after setup. The main thread must call
+ * upload_wait() before it releases or advances past the source buffers. */
+typedef struct {
+    gpu_t *g;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int has_job, done, stop;
+    int k;
+    void *src0, *src1;
+    MppBuffer buf0, buf1;
+    volatile int64_t last_us;     /* duration of the last job (stats) */
+} uploader_t;
+
+static void *upload_thread(void *arg) {
+    uploader_t *u = arg;
+    gpu_t *g = u->g;
+    pthread_mutex_lock(&u->mu);
+    for (;;) {
+        while (!u->has_job && !u->stop)
+            pthread_cond_wait(&u->cv, &u->mu);
+        if (!u->has_job)
+            break;
+        int k = u->k;
+        void *s0 = u->src0, *s1 = u->src1;
+        MppBuffer b0 = u->buf0, b1 = u->buf1;
+        pthread_mutex_unlock(&u->mu);
+
+        int64_t t0 = now_us();
+        gpu_slot_t *s = &g->slots[k];
+        /* DMA-written memory via a cached alias: invalidate before reads */
+        mpp_buffer_sync_ro_begin(b0);
+        mpp_buffer_sync_ro_begin(b1);
+        size_t nv12 = (size_t)g->src_w * g->src_h * 3 / 2;
+        memcpy((char *)s->staging_map + s->stage_off[0], s0, nv12);
+        memcpy((char *)s->staging_map + s->stage_off[2], s1, nv12);
+        VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                   .memory = s->staging_mem, .offset = 0, .size = g->stage_size };
+        vkFlushMappedMemoryRanges(g->dev, 1, &mr);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .commandBufferCount = 1, .pCommandBuffers = &s->cb };
+        CHECK(vkQueueSubmit(g->queue, 1, &si, s->fence));
+        u->last_us = now_us() - t0;
+
+        pthread_mutex_lock(&u->mu);
+        u->has_job = 0;
+        u->done = 1;
+        pthread_cond_broadcast(&u->cv);
+    }
+    pthread_mutex_unlock(&u->mu);
+    return NULL;
+}
+
 /* Stitch one frame pair (tight NV12 in) → tight NV12 out (repacked).
  * Blocking: waits the slot's fence before reuse and after submission. */
 static int64_t g_times[5];   /* wait-before, memcpy, submit, wait-after, repack */
@@ -1423,6 +1478,18 @@ typedef struct {
     RK_S32 exposure;
     int count;                  /* frames decoded */
     int errors;                 /* decode failures (status reporting) */
+    /* capture-path timing (status "cam*.t"): where the frame rate goes */
+    int64_t t_slot_us;          /* waiting for a free ring slot (pipeline behind) */
+    int64_t t_dq_us;            /* waiting in DQBUF for the camera to deliver */
+    int64_t t_dec_us;           /* jpegd put_packet..get_frame (shared VPU core) */
+    int64_t t_n;                /* frames the three above were summed over */
+    int64_t ts_prev;            /* previous frame's V4L2 timestamp */
+    int64_t ts_dt_sum;          /* sum of intervals between frames */
+    int ts_dt_n;
+    int ts_gap;                 /* intervals above 1.5x the nominal 33.3 ms */
+    uint32_t seq_prev;
+    int seq_valid;
+    int seq_lost;               /* V4L2 sequence numbers skipped by the driver */
     /* exposure state machine (cam2h264.c) */
     int lock_pending, lock_phase, refine_left, refine_rounds;
     double target_luma, luma_acc;
@@ -1554,9 +1621,14 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
         if (c->count >= 119) {
             c->target_luma = c->luma_n ? c->luma_acc / c->luma_n : 64.0;
             if (c->dt_n > 0 && (c->dt_sum / c->dt_n) > 33333) {
+                /* frame rate first: auto wants a longer exposure than one
+                 * 30 fps frame, which drops the sensor to ~20 fps. Cap at
+                 * 30ms (image is darker, rate holds near 28 fps). */
                 c->lock_pending = 0;
+                c->lock_exp = 300;
+                set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
                 fprintf(stderr, "%s: exposure: auto needs %.1fms (>33ms) — "
-                        "staying in auto for brightness\n",
+                        "capped at 30ms to hold the frame rate\n",
                         c->dev, (c->dt_sum / c->dt_n) / 1000.0);
             } else {
                 if (c->dt_n > 0) {
@@ -1600,9 +1672,11 @@ static void *capture_thread(void *arg) {
     cam_t *c = arg;
     while (g_running) {
         /* backpressure: wait for a FREE ring slot BEFORE DQBUF */
+        int64_t t_a = now_us();
         int idx = ring_wait_slot(&c->ring, 0);
         if (idx < 0)
             break;
+        c->t_slot_us += now_us() - t_a;
         ring_slot_t *slot = &c->ring.slots[idx];
 
         if (slot->frame == NULL) {
@@ -1637,6 +1711,7 @@ static void *capture_thread(void *arg) {
         vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         vbuf.memory = V4L2_MEMORY_MMAP;
         int q_ok = 0;
+        int64_t t_b = now_us();
         while (g_running) {
             if (ioctl(c->fd, VIDIOC_DQBUF, &vbuf) < 0) {
                 if (errno == EAGAIN) { usleep(1000); continue; }
@@ -1651,6 +1726,19 @@ static void *capture_thread(void *arg) {
         int64_t pts_us = (int64_t)vbuf.timestamp.tv_sec * 1000000 +
                          vbuf.timestamp.tv_usec;
         size_t jpeg_size = vbuf.bytesused;
+        int64_t t_c = now_us();
+        c->t_dq_us += t_c - t_b;
+        if (c->ts_prev > 0 && pts_us > c->ts_prev) {
+            c->ts_dt_sum += pts_us - c->ts_prev;
+            c->ts_dt_n++;
+            if (pts_us - c->ts_prev > 50000)
+                c->ts_gap++;
+        }
+        c->ts_prev = pts_us;
+        if (c->seq_valid && vbuf.sequence > c->seq_prev + 1)
+            c->seq_lost += (int)(vbuf.sequence - c->seq_prev - 1);
+        c->seq_prev = vbuf.sequence;
+        c->seq_valid = 1;
 
         /* live-preview snapshot: raw UVC JPEG payload straight to disk
          * (full 4K, colors exact — the camera's own JPEG). The jpegenc
@@ -1682,6 +1770,8 @@ static void *capture_thread(void *arg) {
 
         MppFrame dec_frame = NULL;
         r = c->dec_mpi->decode_get_frame(c->dec_ctx, &dec_frame);
+        c->t_dec_us += now_us() - t_c;
+        c->t_n++;
         if (r || !dec_frame) { c->errors++; slot->state = 0; continue; }
         if (mpp_frame_get_info_change(dec_frame)) {
             c->dec_mpi->control(c->dec_ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
@@ -1785,12 +1875,27 @@ static void ctl_reply(ctl_t *c, int fd, const char *msg) {
         send(fd, line, (size_t)n, MSG_NOSIGNAL);
 }
 
+/* per-camera capture timing as JSON fields: mean ms per frame spent waiting
+ * for a ring slot (pipeline behind), waiting for the camera, and in jpegd;
+ * the mean interval between camera timestamps, intervals over 50 ms, and
+ * driver-lost sequence numbers. Averages since the pipeline started. */
+static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
+    double k = c->t_n > 0 ? 1.0 / (double)c->t_n / 1000.0 : 0.0;
+    double dt = c->ts_dt_n > 0 ? (double)c->ts_dt_sum / c->ts_dt_n / 1000.0 : 0.0;
+    snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
+             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d",
+             c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
+             c->ts_gap, c->seq_lost);
+    return buf;
+}
+
 /* called by the MAIN thread once per frame */
 static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
                         int out_count, int dup_count, int skip_count,
                         int skipped_start, int64_t skew_sum, int64_t skew_n) {
     if (!c)
         return;
+    char tbuf0[256], tbuf1[256];
     pthread_mutex_lock(&c->mu);
     c->rec_bytes = w->rec_bytes;
     int64_t elapsed = c->recording ? now_us() - c->rec_start_us : 0;
@@ -1798,8 +1903,8 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
     int n = snprintf(c->status_buf, sizeof c->status_buf,
         "{\"state\":\"%s\",\"rec_dir\":\"%s\",\"rec_elapsed_s\":%lld.%03lld,"
         "\"rec_bytes\":%lld,"
-        "\"cam0\":{\"frames\":%d,\"errors\":%d},"
-        "\"cam1\":{\"frames\":%d,\"errors\":%d},"
+        "\"cam0\":{\"frames\":%d,\"errors\":%d,%s},"
+        "\"cam1\":{\"frames\":%d,\"errors\":%d,%s},"
         "\"paired\":%d,\"dup\":%d,\"skip\":%d,\"start_trim\":%d,"
         "\"skew_avg_us\":%lld,"
         "\"enc\":{\"packets\":%d,\"put\":%d,\"drained\":%d},"
@@ -1809,8 +1914,8 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
         c->recording ? c->rec_dir : "",
         (long long)(elapsed / 1000000), (long long)((elapsed / 1000) % 1000),
         (long long)c->rec_bytes,
-        cams[0].count, cams[0].errors,
-        cams[1].count, cams[1].errors,
+        cams[0].count, cams[0].errors, cam_timing(&cams[0], tbuf0, sizeof tbuf0),
+        cams[1].count, cams[1].errors, cam_timing(&cams[1], tbuf1, sizeof tbuf1),
         out_count, dup_count, skip_count, skipped_start,
         (long long)skew,
         w->enc_count, w->put_total, w->drained_total,
@@ -2437,14 +2542,42 @@ int main(int argc, char **argv) {
     /* wait for cam1's first frame to learn the start trim */
     cur1_idx = ring_take(&cams[1].ring, &cur1, &cur1_pts);
 
+    /* main-loop stage timers (us, summed over 10 iterations, logged with
+     * the "submitted" line): where the frame period goes */
+    int64_t acc_take = 0, acc_fence = 0, acc_ack = 0, acc_copy = 0, acc_enc = 0, acc_iter = 0;
+    int64_t acc_upw = 0;
+    uploader_t up = { .g = &g };
+    pthread_mutex_init(&up.mu, NULL);
+    pthread_cond_init(&up.cv, NULL);
+    pthread_t upthread;
+    pthread_create(&upthread, NULL, upload_thread, &up);
+    int up_pending = 0, up_f0 = -1;
+    /* wait for the in-flight upload, then release its cam0 frame */
+#define UPLOAD_WAIT() do { \
+        if (up_pending) { \
+            int64_t _w0 = now_us(); \
+            pthread_mutex_lock(&up.mu); \
+            while (!up.done) \
+                pthread_cond_wait(&up.cv, &up.mu); \
+            pthread_mutex_unlock(&up.mu); \
+            ring_release(&cams[0].ring, up_f0); \
+            up_pending = 0; \
+            acc_upw += now_us() - _w0; \
+            acc_copy += up.last_us; \
+        } \
+    } while (0)
     while (g_running && (frames == 0 || out_count < frames) &&
            !(t_deadline && now_us() > t_deadline)) {
+        int64_t t_top = now_us();
         /* cam0 frame */
         int64_t p0_pts;
         MppFrame f0 = NULL;
         int f0_idx = ring_take(&cams[0].ring, &f0, &p0_pts);
         if (f0_idx < 0)
             break;
+        /* the previous pair's copy must finish before the cam1 cursor
+         * moves on (its source buffers may be released below) */
+        UPLOAD_WAIT();
 
         if (cur1_idx < 0 || p0_pts < cams[1].ring.first_pts) {
             /* cam1 not started yet — start trim */
@@ -2487,6 +2620,7 @@ int main(int argc, char **argv) {
         skew_sum += p0_pts > pair_pts ? p0_pts - pair_pts : pair_pts - p0_pts;
         skew_n++;
         int64_t t_stage = now_us();
+        acc_take += t_stage - t_top;
         /* our cached mmap of the decoder buffers (MPP's own mapping is
          * uncached — the 24.9MB staging copy would take ~200ms) */
         void *y0_ptr = cams[0].ring.slots[f0_idx].map_ptr ?
@@ -2495,13 +2629,10 @@ int main(int argc, char **argv) {
         void *y1_ptr = cams[1].ring.slots[pair_idx].map_ptr ?
                        cams[1].ring.slots[pair_idx].map_ptr :
                        mpp_buffer_get_ptr(cams[1].ring.slots[pair_idx].buf);
-        /* DMA-written memory via a cached alias: invalidate before reads */
-        mpp_buffer_sync_ro_begin(cams[0].ring.slots[f0_idx].buf);
-        mpp_buffer_sync_ro_begin(cams[1].ring.slots[pair_idx].buf);
-
         gpu_slot_t *s = &g.slots[g.k];
         int k = g.k;
         /* GPU job for frame i-3 is done → its packed SSBO is readable */
+        int64_t t_f0 = now_us();
         CHECK(vkWaitForFences(g.dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
         CHECK(vkResetFences(g.dev, 1, &s->fence));
         {
@@ -2509,6 +2640,7 @@ int main(int argc, char **argv) {
                                        .memory = s->ssbo_mem, .offset = 0, .size = g.ssbo_size };
             vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
         }
+        acc_fence += now_us() - t_f0;
         /* the slot's previous result (frame i-3) — hand it to the
          * worker for repack, then wait before the GPU overwrites it */
         int64_t put_pts = pend_pts[k];
@@ -2519,25 +2651,31 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&w.q->mu);
         /* the worker must finish repacking slot k's SSBO before the GPU
          * overwrites it with this frame's job (usually already done) */
+        int64_t t_a0 = now_us();
         pthread_mutex_lock(&w.ack_mu);
         while (!w.ack_done[k])
             pthread_cond_wait(&w.ack_cv, &w.ack_mu);
         w.ack_done[k] = 0;
         pthread_mutex_unlock(&w.ack_mu);
-        /* copy this frame's pair into staging + submit */
-        size_t nv12 = (size_t)g.src_w * g.src_h * 3 / 2;
-        memcpy((char *)s->staging_map + s->stage_off[0], y0_ptr, nv12);
-        memcpy((char *)s->staging_map + s->stage_off[2], y1_ptr, nv12);
-        {
-            VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                                       .memory = s->staging_mem, .offset = 0, .size = g.stage_size };
-            vkFlushMappedMemoryRanges(g.dev, 1, &mr);
-        }
-        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                            .commandBufferCount = 1, .pCommandBuffers = &s->cb };
-        CHECK(vkQueueSubmit(g.queue, 1, &si, s->fence));
+        int64_t t_c0 = now_us();
+        acc_ack += t_c0 - t_a0;
+        /* hand this frame's pair to the upload thread (copy + flush +
+         * submit); the encode below overlaps it */
+        pthread_mutex_lock(&up.mu);
+        up.k = k;
+        up.src0 = y0_ptr;
+        up.src1 = y1_ptr;
+        up.buf0 = cams[0].ring.slots[f0_idx].buf;
+        up.buf1 = cams[1].ring.slots[pair_idx].buf;
+        up.done = 0;
+        up.has_job = 1;
+        pthread_cond_signal(&up.cv);
+        pthread_mutex_unlock(&up.mu);
+        up_pending = 1;
+        up_f0 = f0_idx;
         pend_pts[k] = mid;
         g.k = (g.k + 1) % RING_SLOTS;
+        int64_t t_e0 = now_us();
         /* encode frame i-3 (repacked by the worker into enc_in[0]) on
          * the MAIN thread — the proven-clean sync path. The drain
          * returns immediately: the encoder finished ~30ms ago. */
@@ -2552,6 +2690,7 @@ int main(int argc, char **argv) {
             if (pv_ok)
                 pv_put_drain(&pv, put_pts);
         }
+        acc_enc += now_us() - t_e0;
         if (w.recording && w.stopping) {
             /* draining the encoder tail: no new puts. Outside the
              * put_pts guard so a stop inside the first 3 frames also
@@ -2564,11 +2703,19 @@ int main(int argc, char **argv) {
                 w.empty_drains = 0;
             }
         }
-        ring_release(&cams[0].ring, f0_idx);
         out_count++;
-        if (out_count % 10 == 0)
+        acc_iter += now_us() - t_top;
+        if (out_count % 10 == 0) {
             fprintf(stderr, "submitted %d frames (main %.1fms, encoded %d)\n",
                     out_count, (now_us() - t_stage) / 1000.0, w.enc_count);
+            /* per-iteration averages over the last 10: pair/wait for cameras,
+             * GPU fence, worker ack, copy+submit, encode/preview puts, total */
+            fprintf(stderr, "loop-ms take %.1f fence %.1f ack %.1f copy %.1f upwait %.1f enc %.1f iter %.1f\n",
+                    acc_take / 10000.0, acc_fence / 10000.0, acc_ack / 10000.0,
+                    acc_copy / 10000.0, acc_upw / 10000.0, acc_enc / 10000.0,
+                    acc_iter / 10000.0);
+            acc_take = acc_fence = acc_ack = acc_copy = acc_upw = acc_enc = acc_iter = 0;
+        }
 
         /* daemon: publish status + apply pending REC_START/REC_STOP/QUIT
          * (bottom of the iteration — a stop flushes the last packets) */
@@ -2579,6 +2726,12 @@ int main(int argc, char **argv) {
     }
 
     /* ---- stop + EOS (main thread — the old proven-clean path) ---- */
+    UPLOAD_WAIT();
+    pthread_mutex_lock(&up.mu);
+    up.stop = 1;
+    pthread_cond_signal(&up.cv);
+    pthread_mutex_unlock(&up.mu);
+    pthread_join(upthread, NULL);
     g_running = 0;
     for (int i = 0; i < 2; i++) {
         pthread_cond_signal(&cams[i].ring.cv_free);
