@@ -2233,10 +2233,18 @@ class CamDaemon:
 
     def _recover_intent(self):
         """Boot / daemon start: a record intent left behind means the last
-        recording never stopped. Resume it (fresh enough) or finalize it."""
+        recording never stopped. Resume it (fresh enough) or finalize it.
+        No intent but a live recording the DB still calls 'recording': the
+        recording was stopped and its finalize never finished (the daemon
+        was restarted mid-mux, 2026-10-14) — finalize it again."""
         intent = resume.load_intent(INTENT_PATH)
-        if intent is None and resume.intent_unreadable(INTENT_PATH):
-            intent = self._intent_from_db()
+        unfinished = False
+        if intent is None:
+            if resume.intent_unreadable(INTENT_PATH):
+                intent = self._intent_from_db()
+            else:
+                intent = self._intent_from_db(unreadable=False)
+                unfinished = intent is not None
         if intent is None:
             return
         try:
@@ -2248,17 +2256,26 @@ class CamDaemon:
         if not session_dir_is_safe(session.dir) or not session.dir.is_dir():
             log.error("record intent points at %s — cleared", session.dir)
             resume.clear_intent(INTENT_PATH)
+            if unfinished:
+                self.db.update_error(session.recording_id,
+                                     "session folder missing")
             return
         alive_at = float(intent.get("alive_at") or 0.0)
         seg_start = float(intent.get("seg_start") or alive_at)
         session.elapsed_before += max(0.0, alive_at - seg_start)
         session.lost_at = alive_at
-        if time.time() - alive_at > RESUME_MAX_GAP_S:
-            log.warning("record intent for %s is %.0f s old — finalizing "
-                        "instead of resuming", session.dir.name,
-                        time.time() - alive_at)
+        if unfinished or time.time() - alive_at > RESUME_MAX_GAP_S:
+            if unfinished:
+                log.warning("recording %s was stopped but never finalized "
+                            "— finalizing it", session.dir.name)
+            else:
+                log.warning("record intent for %s is %.0f s old — "
+                            "finalizing instead of resuming",
+                            session.dir.name, time.time() - alive_at)
             resume.clear_intent(INTENT_PATH)
             session.duration = session.elapsed_before
+            # visible as finalizing, so a deploy or rig test waits for it
+            self._set_state("finalizing")
             Finalizer(self, session).start()
             return
         log.warning("recording %s never stopped — resuming it",
@@ -2267,26 +2284,28 @@ class CamDaemon:
         self._resume = True
         self.error = "recording interrupted — resuming"
 
-    def _intent_from_db(self) -> Optional[dict]:
-        """The intent file is there but unreadable (power cut mid-write):
-        the recordings DB still knows which recording never stopped."""
+    def _intent_from_db(self, unreadable: bool = True) -> Optional[dict]:
+        """The recordings DB's live recording still marked 'recording', as
+        an intent: for an intent file a power cut left unreadable, or (no
+        intent file) a recording whose finalize never finished."""
         try:
             row = self.db.live_recording_in_progress()
         except Exception as e:
-            log.error("record intent unreadable and the DB lookup failed: "
-                      "%s", e)
+            log.error("recording lookup in the DB failed: %s", e)
             return None
         if not row or not row.get("folder"):
-            log.error("record intent unreadable and no recording in "
-                      "progress in the DB — cleared")
-            resume.clear_intent(INTENT_PATH)
+            if unreadable:
+                log.error("record intent unreadable and no recording in "
+                          "progress in the DB — cleared")
+                resume.clear_intent(INTENT_PATH)
             return None
         dir_ = Path(row["folder"])
         if not dir_.is_absolute():
             dir_ = ROOT_DIR / dir_
-        log.warning("record intent unreadable (power cut mid-write?) — "
-                    "recovering recording %d from the DB",
-                    row["recording_id"])
+        if unreadable:
+            log.warning("record intent unreadable (power cut mid-write?) — "
+                        "recovering recording %d from the DB",
+                        row["recording_id"])
         return resume.intent_from_files(dir_, row["session_id"],
                                         row["recording_id"])
 
