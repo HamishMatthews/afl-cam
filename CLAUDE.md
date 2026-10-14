@@ -178,6 +178,13 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   `shutdown_request` (ThreadingMixIn's `shutdown(SHUT_WR)` FINs upgraded
   connections) and pass `socket.dup()` straight to the WS wrapper (a
   double-wrapped fd gets closed by the intermediate object's `__del__`).
+- **Recording files are fdatasync'd every ~2 s by `sync_thread`** (opens the
+  live session's files by name, touches no encoder or FILE*), so a power cut
+  loses seconds, not the page cache; REC_STOP syncs once more after closing.
+- **White balance is fixed and identical on both cameras** (`AFL_CAM_WB_K`,
+  default 5500 K, 0 = camera auto): on the rig the cameras' own auto WB
+  differed by ~15 in U and V, fixed at one temperature by ~3. The dim-light
+  cap (30 ms) is lifted with the camera's brightness then gamma.
 - **Encoder packet group limit must exceed the rotating buffers** (8 with a
   4-ring): exhaustion makes SPS/PPS header gets fail and packets alias stale
   memory.

@@ -31,5 +31,11 @@ def test_sigkill_mid_recording_resumes_same_session():
                what="standby after finalize")
     latest = get("/api/recordings")["recordings"][0]
     assert latest.get("has_master") and latest.get("has_proxy"), latest
+    if latest.get("resumed", {}).get("restarts") != 1:    # say why in the CI log
+        from pathlib import Path
+        log = Path("rig-daemon.log")
+        lines = [l for l in log.read_text(errors="replace").splitlines()
+                 if "stitch" in l or "resum" in l or "watchdog" in l] if log.exists() else []
+        print("[resume] daemon log:\n" + "\n".join(lines[-40:]))
     assert latest.get("resumed", {}).get("restarts") == 1, latest
     print(f"[crash-resume] gap {latest['resumed']['lost_s']} s")

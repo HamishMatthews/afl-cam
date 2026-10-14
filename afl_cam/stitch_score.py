@@ -172,6 +172,17 @@ def score(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps) -> dict:
     else:
         out["luma_step"] = out["luma_ratio"] = None
 
+    # colour step: median Cr/Cb difference (camera 1 minus camera 0) in the
+    # overlap, after the same blur; 0 = the cameras agree on colour balance
+    if v0.ndim == 3 and lit.any():
+        c0 = cv2.GaussianBlur(cv2.cvtColor(v0[y0:y1, x0:x1], cv2.COLOR_BGR2YCrCb), (0, 0), 8)
+        c1 = cv2.GaussianBlur(cv2.cvtColor(v1[y0:y1, x0:x1], cv2.COLOR_BGR2YCrCb), (0, 0), 8)
+        sel = both.copy()
+        sel[~(((cv2.GaussianBlur(g0, (0, 0), 8) > 8) & (cv2.GaussianBlur(g1, (0, 0), 8) > 8)))] = False
+        if sel.any():
+            out["chroma_step"] = [round(float(np.median(c1[..., k][sel].astype(np.int16) - c0[..., k][sel])), 2)
+                                  for k in (1, 2)]     # Cr, Cb
+
     # seam_ghost: how much double image the blend actually shows — the two
     # views' difference weighted by how evenly they are mixed there
     # (2*min(w0, w1): 1 at a 50/50 mix, 0 where one camera owns the pixel),

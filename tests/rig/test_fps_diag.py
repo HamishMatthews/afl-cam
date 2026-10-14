@@ -111,6 +111,42 @@ def _diagnose():
     time.sleep(3)
     print("[fps-diag] back to auto:", _rate(6))
 
+    # does the camera's own image processing lift a dim picture at a fixed
+    # exposure? mean luma (cam2stitch samples every 30th frame) and fps for
+    # each setting, with the exposure at 30 ms
+    for d in devs.values():
+        _v4l(d, "--set-ctrl=auto_exposure=1", "--set-ctrl=exposure_time_absolute=300")
+    for name, vals in (("gamma", (100, 160, 220)), ("brightness", (0, 32, 64))):
+        for v in vals:
+            for d in devs.values():
+                _v4l(d, f"--set-ctrl={name}={v}")
+            time.sleep(4)
+            r = _rate(5)
+            s0, s1 = stitch().get("cam0", {}), stitch().get("cam1", {})
+            print(f"[fps-diag] {name}={v}: luma {s0.get('luma')} / {s1.get('luma')}, "
+                  f"fps {r['cam0_fps']} / {r['cam1_fps']}")
+        for d in devs.values():
+            _v4l(d, f"--set-ctrl={name}={0 if name == 'brightness' else 100}")
+    for d in devs.values():
+        _v4l(d, "--set-ctrl=auto_exposure=3")
+
+    # colour balance: mean U/V of each camera (128 = neutral) with the
+    # camera's own auto white balance, then both fixed at the same temperature
+    def _uv(tag):
+        a, b = stitch().get("cam0", {}), stitch().get("cam1", {})
+        print(f"[fps-diag] wb {tag}: cam0 u/v {a.get('u')}/{a.get('v')}  "
+              f"cam1 u/v {b.get('u')}/{b.get('v')}")
+    time.sleep(3)
+    _uv("auto")
+    for t in (4000, 5500, 6500):
+        for d in devs.values():
+            _v4l(d, "--set-ctrl=white_balance_automatic=0",
+                 f"--set-ctrl=white_balance_temperature={t}")
+        time.sleep(4)
+        _uv(f"fixed {t} K")
+    for d in devs.values():
+        _v4l(d, "--set-ctrl=white_balance_automatic=1")
+
     for k, d in devs.items():
         print(f"[fps-diag] {k} exposure now:",
               _v4l(d, "--get-ctrl=auto_exposure,exposure_time_absolute"))

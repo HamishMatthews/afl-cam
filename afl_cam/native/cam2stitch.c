@@ -135,6 +135,16 @@ static void set_exposure(int fd, int mode, RK_S32 value)
     }
 }
 
+static void set_ctrl(int fd, __u32 id, RK_S32 value)
+{
+    struct v4l2_control ctrl;
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id = id;
+    ctrl.value = value;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+        fprintf(stderr, "set control 0x%x failed: %s\n", id, strerror(errno));
+}
+
 /* Atomic JPEG snapshot write: the raw UVC MJPEG payload is a complete JPEG —
  * write it straight to *preview_path* via a temp file + rename so the UI
  * (which polls the file) never sees a half-written frame. */
@@ -155,6 +165,34 @@ static void write_preview(const char *preview_path, const void *jpeg, size_t siz
 
 /* Mean luma of an NV12 frame over an 8x8 subsample — cheap brightness proxy
  * for the auto-settle-then-lock exposure loop (copied from cam2h264.c). */
+/* mean U and V of a decoded NV12 frame (sparse sample) — for comparing the
+ * cameras' colour balance */
+static int frame_chroma(MppFrame frame, double *u, double *v)
+{
+    MppBuffer buf = mpp_frame_get_buffer(frame);
+    if (!buf)
+        return -1;
+    RK_U8 *base = (RK_U8 *)mpp_buffer_get_ptr(buf);
+    RK_U32 hs = mpp_frame_get_hor_stride(frame);
+    RK_U32 vs = mpp_frame_get_ver_stride(frame);
+    RK_U32 w = mpp_frame_get_width(frame);
+    RK_U32 h = mpp_frame_get_height(frame);
+    RK_U8 *uv = base + (size_t)hs * vs;
+    RK_U64 su = 0, sv = 0;
+    RK_U32 n = 0;
+    for (RK_U32 yy = 0; yy < h / 2; yy += 8)
+        for (RK_U32 xx = 0; xx + 1 < w; xx += 16) {
+            su += uv[yy * hs + xx];
+            sv += uv[yy * hs + xx + 1];
+            n++;
+        }
+    if (!n)
+        return -1;
+    *u = (double)su / n;
+    *v = (double)sv / n;
+    return 0;
+}
+
 static double frame_luma(MppFrame frame)
 {
     MppBuffer buf = mpp_frame_get_buffer(frame);
@@ -656,7 +694,37 @@ typedef struct {
     void *src0, *src1;
     MppBuffer buf0, buf1;
     volatile int64_t last_us;     /* duration of the last job (stats) */
+    /* helper thread: copies the cam1 frame while the upload thread copies
+     * cam0 (one core moves ~1 GB/s here, so the pair takes half as long) */
+    pthread_mutex_t mu2;
+    pthread_cond_t cv2;
+    int has_job2, done2, stop2;
 } uploader_t;
+
+static void *upload_helper(void *arg) {
+    uploader_t *u = arg;
+    gpu_t *g = u->g;
+    pthread_mutex_lock(&u->mu2);
+    for (;;) {
+        while (!u->has_job2 && !u->stop2)
+            pthread_cond_wait(&u->cv2, &u->mu2);
+        if (!u->has_job2)
+            break;
+        void *s1 = u->src1;
+        MppBuffer b1 = u->buf1;
+        gpu_slot_t *s = &g->slots[u->k];
+        pthread_mutex_unlock(&u->mu2);
+        mpp_buffer_sync_ro_begin(b1);
+        size_t nv12 = (size_t)g->src_w * g->src_h * 3 / 2;
+        memcpy((char *)s->staging_map + s->stage_off[2], s1, nv12);
+        pthread_mutex_lock(&u->mu2);
+        u->has_job2 = 0;
+        u->done2 = 1;
+        pthread_cond_broadcast(&u->cv2);
+    }
+    pthread_mutex_unlock(&u->mu2);
+    return NULL;
+}
 
 static void *upload_thread(void *arg) {
     uploader_t *u = arg;
@@ -674,12 +742,21 @@ static void *upload_thread(void *arg) {
 
         int64_t t0 = now_us();
         gpu_slot_t *s = &g->slots[k];
+        (void)b1; (void)s1;
+        /* cam1 on the helper thread, cam0 here, then join */
+        pthread_mutex_lock(&u->mu2);
+        u->done2 = 0;
+        u->has_job2 = 1;
+        pthread_cond_signal(&u->cv2);
+        pthread_mutex_unlock(&u->mu2);
         /* DMA-written memory via a cached alias: invalidate before reads */
         mpp_buffer_sync_ro_begin(b0);
-        mpp_buffer_sync_ro_begin(b1);
         size_t nv12 = (size_t)g->src_w * g->src_h * 3 / 2;
         memcpy((char *)s->staging_map + s->stage_off[0], s0, nv12);
-        memcpy((char *)s->staging_map + s->stage_off[2], s1, nv12);
+        pthread_mutex_lock(&u->mu2);
+        while (!u->done2)
+            pthread_cond_wait(&u->cv2, &u->mu2);
+        pthread_mutex_unlock(&u->mu2);
         VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                    .memory = s->staging_mem, .offset = 0, .size = g->stage_size };
         vkFlushMappedMemoryRanges(g->dev, 1, &mr);
@@ -1490,6 +1567,9 @@ typedef struct {
     uint32_t seq_prev;
     int seq_valid;
     int seq_lost;               /* V4L2 sequence numbers skipped by the driver */
+    volatile double luma_last;  /* mean Y of a sampled frame (every 30th) */
+    volatile double u_last, v_last;  /* mean U/V of the same frame */
+    int cap_bright, cap_gamma;  /* dim-light lift at the exposure cap */
     /* exposure state machine (cam2h264.c) */
     int lock_pending, lock_phase, refine_left, refine_rounds;
     double target_luma, luma_acc;
@@ -1532,8 +1612,25 @@ static int v4l2_open(cam_t *c) {
     if (c->exposure > 0) {
         set_exposure(fd, V4L2_EXPOSURE_MANUAL, c->exposure);
     } else {
-        /* this camera's auto mode is menu value 3 (cam2h264.c) */
+        /* this camera's auto mode is menu value 3 (cam2h264.c); also drop
+         * any brightness/gamma lift an earlier run left in the camera */
+        set_ctrl(fd, V4L2_CID_BRIGHTNESS, 0);
+        set_ctrl(fd, V4L2_CID_GAMMA, 100);
         set_exposure(fd, 3, 0);
+        /* both cameras on the SAME fixed white balance: on the rig their own
+         * auto white balance disagreed by ~15 in U and V (a visible colour
+         * step at the seam), fixed at one temperature they are within ~3.
+         * AFL_CAM_WB_K = kelvin (2800-6500), 0 = leave the cameras on auto */
+        {
+            const char *wbs = getenv("AFL_CAM_WB_K");
+            int wbk = wbs ? atoi(wbs) : 5500;
+            if (wbk >= 2800 && wbk <= 6500) {
+                set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
+                set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, wbk);
+            } else {
+                set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
+            }
+        }
     }
 
     struct v4l2_requestbuffers req;
@@ -1624,12 +1721,22 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
                 /* frame rate first: auto wants a longer exposure than one
                  * 30 fps frame, which drops the sensor to ~20 fps. Cap at
                  * 30ms (image is darker, rate holds near 28 fps). */
-                c->lock_pending = 0;
                 c->lock_exp = 300;
                 set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
+                /* manual exposure drops the camera's own boost, so the
+                 * picture goes much darker than auto: lift it with the
+                 * camera's brightness (then gamma) until the mean luma
+                 * is back near what auto gave (phase 2) */
+                c->lock_phase = 2;
+                c->refine_left = 40;
+                c->refine_rounds = 0;
+                c->cap_bright = 0;
+                c->cap_gamma = 100;
+                c->luma_acc = 0.0; c->luma_n = 0;
                 fprintf(stderr, "%s: exposure: auto needs %.1fms (>33ms) — "
-                        "capped at 30ms to hold the frame rate\n",
-                        c->dev, (c->dt_sum / c->dt_n) / 1000.0);
+                        "capped at 30ms to hold the frame rate, lifting "
+                        "brightness to luma %.0f\n",
+                        c->dev, (c->dt_sum / c->dt_n) / 1000.0, c->target_luma);
             } else {
                 if (c->dt_n > 0) {
                     c->lock_exp = (RK_S32)((c->dt_sum / c->dt_n) / 100);
@@ -1642,6 +1749,37 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
                 c->luma_acc = 0.0; c->luma_n = 0;
                 fprintf(stderr, "%s: exposure: auto settled at luma %.0f -> manual %d (%dms), refining...\n",
                         c->dev, c->target_luma, c->lock_exp, c->lock_exp / 10);
+            }
+        }
+    } else if (c->lock_phase == 2) {
+        /* the control change takes a few frames: measure the last 15 of 40 */
+        if (--c->refine_left <= 15) { c->luma_acc += l; c->luma_n++; }
+        if (c->refine_left == 0) {
+            double meas = c->luma_n ? c->luma_acc / c->luma_n : c->target_luma;
+            double err = c->target_luma - meas;
+            int done = (err < 0.12 * c->target_luma + 2.0 && err > -0.12 * c->target_luma - 2.0)
+                       || ++c->refine_rounds >= 8;
+            if (done) {
+                c->lock_pending = 0;
+                fprintf(stderr, "%s: exposure: capped at 30ms, brightness %d gamma %d, "
+                        "luma %.0f (target %.0f)\n", c->dev, c->cap_bright,
+                        c->cap_gamma, meas, c->target_luma);
+            } else {
+                if (err > 0 && c->cap_bright >= 64) {
+                    c->cap_gamma += (int)(err / 0.3);
+                    if (c->cap_gamma > 300) c->cap_gamma = 300;
+                    set_ctrl(c->fd, V4L2_CID_GAMMA, c->cap_gamma);
+                } else {
+                    int step = (int)(err / 1.2);
+                    if (step > 24) step = 24;
+                    if (step < -24) step = -24;
+                    c->cap_bright += step;
+                    if (c->cap_bright > 64) c->cap_bright = 64;
+                    if (c->cap_bright < 0) c->cap_bright = 0;
+                    set_ctrl(c->fd, V4L2_CID_BRIGHTNESS, c->cap_bright);
+                }
+                c->refine_left = 40;
+                c->luma_acc = 0.0; c->luma_n = 0;
             }
         }
     } else {
@@ -1786,6 +1924,16 @@ static void *capture_thread(void *arg) {
             continue;
         }
         c->count++;
+        if (c->count % 30 == 0) {
+            double ll = frame_luma(dec_frame);
+            if (ll >= 0)
+                c->luma_last = ll;
+            double cu, cv;
+            if (frame_chroma(dec_frame, &cu, &cv) == 0) {
+                c->u_last = cu;
+                c->v_last = cv;
+            }
+        }
         exposure_step(c, dec_frame, pts_us);
         ring_push(&c->ring, idx, pts_us);
     }
@@ -1883,9 +2031,9 @@ static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
     double k = c->t_n > 0 ? 1.0 / (double)c->t_n / 1000.0 : 0.0;
     double dt = c->ts_dt_n > 0 ? (double)c->ts_dt_sum / c->ts_dt_n / 1000.0 : 0.0;
     snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
-             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d",
+             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f,\"u\":%.1f,\"v\":%.1f",
              c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
-             c->ts_gap, c->seq_lost);
+             c->ts_gap, c->seq_lost, c->luma_last, c->u_last, c->v_last);
     return buf;
 }
 
@@ -1931,6 +2079,20 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
     pthread_mutex_unlock(&c->mu);
 }
 
+static void sync_rec_files(const char *dir) {
+    static const char *names[] = { "stitch.raw.h264", "stitch.pts",
+                                   "preview.raw.h264", "preview.pts" };
+    char path[1100];
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;
+        fdatasync(fd);
+        close(fd);
+    }
+}
+
 /* called by the MAIN thread once the encoder drain has gone quiet while
  * stopping: flush + close the recording files (proxy included) */
 static void ctl_finish_stop(ctl_t *c, worker_ctx_t *w, pv_t *pv) {
@@ -1958,6 +2120,7 @@ static void ctl_finish_stop(ctl_t *c, worker_ctx_t *w, pv_t *pv) {
     pthread_mutex_unlock(&c->mu);
     fprintf(stderr, "ctl: REC_STOP — closed %s (%lld bytes)\n",
             closed_dir, (long long)bytes);
+    sync_rec_files(closed_dir);
 }
 
 /* called by the MAIN thread at the bottom of each loop iteration:
@@ -2076,6 +2239,28 @@ static int ctl_handle_line(ctl_t *c, int fd, char *line) {
     return 1;
 }
 
+/* Power-loss safety (#21): the recording files are fflush()ed per packet, so
+ * a process crash loses nothing, but a power cut loses whatever sits in the
+ * page cache. Every ~2 s this thread opens each file of the live recording by
+ * name and fdatasync()s it. It only touches files (never the encoder or the
+ * main thread's FILE*s), so the CLAUDE.md main-thread rule does not apply. */
+static void *sync_thread(void *arg) {
+    ctl_t *c = arg;
+    for (;;) {
+        struct timespec ts = { 2, 0 };
+        nanosleep(&ts, NULL);
+        char dir[512];
+        pthread_mutex_lock(&c->mu);
+        int rec = c->recording;
+        strncpy(dir, c->rec_dir, sizeof dir - 1);
+        dir[sizeof dir - 1] = 0;
+        pthread_mutex_unlock(&c->mu);
+        if (rec && dir[0])
+            sync_rec_files(dir);
+    }
+    return NULL;
+}
+
 static void *ctl_thread(void *arg) {
     ctl_t *c = arg;
     int64_t last_push = 0;
@@ -2191,6 +2376,8 @@ static ctl_t *ctl_start(const char *sock_path) {
     chmod(sock_path, 0660);
     pthread_t th;
     pthread_create(&th, NULL, ctl_thread, c);
+    pthread_t sth;
+    pthread_create(&sth, NULL, sync_thread, c);
     fprintf(stderr, "ctl: listening on %s\n", sock_path);
     return c;
 }
@@ -2551,6 +2738,10 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&up.mu, NULL);
     pthread_cond_init(&up.cv, NULL);
     pthread_t upthread;
+    pthread_mutex_init(&up.mu2, NULL);
+    pthread_cond_init(&up.cv2, NULL);
+    pthread_t uphelper;
+    pthread_create(&uphelper, NULL, upload_helper, &up);
     pthread_create(&upthread, NULL, upload_thread, &up);
     int up_pending = 0, up_f0 = -1;
     /* wait for the in-flight upload, then release its cam0 frame */
@@ -2733,6 +2924,11 @@ int main(int argc, char **argv) {
     pthread_cond_signal(&up.cv);
     pthread_mutex_unlock(&up.mu);
     pthread_join(upthread, NULL);
+    pthread_mutex_lock(&up.mu2);
+    up.stop2 = 1;
+    pthread_cond_signal(&up.cv2);
+    pthread_mutex_unlock(&up.mu2);
+    pthread_join(uphelper, NULL);
     g_running = 0;
     for (int i = 0; i < 2; i++) {
         pthread_cond_signal(&cams[i].ring.cv_free);

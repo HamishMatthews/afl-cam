@@ -51,6 +51,11 @@ def main() -> int:
         stills = {}
         for label, dev in (("cam0", dev0), ("cam1", dev1)):
             out = tmp / f"{label}.jpg"
+            # the pipeline leaves the exposure cap's manual exposure, brightness
+            # and gamma lift on the camera: back to plain auto for the stills
+            subprocess.run(["v4l2-ctl", "-d", str(dev), "--set-ctrl=brightness=0",
+                            "--set-ctrl=gamma=100", "--set-ctrl=auto_exposure=3"],
+                           capture_output=True, timeout=10)
             # 4 s lets auto-exposure settle; -update 1 keeps the last frame
             result = subprocess.run(
                 ["ffmpeg", "-v", "error",
