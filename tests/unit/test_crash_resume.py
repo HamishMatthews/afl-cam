@@ -201,6 +201,30 @@ def test_wiped_intent_without_a_recording_in_the_db_is_cleared(env):
     assert not d.INTENT_PATH.exists()
 
 
+def test_finalize_cut_short_by_a_restart_runs_again(env):
+    """Stop clears the intent, then the daemon is restarted mid-mux (a rig
+    test stopped afl-camd, 2026-10-14): the DB row is still 'recording'.
+    The next start finalizes it again and never resumes it."""
+    _, sess, finalized = env
+    cam = make_daemon()
+    cam.state = "standby"
+    cam._execute_start()
+    cam._execute_stop()
+    assert len(finalized) == 1 and not d.INTENT_PATH.exists()
+
+    cam2 = make_daemon()
+    cam2._recover_intent()
+    assert not cam2._resume and cam2.session is None
+    assert cam2.state == "finalizing"
+    assert len(finalized) == 2 and finalized[-1].dir == sess
+
+
+def test_nothing_to_recover_on_a_clean_start(env):
+    cam = make_daemon()
+    cam._recover_intent()
+    assert cam.state == "idle" and cam.session is None
+
+
 def test_last_heartbeat_tmp_is_used_when_the_intent_is_torn(env):
     _, sess, _ = env
     cam = make_daemon()

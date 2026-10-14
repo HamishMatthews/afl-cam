@@ -54,6 +54,19 @@ restore() {
 trap restore EXIT
 trap 'exit 130' INT TERM
 
+# never stop the field daemon mid-recording or mid-finalize: a finalize
+# killed halfway leaves the session un-muxed (2026-10-14)
+for _ in $(seq 180); do
+    state=$( { curl -sf -m 3 http://127.0.0.1:80/api/status \
+               || curl -sf -m 3 http://127.0.0.1:8080/api/status; } 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)
+    case "$state" in
+        recording) echo "[rig] afl-camd is recording — not testing now" >&2
+                   trap - EXIT; exit 1 ;;
+        finalizing|realigning) echo "[rig] afl-camd is $state — waiting…"; sleep 10 ;;
+        *) break ;;
+    esac
+done
 sudo -n systemctl stop afl-camd
 # a re-align from the tests writes to a scratch dir, never calibration/
 mkdir -p rig-artifacts/realign

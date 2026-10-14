@@ -80,7 +80,11 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   instead of resuming. A power cut can leave the intent (and its .tmp)
   as NUL bytes even after fsync (2026-10-14, power bank): an unreadable
   intent falls back to the DB's newest live recording still marked
-  `recording`, timed from the session folder's mtimes + `.pts`.
+  `recording`, timed from the session folder's mtimes + `.pts`. No
+  intent but such a row = a stop whose finalize was killed (daemon
+  restart mid-mux): it is finalized again, never resumed. `rig_test.sh`
+  and `deploy_board.sh` wait out / refuse a recording or finalizing
+  daemon.
   Daemon intervals (watchdog, idle, heartbeat) use the monotonic clock:
   the phone/NTP clock sync jumps the wall clock by hours at the ground.
 - `afl_cam/web/index.html` — the phone page: status/REC/elapsed, WHEP
