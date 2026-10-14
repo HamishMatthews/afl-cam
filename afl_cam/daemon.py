@@ -388,7 +388,7 @@ class StitchSupervisor(threading.Thread):
     def set_status(self, st: Optional[dict]):
         with self._status_lock:
             self.status = st
-            self.status_ts = time.time()
+            self.status_ts = time.monotonic()
 
     def get_status(self) -> Optional[dict]:
         with self._status_lock:
@@ -1620,7 +1620,10 @@ class CamDaemon:
         self._intents_lock = threading.Lock()
         self._requests: dict = {}    # request_id -> outcome (idempotency)
         self._request_order: list = []
-        self._last_http = time.time()
+        # intervals run on the monotonic clock: the wall clock jumps when
+        # the phone or NTP sets it (hours, at the ground), and a jump must
+        # never read as a stalled pipeline or an idle phone
+        self._last_http = time.monotonic()
         self._touch_lock = threading.Lock()
         self._ws: set = set()
         self._ws_lock = threading.Lock()
@@ -1683,7 +1686,7 @@ class CamDaemon:
 
     def touch(self):
         with self._touch_lock:
-            self._last_http = time.time()
+            self._last_http = time.monotonic()
 
     def add_ws_client(self, ws: WSClient):
         with self._ws_lock:
@@ -1725,7 +1728,7 @@ class CamDaemon:
             return True
         if self._pending_start or self._resume or self._ws:
             return True
-        return time.time() - self._last_http < 2
+        return time.monotonic() - self._last_http < 2
 
     def _close_pipeline(self):
         """Close cam2stitch and wait until the cameras are free. The
@@ -1735,7 +1738,7 @@ class CamDaemon:
         if proc is None and not self.supervisor._adopted:
             return                  # nothing running
         self._idle_sigterm = True
-        self._sigterm_sent_at = time.time()
+        self._sigterm_sent_at = time.monotonic()
         self._sigterm_target = proc
         if proc is None:
             # adopted (foreign) pipeline: ask it over the ctl socket, then
@@ -1878,7 +1881,7 @@ class CamDaemon:
                 log.info("crop: %s — restarting the pipeline", "on" if enabled else "off")
                 self._idle_sigterm = True
                 self._set_state("idle")
-                self._sigterm_sent_at = time.time()
+                self._sigterm_sent_at = time.monotonic()
                 self._sigterm_target = self.supervisor.proc
                 if self.supervisor.proc is not None:
                     self.supervisor.proc.send_signal(15)
@@ -1975,12 +1978,13 @@ class CamDaemon:
         last_ws_push = 0.0
         while not self.stopping:
             st = self.supervisor.get_status()
-            now = time.time()
+            now = time.time()          # wall clock: schedule, intent stamps
+            mono = time.monotonic()    # intervals (see _last_http)
 
             # idle → starting (phone arrived or button press)
             if self.state in ("idle", "error") and \
                     (self._pending_start or self._resume or
-                     now - self._last_http < 2 or self._ws):
+                     mono - self._last_http < 2 or self._ws):
                 self._set_state("starting", error=(
                     "recording interrupted — resuming" if self._resume else None))
 
@@ -2009,19 +2013,19 @@ class CamDaemon:
             # loop, status stopped, and the daemon sat in "starting" for
             # 36 hours with the cameras held)
             if self.state == "starting" \
-                    and now - self._starting_since > 30:
+                    and mono - self._starting_since > 30:
                 log.error("watchdog: stuck in 'starting' — restarting "
                           "the pipeline")
                 self.supervisor.kill_pipeline()
-                self._starting_since = now
+                self._starting_since = mono
             elif self.state in ("standby", "recording", "finalizing") \
                     and not self._cameras_busy \
                     and not (self.session and self.session.kind == "separate") \
                     and self.supervisor.status_ts \
-                    and now - self.supervisor.status_ts > 10:
+                    and mono - self.supervisor.status_ts > 10:
                 log.error("watchdog: stitch status stalled %.0fs — "
                           "restarting the pipeline",
-                          now - self.supervisor.status_ts)
+                          mono - self.supervisor.status_ts)
                 self.supervisor.kill_pipeline()
                 if self.session is not None:
                     # resume into the next segment (per-packet flushes keep
@@ -2070,7 +2074,7 @@ class CamDaemon:
             # heartbeat the record intent (a reboot long after the last
             # one finalizes instead of resuming)
             if self.state == "recording" and self.session is not None \
-                    and now - self._intent_saved_at > 5:
+                    and mono - self._intent_saved_at > 5:
                 self._save_intent()
 
             # schedule
@@ -2104,12 +2108,12 @@ class CamDaemon:
 
             # idle timeout: close the cameras when nobody is around
             if self.state in ("standby",) and not self.session and \
-                    now - self._last_http > IDLE_STOP_SECS and not self._ws:
+                    mono - self._last_http > IDLE_STOP_SECS and not self._ws:
                 log.info("idle %.0fs — closing the pipeline",
                          IDLE_STOP_SECS)
                 self._idle_sigterm = True
                 self._set_state("idle")
-                self._sigterm_sent_at = now
+                self._sigterm_sent_at = mono
                 self._sigterm_target = self.supervisor.proc
                 if self.supervisor.proc is not None:
                     self.supervisor.proc.send_signal(15)
@@ -2123,9 +2127,9 @@ class CamDaemon:
             if self._sigterm_target is not None \
                     and self._sigterm_target is self.supervisor.proc \
                     and self.supervisor.proc.poll() is None \
-                    and now - self._sigterm_sent_at > 5:
+                    and mono - self._sigterm_sent_at > 5:
                 log.warning("pipeline didn't exit %.0fs after SIGTERM — "
-                            "SIGKILL", now - self._sigterm_sent_at)
+                            "SIGKILL", mono - self._sigterm_sent_at)
                 self.supervisor.proc.kill()
                 self._sigterm_sent_at = 0.0
                 self._sigterm_target = None
@@ -2157,7 +2161,7 @@ class CamDaemon:
             log.info("state: %s -> %s%s", self.state, state,
                      f" ({error})" if error else "")
             if state == "starting":
-                self._starting_since = time.time()
+                self._starting_since = time.monotonic()
         if error is not None:
             self.error = error
         elif self.state == "error" and state not in ("error", "finalizing"):
@@ -2223,7 +2227,7 @@ class CamDaemon:
             return
         try:
             resume.save_intent(INTENT_PATH, self.session.intent())
-            self._intent_saved_at = time.time()
+            self._intent_saved_at = time.monotonic()
         except OSError as e:
             log.error("record intent not saved: %s", e)
 
@@ -2231,6 +2235,8 @@ class CamDaemon:
         """Boot / daemon start: a record intent left behind means the last
         recording never stopped. Resume it (fresh enough) or finalize it."""
         intent = resume.load_intent(INTENT_PATH)
+        if intent is None and resume.intent_unreadable(INTENT_PATH):
+            intent = self._intent_from_db()
         if intent is None:
             return
         try:
@@ -2260,6 +2266,29 @@ class CamDaemon:
         self.session = session
         self._resume = True
         self.error = "recording interrupted — resuming"
+
+    def _intent_from_db(self) -> Optional[dict]:
+        """The intent file is there but unreadable (power cut mid-write):
+        the recordings DB still knows which recording never stopped."""
+        try:
+            row = self.db.live_recording_in_progress()
+        except Exception as e:
+            log.error("record intent unreadable and the DB lookup failed: "
+                      "%s", e)
+            return None
+        if not row or not row.get("folder"):
+            log.error("record intent unreadable and no recording in "
+                      "progress in the DB — cleared")
+            resume.clear_intent(INTENT_PATH)
+            return None
+        dir_ = Path(row["folder"])
+        if not dir_.is_absolute():
+            dir_ = ROOT_DIR / dir_
+        log.warning("record intent unreadable (power cut mid-write?) — "
+                    "recovering recording %d from the DB",
+                    row["recording_id"])
+        return resume.intent_from_files(dir_, row["session_id"],
+                                        row["recording_id"])
 
     def _segment_lost(self):
         """The live segment died (pipeline crash / watchdog kill): keep the

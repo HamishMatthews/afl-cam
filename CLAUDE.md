@@ -77,7 +77,12 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   segment and concatenates; gaps go in `segments.json`. Only an explicit
   stop, the schedule or an auto-stop clears it; a boot more than
   `AFL_CAM_RESUME_MAX_GAP_S` (900) after the last heartbeat finalizes
-  instead of resuming.
+  instead of resuming. A power cut can leave the intent (and its .tmp)
+  as NUL bytes even after fsync (2026-10-14, power bank): an unreadable
+  intent falls back to the DB's newest live recording still marked
+  `recording`, timed from the session folder's mtimes + `.pts`.
+  Daemon intervals (watchdog, idle, heartbeat) use the monotonic clock:
+  the phone/NTP clock sync jumps the wall clock by hours at the ground.
 - `afl_cam/web/index.html` — the phone page: status/REC/elapsed, WHEP
   preview with HLS fallback, schedule, recordings browser (play/save/delete),
   and a Setup tab: pre-game self-test (`afl_cam/selftest.py`), re-align with
