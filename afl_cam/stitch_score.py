@@ -180,7 +180,7 @@ def score(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps) -> dict:
         sel = both.copy()
         sel[~(((cv2.GaussianBlur(g0, (0, 0), 8) > 8) & (cv2.GaussianBlur(g1, (0, 0), 8) > 8)))] = False
         if sel.any():
-            out["chroma_step"] = [round(float(np.median(c1[..., k][sel] - c0[..., k][sel])), 2)
+            out["chroma_step"] = [round(float(np.median(c1[..., k][sel].astype(np.int16) - c0[..., k][sel])), 2)
                                   for k in (1, 2)]     # Cr, Cb
 
     # seam_ghost: how much double image the blend actually shows — the two
