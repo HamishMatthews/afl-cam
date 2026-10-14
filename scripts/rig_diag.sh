@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Read-only board diagnostics, round 3.
-sec() { echo; echo "===== $* ====="; }
-L=/home/hamish/Documents/afl-cam/outputs/_live
-sec intent.json; od -c $L/intent.json | head -20; echo; cat $L/intent.json; echo
-sec intent.json.tmp; cat $L/intent.json.tmp; echo
-sec "stitch.log (no mpp spam)"; grep -av 'mpp_mem_pool\|mpp_buffer_ref_dec\|put_meta' $L/stitch.log | cut -c1-220 | tail -250
-sec preview-chain.log; tail -40 $L/preview-chain.log
-sec "ramlog / journal mounts"; findmnt | grep -E 'log|zram'; ls -la /var/log/journal /var/log.hdd/journal 2>&1 | head; systemctl status armbian-ramlog --no-pager -n 5
+# Read-only: did the deployed daemon recover the power-cut session?
+S() { echo 123 | sudo -S -p '' "$@"; }
+sleep 60   # let the finalize run
+S journalctl -u afl-camd --since '-10 min' --no-pager | grep -av 'mpp' | grep -aiE 'intent|resum|finaliz|recover|retime|mux|concat|error' | tail -40
+d=/home/hamish/Documents/afl-cam/outputs/20261014_190718; ls -la $d
+python3 -c "
+import sqlite3;c=sqlite3.connect('file:/home/hamish/Documents/afl-cam/recordings.db?mode=ro',uri=True)
+print(c.execute('select id,status,duration_sec,file_size_bytes from recordings where id=123').fetchall())
+print(c.execute('select id,stitch_status from sessions where id=91').fetchall())"
+ls -la /home/hamish/Documents/afl-cam/outputs/_live/ | grep intent
