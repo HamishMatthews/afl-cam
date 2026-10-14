@@ -1901,7 +1901,7 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
     int64_t elapsed = c->recording ? now_us() - c->rec_start_us : 0;
     int64_t skew = skew_n ? skew_sum / skew_n : -1;
     int n = snprintf(c->status_buf, sizeof c->status_buf,
-        "{\"state\":\"%s\",\"rec_dir\":\"%s\",\"rec_elapsed_s\":%lld.%03lld,"
+        "{\"state\":\"%s\",\"t_us\":%lld,\"rec_dir\":\"%s\",\"rec_elapsed_s\":%lld.%03lld,"
         "\"rec_bytes\":%lld,"
         "\"cam0\":{\"frames\":%d,\"errors\":%d,%s},"
         "\"cam1\":{\"frames\":%d,\"errors\":%d,%s},"
@@ -1911,6 +1911,7 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
         "\"preview\":{\"on\":%d,\"packets\":%llu,\"bytes\":%llu,"
         "\"drops\":%llu,\"hdr_sent\":%llu}}\n",
         c->recording ? "recording" : "standby",
+        (long long)now_us(),
         c->recording ? c->rec_dir : "",
         (long long)(elapsed / 1000000), (long long)((elapsed / 1000) % 1000),
         (long long)c->rec_bytes,
