@@ -62,3 +62,14 @@ jobs:
           name: stitch-score
           path: rig-artifacts/stitch-score/
           if-no-files-found: ignore
+      - name: Perf report
+        if: always()
+        run: |
+          [ -f rig-artifacts/perf/summary.md ] && cat rig-artifacts/perf/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Perf report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rig-perf
+          path: rig-artifacts/perf/
+          if-no-files-found: ignore
