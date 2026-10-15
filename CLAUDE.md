@@ -238,7 +238,8 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   read 1.0 px), so older "~0.5 px" figures are optimistic.
 - **Exposure**: the cameras' auto-exposure picks the sensor rate (dim scene =
   ~50 ms exposure = 20 fps); manual exposure without light records BLACK
-  frames (no V4L2 gain control exists). The recorder's "auto-settle-then-lock"
+  frames (no V4L2 gain control exists, only brightness and gamma, which
+  cam2stitch uses to lift the picture at the 30 ms cap). The recorder's "auto-settle-then-lock"
   checks mean frame interval. Never assume fps limits from time-of-day — the
   pipeline capacity is ~30 fps at full canvas when light allows.
 - **Camera discovery** (`config.py`): the cameras carry IDENTICAL USB
