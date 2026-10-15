@@ -17,7 +17,7 @@ ctl() { python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connec
 arecord -l
 for v in audio audiobig noaudio; do
   echo "===== $v"
-  pre=""; case $v in big*) pre="taskset -c 4-7";; esac
+  pre=""; case $v in *big*) pre="taskset -c 4-7";; esac
   AFL_CAM_CTL_SOCK=$T/ctl.sock AFL_CAM_PREVIEW_UDP=127.0.0.1:9 AFL_CAM_PREVIEW_VIDEO_W=1600 AFL_CAM_PREVIEW_BITRATE_KBPS=3500 \
     $pre $P/m /dev/video0 /dev/video2 $RIG/calibration/stitch_live_full $T/placeholder.raw.h264 0 3840 2160 30 0 0 $TREE/afl_cam/native/stitch_nv12.spv > /dev/null 2> $T/$v.err &
   pid=$!
