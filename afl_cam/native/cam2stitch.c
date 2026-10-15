@@ -700,6 +700,14 @@ typedef struct {
     int has_job2, done2, stop2;
 } uploader_t;
 
+static volatile int g_slot_seq[3];   /* PROBE: job seq per GPU slot */
+static int g_dump_lo = -1, g_dump_hi = -1;
+static void probe_dump(const char *name, int seq, const void *p, size_t n) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s_%03d.bin", getenv("AFL_CAM_DUMP_DIR"), name, seq);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(p, 1, n, f); fclose(f); }
+}
 static void *upload_helper(void *arg) {
     uploader_t *u = arg;
     gpu_t *g = u->g;
@@ -775,6 +783,15 @@ static void *upload_thread(void *arg) {
                 }
                 fprintf(stderr, "COHERENCE job %d: Y diff %.4f%% (sum %ld)  UV diff %.4f%% (sum %ld)\n",
                         njob, 100.0 * dy / ny, sy, 100.0 * duv / nuv, suv);
+            }
+        }
+        {
+            static int seq = 0;
+            seq++;
+            g_slot_seq[k] = seq;
+            if (getenv("AFL_CAM_DUMP_DIR") && seq >= g_dump_lo && seq <= g_dump_hi) {
+                probe_dump("src0", seq, (char *)s->staging_map + s->stage_off[0], nv12);
+                probe_dump("src1", seq, (char *)s->staging_map + s->stage_off[2], nv12);
             }
         }
         VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
@@ -1445,6 +1462,12 @@ static void *encode_worker(void *arg) {
          * The ENCODER (put/drain) runs on the MAIN thread — the old sync
          * design was clean for hours, while encoder calls from this worker
          * thread produced intermittent phantom/corrupt packets. */
+        {
+            int sq = g_slot_seq[it.slot];
+            if (getenv("AFL_CAM_DUMP_DIR") && sq >= g_dump_lo && sq <= g_dump_hi)
+                probe_dump("ssbo", sq, w->g->slots[it.slot].ssbo_map,
+                           (size_t)w->g->canvas_w * w->g->canvas_h * 2);
+        }
         void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[0]);
         repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
         /* preview downscale (daemon mode): one extra SSBO read pass */
@@ -2438,6 +2461,7 @@ int main(int argc, char **argv) {
                             argc > 7 ? argv[7] : "afl_cam/native/stitch_nv12.spv");
     }
     if (argc < 5) { usage(argv[0]); return 1; }
+    if (getenv("AFL_CAM_DUMP_LO")) { g_dump_lo = atoi(getenv("AFL_CAM_DUMP_LO")); g_dump_hi = g_dump_lo + 4; }
     const char *dev0 = argv[1], *dev1 = argv[2];
     const char *params_dir = argv[3];
     const char *out_path = argv[4];
