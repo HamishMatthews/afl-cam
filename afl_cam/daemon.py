@@ -116,6 +116,7 @@ GPIO_BTN = os.environ.get("AFL_CAM_GPIO_BTN", "")
 GPIO_LED = os.environ.get("AFL_CAM_GPIO_LED", "")
 WEB_UI = Path(__file__).resolve().parent / "web" / "index.html"
 WEB_UI_DIR = WEB_UI.parent
+_web_ui_cache = None      # last good copy of the page (see _Handler._index)
 LIVE_SNAP_DIR = OUTPUTS_DIR / "_live"    # camN_preview.jpg snapshots land here
 WHEP_PORT = 8889
 HLS_PORT = 8888
@@ -1365,10 +1366,16 @@ class _Handler(BaseHTTPRequestHandler):
         self._err("not found", status=404)
 
     def _index(self):
+        global _web_ui_cache
         try:
-            data = WEB_UI.read_bytes()
-        except OSError:
-            return self._err("web UI missing", status=500)
+            data = _web_ui_cache = WEB_UI.read_bytes()
+        except OSError as e:
+            # a deploy rewriting the file or a disk hiccup: keep serving
+            # the last good copy, and say why when there is none
+            log.error("web UI unreadable (%s): %s", WEB_UI, e)
+            if _web_ui_cache is None:
+                return self._err(f"web UI unreadable: {e}", status=500)
+            data = _web_ui_cache
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))

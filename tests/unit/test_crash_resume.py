@@ -323,3 +323,35 @@ def test_finalize_joins_segments(tmp_path, monkeypatch):
     assert not list(sess.glob("*.part*"))
     report = json.loads((sess / "segments.json").read_text())
     assert report["restarts"] == 1 and report["lost_s"] == 4.5
+
+
+def test_page_survives_an_unreadable_file(env, monkeypatch, tmp_path):
+    """The page file read fails (a deploy rewriting it, a disk hiccup): the
+    last good copy is served; with none, the error says why."""
+    import http.client
+    page = tmp_path / "index.html"
+    page.write_bytes(b"<html>ok</html>")
+    monkeypatch.setattr(d, "WEB_UI", page)
+    monkeypatch.setattr(d, "_web_ui_cache", None)
+    cam = make_daemon()
+    srv = d._Server(("127.0.0.1", 0), cam)
+    srv.timeout = 0.2
+    port = srv.server_address[1]
+    t = threading.Thread(target=lambda: [srv.handle_request()
+                                         for _ in range(3)], daemon=True)
+    t.start()
+
+    def get():
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("GET", "/")
+        r = c.getresponse()
+        return r.status, r.read()
+
+    assert get() == (200, b"<html>ok</html>")
+    page.unlink()                          # gone: the cached copy serves
+    assert get() == (200, b"<html>ok</html>")
+    monkeypatch.setattr(d, "_web_ui_cache", None)    # a fresh daemon
+    status, body = get()
+    assert status == 500 and b"web UI unreadable" in body
+    t.join(5)
+    srv.server_close()
