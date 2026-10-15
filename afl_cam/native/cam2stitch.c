@@ -700,14 +700,6 @@ typedef struct {
     int has_job2, done2, stop2;
 } uploader_t;
 
-static volatile int g_slot_seq[3];   /* PROBE: job seq per GPU slot */
-static int g_dump_lo = -1, g_dump_hi = -1;
-static void probe_dump(const char *name, int seq, const void *p, size_t n) {
-    char path[512];
-    snprintf(path, sizeof path, "%s/%s_%03d.bin", getenv("AFL_CAM_DUMP_DIR"), name, seq);
-    FILE *f = fopen(path, "wb");
-    if (f) { fwrite(p, 1, n, f); fclose(f); }
-}
 static void *upload_helper(void *arg) {
     uploader_t *u = arg;
     gpu_t *g = u->g;
@@ -764,36 +756,6 @@ static void *upload_thread(void *arg) {
         while (!u->done2)
             pthread_cond_wait(&u->cv2, &u->mu2);
         pthread_mutex_unlock(&u->mu2);
-        if (getenv("AFL_CAM_COHERENCE")) {     /* PROBE: cached copy vs MPP mapping */
-            static int njob = 0;
-            if (++njob % 15 == 0) {
-                const uint8_t *ref = mpp_buffer_get_ptr(b0);
-                const uint8_t *cp = (const uint8_t *)s->staging_map + s->stage_off[0];
-                size_t W = g->src_w, H = g->src_h;
-                long dy = 0, duv = 0, ny = 0, nuv = 0, sy = 0, suv = 0;
-                for (size_t r = 0; r < H; r += 8) {
-                    const uint8_t *a = ref + r * W, *b = cp + r * W;
-                    for (size_t x = 0; x < W; x++) { int d = a[x] - b[x]; if (d) { dy++; sy += d < 0 ? -d : d; } }
-                    ny += W;
-                }
-                for (size_t r = 0; r < H / 2; r += 4) {
-                    const uint8_t *a = ref + W * H + r * W, *b = cp + W * H + r * W;
-                    for (size_t x = 0; x < W; x++) { int d = a[x] - b[x]; if (d) { duv++; suv += d < 0 ? -d : d; } }
-                    nuv += W;
-                }
-                fprintf(stderr, "COHERENCE job %d: Y diff %.4f%% (sum %ld)  UV diff %.4f%% (sum %ld)\n",
-                        njob, 100.0 * dy / ny, sy, 100.0 * duv / nuv, suv);
-            }
-        }
-        {
-            static int seq = 0;
-            seq++;
-            g_slot_seq[k] = seq;
-            if (getenv("AFL_CAM_DUMP_DIR") && seq >= g_dump_lo && seq <= g_dump_hi) {
-                probe_dump("src0", seq, (char *)s->staging_map + s->stage_off[0], nv12);
-                probe_dump("src1", seq, (char *)s->staging_map + s->stage_off[2], nv12);
-            }
-        }
         VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                    .memory = s->staging_mem, .offset = 0, .size = g->stage_size };
         vkFlushMappedMemoryRanges(g->dev, 1, &mr);
@@ -1168,11 +1130,15 @@ static void pv_put_drain(pv_t *pv, int64_t pts) {
             MppMeta m = mpp_frame_get_meta(pv->in_frame);
             if (m)
                 mpp_meta_set_packet(m, KEY_OUTPUT_PACKET, enc_pkt);
-            mpp_packet_deinit(&enc_pkt);
+            /* no deinit here: the drain below gets this packet back and
+             * deinits it (see worker_put_frame) */
+        }
+        if (pv->mpi->encode_put_frame(pv->ctx, pv->in_frame)) {
+            if (enc_pkt)
+                mpp_packet_deinit(&enc_pkt);
+            return;
         }
     }
-    if (pv->mpi->encode_put_frame(pv->ctx, pv->in_frame))
-        return;
 
     for (;;) {
         MppPacket pkt = NULL;
@@ -1354,10 +1320,17 @@ static void worker_put_frame(worker_ctx_t *w, MppFrame ef, MppBuffer out_buf) {
     MppMeta fmeta = mpp_frame_get_meta(ef);
     if (fmeta)
         mpp_meta_set_packet(fmeta, KEY_OUTPUT_PACKET, enc_pkt);
-    mpp_packet_deinit(&enc_pkt);
+    /* the encoder hands this same packet back from encode_get_packet and
+     * the drain deinits it there. Deinit it here as well and it is freed
+     * twice: MPP's packet pool reuses the object while the encoder still
+     * writes through it (corrupt streams, "non-positive ref_count" spam) */
     MPP_RET ret = w->enc_mpi->encode_put_frame(w->enc_ctx, ef);
-    if (ret) fprintf(stderr, "encode_put_frame failed %d\n", ret);
-    else w->put_total++;
+    if (ret) {
+        fprintf(stderr, "encode_put_frame failed %d\n", ret);
+        mpp_packet_deinit(&enc_pkt);
+    } else {
+        w->put_total++;
+    }
 }
 
 static int worker_drain(worker_ctx_t *w, int64_t fallback_pts) {
@@ -1462,12 +1435,6 @@ static void *encode_worker(void *arg) {
          * The ENCODER (put/drain) runs on the MAIN thread — the old sync
          * design was clean for hours, while encoder calls from this worker
          * thread produced intermittent phantom/corrupt packets. */
-        {
-            int sq = g_slot_seq[it.slot];
-            if (getenv("AFL_CAM_DUMP_DIR") && sq >= g_dump_lo && sq <= g_dump_hi)
-                probe_dump("ssbo", sq, w->g->slots[it.slot].ssbo_map,
-                           (size_t)w->g->canvas_w * w->g->canvas_h * 2);
-        }
         void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[0]);
         repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
         /* preview downscale (daemon mode): one extra SSBO read pass */
@@ -1943,25 +1910,50 @@ static void *capture_thread(void *arg) {
                 mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, slot->frame);
         }
         r = c->dec_mpi->decode_put_packet(c->dec_ctx, dec_pkt);
+        ioctl(c->fd, VIDIOC_QBUF, &vbuf);
+        MppFrame dec_frame = NULL;
+        if (!r)
+            r = c->dec_mpi->decode_get_frame(c->dec_ctx, &dec_frame);
+        /* MPP's advanced-mode contract (mpi_dec_test dec_advanced): the
+         * decoder parks the input packet in the output frame's meta as
+         * KEY_INPUT_PACKET; take it back out, then free the packet only
+         * after the frame is out. Freeing it before decode_get_frame left
+         * a dangling packet in the slot frame's meta. */
+        if (dec_frame) {
+            MppMeta fm = mpp_frame_get_meta(dec_frame);
+            MppPacket back = NULL;
+            if (fm)
+                mpp_meta_get_packet(fm, KEY_INPUT_PACKET, &back);
+        }
         mpp_packet_deinit(&dec_pkt);
         mpp_buffer_put(dec_in_buf);
-        ioctl(c->fd, VIDIOC_QBUF, &vbuf);
-        if (r) { c->errors++; slot->state = 0; continue; }
-
-        MppFrame dec_frame = NULL;
-        r = c->dec_mpi->decode_get_frame(c->dec_ctx, &dec_frame);
         c->t_dec_us += now_us() - t_c;
         c->t_n++;
         if (r || !dec_frame) { c->errors++; slot->state = 0; continue; }
+        /* the decoder fills and returns the slot's own frame (passed in as
+         * KEY_OUTPUT_FRAME). On the drop paths keep it for the next decode:
+         * deiniting it here left slot->frame dangling, and the next decode
+         * wrote through a freed frame */
         if (mpp_frame_get_info_change(dec_frame)) {
             c->dec_mpi->control(c->dec_ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
-            mpp_frame_deinit(&dec_frame);
+            if (dec_frame != slot->frame)
+                mpp_frame_deinit(&dec_frame);
             slot->state = 0;
             continue;
         }
         if (mpp_frame_get_errinfo(dec_frame)) {
             c->errors++;
+            if (dec_frame != slot->frame)
+                mpp_frame_deinit(&dec_frame);
+            else
+                mpp_frame_set_errinfo(slot->frame, 0);
+            slot->state = 0;
+            continue;
+        }
+        if (dec_frame != slot->frame) {
+            /* not ours (never seen): keep the ring consistent */
             mpp_frame_deinit(&dec_frame);
+            c->errors++;
             slot->state = 0;
             continue;
         }
@@ -2461,7 +2453,6 @@ int main(int argc, char **argv) {
                             argc > 7 ? argv[7] : "afl_cam/native/stitch_nv12.spv");
     }
     if (argc < 5) { usage(argv[0]); return 1; }
-    if (getenv("AFL_CAM_DUMP_LO")) { g_dump_lo = atoi(getenv("AFL_CAM_DUMP_LO")); g_dump_hi = g_dump_lo + 4; }
     const char *dev0 = argv[1], *dev1 = argv[2];
     const char *params_dir = argv[3];
     const char *out_path = argv[4];

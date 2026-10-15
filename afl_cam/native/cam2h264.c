@@ -206,7 +206,7 @@ static int run_bench(const char *out_path, int seconds, int width, int height,
         mpp_packet_set_length(enc_pkt, 0);
         MppMeta m = mpp_frame_get_meta(frame);
         if (m) mpp_meta_set_packet(m, KEY_OUTPUT_PACKET, enc_pkt);
-        mpp_packet_deinit(&enc_pkt);
+        /* the get_packet below returns this packet and deinits it */
         mpp_frame_set_pts(frame, (RK_S64)i * 33333);
         if ((ret = mpi->encode_put_frame(ctx, frame))) { fprintf(stderr, "bench: put %d\n", ret); break; }
         MppPacket pkt = NULL;
@@ -238,7 +238,7 @@ static int run_bench(const char *out_path, int seconds, int width, int height,
         mpp_packet_set_length(enc_pkt, 0);
         MppMeta m = mpp_frame_get_meta(frame);
         if (m) mpp_meta_set_packet(m, KEY_OUTPUT_PACKET, enc_pkt);
-        mpp_packet_deinit(&enc_pkt);
+        /* the get_packet below returns this packet and deinits it */
         mpp_frame_set_pts(frame, (RK_S64)paced * 33333);
         if ((ret = mpi->encode_put_frame(ctx, frame))) { fprintf(stderr, "bench: put %d\n", ret); break; }
         MppPacket pkt = NULL;
@@ -653,17 +653,24 @@ int main(int argc, char **argv)
         }
 
         ret = dec_mpi->decode_put_packet(dec_ctx, dec_pkt);
-        mpp_packet_deinit(&dec_pkt);
-        /* release our ref; the decoder queue holds its own until decode completes */
-        mpp_buffer_put(dec_in_buf);
-        dec_in_buf = NULL;
+        MppFrame dec_frame = NULL;
         if (ret) {
             fprintf(stderr, "decode_put_packet failed ret %d\n", ret);
-            goto FRAME_DONE;
+        } else {
+            ret = dec_mpi->decode_get_frame(dec_ctx, &dec_frame);
         }
-
-        MppFrame dec_frame = NULL;
-        ret = dec_mpi->decode_get_frame(dec_ctx, &dec_frame);
+        /* advanced-mode contract (mpi_dec_test dec_advanced): take the input
+         * packet back out of the frame's meta, and free it only after the
+         * frame is out */
+        if (dec_frame) {
+            MppMeta fm = mpp_frame_get_meta(dec_frame);
+            MppPacket back = NULL;
+            if (fm)
+                mpp_meta_get_packet(fm, KEY_INPUT_PACKET, &back);
+        }
+        mpp_packet_deinit(&dec_pkt);
+        mpp_buffer_put(dec_in_buf);
+        dec_in_buf = NULL;
         if (ret || !dec_frame) {
             if (ret)
                 fprintf(stderr, "decode_get_frame failed ret %d\n", ret);
@@ -676,13 +683,17 @@ int main(int argc, char **argv)
             ret = dec_mpi->control(dec_ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
             if (ret)
                 fprintf(stderr, "INFO_CHANGE_READY failed ret %d\n", ret);
-            mpp_frame_deinit(&dec_frame);
+            if (dec_frame != out_frame)
+                mpp_frame_deinit(&dec_frame);
             goto FRAME_DONE;
         }
 
         if (mpp_frame_get_errinfo(dec_frame)) {
             fprintf(stderr, "decoded frame %d has errinfo\n", count);
-            mpp_frame_deinit(&dec_frame);
+            if (dec_frame != out_frame)
+                mpp_frame_deinit(&dec_frame);
+            else
+                mpp_frame_set_errinfo(out_frame, 0);
             goto FRAME_DONE;
         }
 
@@ -769,10 +780,18 @@ int main(int argc, char **argv)
             MppMeta fmeta = mpp_frame_get_meta(dec_frame);
             if (fmeta)
                 mpp_meta_set_packet(fmeta, KEY_OUTPUT_PACKET, enc_pkt);
-            mpp_packet_deinit(&enc_pkt);
+            /* no deinit here: the drain below gets this same packet back
+             * and deinits it; a second deinit frees it while the encoder
+             * still writes through it */
+            ret = enc_mpi->encode_put_frame(enc_ctx, dec_frame);
+            if (ret)
+                mpp_packet_deinit(&enc_pkt);
         }
-        ret = enc_mpi->encode_put_frame(enc_ctx, dec_frame);
-        mpp_frame_deinit(&dec_frame);
+        /* dec_frame is our preallocated out_frame, reused every frame (the
+         * old per-frame deinit freed it and the next decode wrote through
+         * the freed object) */
+        if (dec_frame != out_frame)
+            mpp_frame_deinit(&dec_frame);
         if (ret) {
             fprintf(stderr, "encode_put_frame failed ret %d\n", ret);
             goto FRAME_DONE;
