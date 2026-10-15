@@ -83,6 +83,9 @@
     fprintf(stderr, "VK error %d at %s:%d\n", r_, __FILE__, __LINE__); exit(1); } } while (0)
 
 static volatile int g_running = 1;
+/* mean luma the exposure loop holds both cameras at (BT.601 limited range,
+ * 16-235); AFL_CAM_TARGET_LUMA overrides */
+static double g_target_luma = 130.0;
 
 static void cma_print(const char *tag) {
     FILE *f = fopen("/proc/meminfo", "r");
@@ -193,7 +196,7 @@ static int frame_chroma(MppFrame frame, double *u, double *v)
     return 0;
 }
 
-static double frame_luma(MppFrame frame)
+static double frame_luma_step(MppFrame frame, RK_U32 step)
 {
     MppBuffer buf = mpp_frame_get_buffer(frame);
     if (!buf)
@@ -204,12 +207,17 @@ static double frame_luma(MppFrame frame)
     RK_U32 h = mpp_frame_get_height(frame);
     RK_U64 sum = 0;
     RK_U32 n = 0;
-    for (RK_U32 yy = 0; yy < h; yy += 8)
-        for (RK_U32 xx = 0; xx < w; xx += 8) {
+    for (RK_U32 yy = 0; yy < h; yy += step)
+        for (RK_U32 xx = 0; xx < w; xx += step) {
             sum += y[yy * hstride + xx];
             n++;
         }
     return n ? (double)sum / n : -1.0;
+}
+
+static double frame_luma(MppFrame frame)
+{
+    return frame_luma_step(frame, 8);
 }
 
 static void *read_file(const char *path, size_t *out_len) {
@@ -1648,6 +1656,13 @@ typedef struct {
     volatile double luma_last;  /* mean Y of a sampled frame (every 30th) */
     volatile double u_last, v_last;  /* mean U/V of the same frame */
     int cap_bright, cap_gamma;  /* dim-light lift at the exposure cap */
+    /* after the lock, exposure keeps following the light (exposure_track):
+     * time first (up to the 30 ms cap), then the brightness/gamma lift */
+    int ae_lift;                /* 0..64 brightness, 65..264 gamma 101..300 */
+    int ae_settle, ae_frames;   /* frames to skip after a change / counter */
+    double ae_acc;
+    int ae_n, ae_changes;
+    int64_t ae_last_log;
     /* exposure state machine (cam2h264.c) */
     int lock_pending, lock_phase, refine_left, refine_rounds;
     double target_luma, luma_acc;
@@ -1694,6 +1709,8 @@ static int v4l2_open(cam_t *c) {
          * any brightness/gamma lift an earlier run left in the camera */
         set_ctrl(fd, V4L2_CID_BRIGHTNESS, 0);
         set_ctrl(fd, V4L2_CID_GAMMA, 100);
+        c->cap_bright = 0;
+        c->cap_gamma = 100;
         set_exposure(fd, 3, 0);
         /* both cameras on the SAME fixed white balance: on the rig their own
          * auto white balance disagreed by ~15 in U and V (a visible colour
@@ -1779,10 +1796,108 @@ static int dec_init(cam_t *c) {
     return ret;
 }
 
+/* After the start-up lock the light still changes (cloud, sun, a move from
+ * the shed to the ground): keep the mean luma near the target. Brighter:
+ * drop the dim-light lift first, then shorten the exposure. Darker: lengthen
+ * the exposure up to the 30 ms cap (the frame rate), then lift. Steps are
+ * small and spaced (~0.7 s) so a recording sees a gradual change, except
+ * when the picture is clipping, where they are coarse to recover fast. */
+#define AE_CAP 300              /* 30 ms: longer drops the sensor below 30 fps */
+#define AE_WINDOW 15            /* frames measured per decision */
+#define AE_SETTLE 6             /* frames a control change takes to show */
+static void ae_apply_lift(cam_t *c, int lift) {
+    if (lift < 0) lift = 0;
+    if (lift > 264) lift = 264;
+    int bright = lift < 64 ? lift : 64;
+    int gamma = lift > 64 ? 100 + (lift - 64) : 100;
+    if (bright != c->cap_bright) {
+        c->cap_bright = bright;
+        set_ctrl(c->fd, V4L2_CID_BRIGHTNESS, bright);
+    }
+    if (gamma != c->cap_gamma) {
+        c->cap_gamma = gamma;
+        set_ctrl(c->fd, V4L2_CID_GAMMA, gamma);
+    }
+    c->ae_lift = lift;
+}
+
+static void exposure_track(cam_t *c, MppFrame dec_frame) {
+    if (c->ae_settle > 0) {
+        c->ae_settle--;
+        return;
+    }
+    /* sparse sample (16 px grid) through MPP's uncached mapping */
+    if (++c->ae_frames % 3 == 0) {
+        double l = frame_luma_step(dec_frame, 16);
+        if (l >= 0) { c->ae_acc += l; c->ae_n++; }
+    }
+    if (c->ae_frames < AE_WINDOW || c->ae_n == 0)
+        return;
+    double meas = c->ae_acc / c->ae_n;
+    c->ae_frames = 0; c->ae_acc = 0.0; c->ae_n = 0;
+    double target = c->target_luma;
+    int clipping = meas >= 225.0;
+    if (!clipping && meas > target * 0.94 && meas < target * 1.06)
+        return;
+    /* far off (a big change of light): larger steps */
+    int far = meas < target * 0.5 || meas > target * 1.5;
+    int exp0 = c->lock_exp, lift0 = c->ae_lift;
+    double err = target - meas;
+    if (err > 0) {
+        if (c->lock_exp < AE_CAP) {
+            double r = meas > 1.0 ? target / meas : 2.0;
+            double rmax = far ? 1.5 : 1.15;
+            if (r > rmax) r = rmax;
+            int e = (int)(c->lock_exp * r + 0.5);
+            if (e <= c->lock_exp) e = c->lock_exp + 1;
+            c->lock_exp = e > AE_CAP ? AE_CAP : e;
+        } else {
+            int step = c->ae_lift < 64 ? (int)(err / 1.2) : (int)(err / 0.3);
+            int lim = c->ae_lift < 64 ? 12 : 30;
+            if (step < 1) step = 1;
+            if (step > lim) step = lim;
+            ae_apply_lift(c, c->ae_lift + step);
+        }
+    } else if (c->ae_lift > 0) {
+        if (clipping) {
+            ae_apply_lift(c, c->ae_lift > 64 ? 64 : 0);
+        } else {
+            int step = c->ae_lift > 64 ? (int)(-err / 0.3) : (int)(-err / 1.2);
+            int lim = c->ae_lift > 64 ? 30 : 12;
+            if (step < 1) step = 1;
+            if (step > lim) step = lim;
+            ae_apply_lift(c, c->ae_lift - step);
+        }
+    } else {
+        double r = clipping ? 0.5 : target / meas;
+        double rmin = far ? 0.67 : 0.85;
+        if (r < rmin && !clipping) r = rmin;
+        int e = (int)(c->lock_exp * r + 0.5);
+        if (e >= c->lock_exp) e = c->lock_exp - 1;
+        c->lock_exp = e < 3 ? 3 : e;
+    }
+    if (c->lock_exp != exp0)
+        set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
+    if (c->lock_exp == exp0 && c->ae_lift == lift0)
+        return;
+    c->ae_settle = AE_SETTLE;
+    c->ae_changes++;
+    int64_t now = now_us();
+    if (now - c->ae_last_log > 5000000) {
+        c->ae_last_log = now;
+        fprintf(stderr, "%s: exposure: luma %.0f (target %.0f) -> %.1fms, "
+                "brightness %d gamma %d\n", c->dev, meas, target,
+                c->lock_exp / 10.0, c->cap_bright, c->cap_gamma);
+    }
+}
+
 /* per-frame exposure state machine — ported verbatim from cam2h264.c */
 static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
-    if (!c->lock_pending)
+    if (!c->lock_pending) {
+        if (c->exposure <= 0)
+            exposure_track(c, dec_frame);
         return;
+    }
     if (c->prev_pts > 0 && pts_us > c->prev_pts) {
         c->dt_sum += pts_us - c->prev_pts;
         c->dt_n++;
@@ -1794,7 +1909,10 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
     if (c->lock_phase == 0) {
         if (c->count >= 60) { c->luma_acc += l; c->luma_n++; }
         if (c->count >= 119) {
-            c->target_luma = c->luma_n ? c->luma_acc / c->luma_n : 64.0;
+            /* both cameras aim at the same luma (the seam stays even);
+             * what auto gave is only used for the starting exposure */
+            double auto_luma = c->luma_n ? c->luma_acc / c->luma_n : 64.0;
+            c->target_luma = g_target_luma;
             if (c->dt_n > 0 && (c->dt_sum / c->dt_n) > 33333) {
                 /* frame rate first: auto wants a longer exposure than one
                  * 30 fps frame, which drops the sensor to ~20 fps. Cap at
@@ -1813,8 +1931,9 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
                 c->luma_acc = 0.0; c->luma_n = 0;
                 fprintf(stderr, "%s: exposure: auto needs %.1fms (>33ms) — "
                         "capped at 30ms to hold the frame rate, lifting "
-                        "brightness to luma %.0f\n",
-                        c->dev, (c->dt_sum / c->dt_n) / 1000.0, c->target_luma);
+                        "brightness to luma %.0f (auto gave %.0f)\n",
+                        c->dev, (c->dt_sum / c->dt_n) / 1000.0, c->target_luma,
+                        auto_luma);
             } else {
                 if (c->dt_n > 0) {
                     c->lock_exp = (RK_S32)((c->dt_sum / c->dt_n) / 100);
@@ -1825,8 +1944,8 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
                 c->lock_phase = 1;
                 c->refine_left = 30;
                 c->luma_acc = 0.0; c->luma_n = 0;
-                fprintf(stderr, "%s: exposure: auto settled at luma %.0f -> manual %d (%dms), refining...\n",
-                        c->dev, c->target_luma, c->lock_exp, c->lock_exp / 10);
+                fprintf(stderr, "%s: exposure: auto settled at luma %.0f -> manual %d (%dms), refining to luma %.0f...\n",
+                        c->dev, auto_luma, c->lock_exp, c->lock_exp / 10, c->target_luma);
             }
         }
     } else if (c->lock_phase == 2) {
@@ -1835,10 +1954,14 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
         if (c->refine_left == 0) {
             double meas = c->luma_n ? c->luma_acc / c->luma_n : c->target_luma;
             double err = c->target_luma - meas;
+            /* too bright with no lift to take off: exposure_track
+             * shortens the exposure from here */
             int done = (err < 0.12 * c->target_luma + 2.0 && err > -0.12 * c->target_luma - 2.0)
+                       || (err < 0 && c->cap_bright == 0 && c->cap_gamma <= 100)
                        || ++c->refine_rounds >= 8;
             if (done) {
                 c->lock_pending = 0;
+                c->ae_lift = c->cap_bright + (c->cap_gamma > 100 ? c->cap_gamma - 100 : 0);
                 fprintf(stderr, "%s: exposure: capped at 30ms, brightness %d gamma %d, "
                         "luma %.0f (target %.0f)\n", c->dev, c->cap_bright,
                         c->cap_gamma, meas, c->target_luma);
@@ -2134,9 +2257,11 @@ static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
     double k = c->t_n > 0 ? 1.0 / (double)c->t_n / 1000.0 : 0.0;
     double dt = c->ts_dt_n > 0 ? (double)c->ts_dt_sum / c->ts_dt_n / 1000.0 : 0.0;
     snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
-             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f,\"u\":%.1f,\"v\":%.1f",
+             "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f,\"u\":%.1f,\"v\":%.1f,"
+             "\"exp_ms\":%.1f,\"bright\":%d,\"gamma\":%d,\"ae_changes\":%d",
              c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
-             c->ts_gap, c->seq_lost, c->luma_last, c->u_last, c->v_last);
+             c->ts_gap, c->seq_lost, c->luma_last, c->u_last, c->v_last,
+             c->lock_exp / 10.0, c->cap_bright, c->cap_gamma, c->ae_changes);
     return buf;
 }
 
@@ -2530,6 +2655,11 @@ int main(int argc, char **argv) {
     RK_U32 height = argc > 7 ? atoi(argv[7]) : 2160;
     RK_U32 fps = argc > 8 ? atoi(argv[8]) : 30;
     RK_S32 exposure = argc > 9 ? atoi(argv[9]) : 0;
+    if (getenv("AFL_CAM_TARGET_LUMA")) {
+        double t = atof(getenv("AFL_CAM_TARGET_LUMA"));
+        if (t >= 40.0 && t <= 200.0)
+            g_target_luma = t;
+    }
     RK_S32 wall_sec = argc > 10 ? atoi(argv[10]) : 0;
     const char *spv_path = argc > 11 ? argv[11] : "afl_cam/native/stitch_nv12.spv";
 
