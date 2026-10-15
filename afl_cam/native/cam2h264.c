@@ -88,14 +88,13 @@ static double frame_luma(MppFrame frame)
         return -1.0;
     RK_U8 *y = (RK_U8 *)mpp_buffer_get_ptr(buf);
     RK_U32 hstride = mpp_frame_get_hor_stride(frame);
-    RK_U32 vstride = mpp_frame_get_ver_stride(frame);
     RK_U32 w = mpp_frame_get_width(frame);
     RK_U32 h = mpp_frame_get_height(frame);
     RK_U64 sum = 0;
     RK_U32 n = 0;
     for (RK_U32 yy = 0; yy < h; yy += 8)
         for (RK_U32 xx = 0; xx < w; xx += 8) {
-            sum += y[yy * vstride + xx];
+            sum += y[yy * hstride + xx];
             n++;
         }
     return n ? (double)sum / n : -1.0;
@@ -193,8 +192,8 @@ static int run_bench(const char *out_path, int seconds, int width, int height,
     if ((ret = mpp_buffer_get(pkt_grp, &out_buf, 4 * 1024 * 1024))) return 1;
 
     RK_U8 *p = (RK_U8 *)mpp_buffer_get_ptr(fbuf);
-    for (RK_U32 y = 0; y < height; y++)
-        for (RK_U32 x = 0; x < width; x++)
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
             p[y * hstride + x] = (RK_U8)((x * 255 / width + y) & 0xff);
     memset(p + hstride * (size_t)height, 128, hstride * (size_t)height / 2);
 

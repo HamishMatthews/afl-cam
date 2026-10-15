@@ -223,11 +223,7 @@ def build_cam2stitch() -> Path | None:
     if STITCH_RECORDER_BIN.exists() and STITCH_RECORDER_SRC.exists() and \
             STITCH_RECORDER_BIN.stat().st_mtime >= STITCH_RECORDER_SRC.stat().st_mtime:
         return STITCH_RECORDER_BIN
-    cmd = [
-        "gcc", "-O2", "-I/usr/local/include/rockchip",
-        "-o", str(STITCH_RECORDER_BIN), str(STITCH_RECORDER_SRC),
-        "-L/usr/local/lib", "-lrockchip_mpp", "-lvulkan", "-lpthread",
-    ]
+    cmd = ["make", "-C", str(STITCH_RECORDER_SRC.parent), "cam2stitch"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
@@ -247,11 +243,7 @@ def build_cam2h264() -> Path | None:
     if NATIVE_RECORDER_BIN.exists() and NATIVE_RECORDER_SRC.exists() and \
             NATIVE_RECORDER_BIN.stat().st_mtime >= NATIVE_RECORDER_SRC.stat().st_mtime:
         return NATIVE_RECORDER_BIN
-    cmd = [
-        "gcc", "-O2", "-I/usr/local/include/rockchip",
-        "-o", str(NATIVE_RECORDER_BIN), str(NATIVE_RECORDER_SRC),
-        "-L/usr/local/lib", "-lrockchip_mpp", "-lpthread",
-    ]
+    cmd = ["make", "-C", str(NATIVE_RECORDER_SRC.parent), "cam2h264"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
