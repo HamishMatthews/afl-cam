@@ -1021,6 +1021,46 @@ static int pv_init(pv_t *pv, int w, int h, int fps, int bitrate_kbps) {
  * preview staging buffer. Runs on the WORKER thread — one extra SSBO
  * read pass after the repack; drops the frame if the main thread has
  * not consumed the previous one yet. */
+/* col[x] += src[x] for n bytes, 16 at a time (-O2 leaves the plain loop
+ * scalar) */
+static void colsum_y(uint16_t *col, const uint8_t *src, RK_U32 n) {
+    typedef uint8_t u8x16 __attribute__((vector_size(16)));
+    typedef uint16_t u16x16 __attribute__((vector_size(32)));
+    RK_U32 x = 0;
+    for (; x + 16 <= n; x += 16) {
+        u8x16 b;
+        u16x16 c;
+        memcpy(&b, src + x, sizeof b);
+        memcpy(&c, col + x, sizeof c);
+        c += __builtin_convertvector(b, u16x16);
+        memcpy(col + x, &c, sizeof c);
+    }
+    for (; x < n; x++)
+        col[x] += src[x];
+}
+
+/* cu[x] += u, cv[x] += v of n (u | v<<8) chroma uints, 8 at a time */
+static void colsum_uv(uint16_t *cu, uint16_t *cv, const uint32_t *src, RK_U32 n) {
+    typedef uint32_t u32x8 __attribute__((vector_size(32)));
+    typedef uint16_t u16x8 __attribute__((vector_size(16)));
+    RK_U32 x = 0;
+    for (; x + 8 <= n; x += 8) {
+        u32x8 p;
+        u16x8 a, b;
+        memcpy(&p, src + x, sizeof p);
+        memcpy(&a, cu + x, sizeof a);
+        memcpy(&b, cv + x, sizeof b);
+        a += __builtin_convertvector(p & 0xffu, u16x8);
+        b += __builtin_convertvector((p >> 8) & 0xffu, u16x8);
+        memcpy(cu + x, &a, sizeof a);
+        memcpy(cv + x, &b, sizeof b);
+    }
+    for (; x < n; x++) {
+        cu[x] += (uint16_t)(src[x] & 0xffu);
+        cv[x] += (uint16_t)((src[x] >> 8) & 0xffu);
+    }
+}
+
 static void pv_downscale_ssbo(pv_t *pv, gpu_t *g, int slot) {
     if (!pv->ok)
         return;
@@ -1029,47 +1069,62 @@ static void pv_downscale_ssbo(pv_t *pv, gpu_t *g, int slot) {
         pthread_mutex_unlock(&pv->mu);
         return;
     }
-    const uint32_t *o32 = g->slots[slot].ssbo_map;
-    size_t cw = g->canvas_w, ch = g->canvas_h, cw4 = cw / 4;
+    /* little-endian: Y bytes sit in the SSBO in pixel order, and each
+     * chroma uint is (u | v<<8). Each output row first sums its source
+     * rows column-wise (vectorised), then box-sums that row along x. */
+    const uint8_t *src = g->slots[slot].ssbo_map;
+    RK_U32 cw = g->canvas_w, ch = g->canvas_h, cw2 = cw / 2, ch2 = ch / 2;
+    RK_U32 pw = pv->w, ph = pv->h, pw2 = pw / 2, ph2 = ph / 2;
+    /* canvas width <= 8192, pv->w <= 2048 (clamped at init). The box
+     * edges along x are the same for every row: compute them once per
+     * frame rather than two 64-bit divides per output pixel. */
+    static uint16_t col[8192], colv[4096];
+    static RK_U32 bx[2049], bx2[1025];
+    for (RK_U32 ox = 0; ox <= pw; ox++)
+        bx[ox] = (RK_U32)((uint64_t)ox * cw / pw);
+    for (RK_U32 ox = 0; ox <= pw2; ox++)
+        bx2[ox] = (RK_U32)((uint64_t)ox * cw2 / pw2);
     uint8_t *y = pv->stage;
-    for (RK_U32 oy = 0; oy < pv->h; oy++) {
-        RK_U32 y0 = (RK_U32)((uint64_t)oy * ch / pv->h);
-        RK_U32 y1 = (RK_U32)((uint64_t)(oy + 1) * ch / pv->h);
+    for (RK_U32 oy = 0; oy < ph; oy++) {
+        RK_U32 y0 = (RK_U32)((uint64_t)oy * ch / ph);
+        RK_U32 y1 = (RK_U32)((uint64_t)(oy + 1) * ch / ph);
         if (y1 <= y0) y1 = y0 + 1;
-        uint8_t *orow = y + (size_t)oy * pv->w;
-        for (RK_U32 ox = 0; ox < pv->w; ox++) {
-            RK_U32 x0 = (RK_U32)((uint64_t)ox * cw / pv->w);
-            RK_U32 x1 = (RK_U32)((uint64_t)(ox + 1) * cw / pv->w);
+        memset(col, 0, cw * sizeof col[0]);
+        for (RK_U32 yy = y0; yy < y1; yy++)
+            colsum_y(col, src + (size_t)yy * cw, cw);
+        uint8_t *orow = y + (size_t)oy * pw;
+        for (RK_U32 ox = 0; ox < pw; ox++) {
+            RK_U32 x0 = bx[ox], x1 = bx[ox + 1];
             if (x1 <= x0) x1 = x0 + 1;
             RK_U32 acc = 0;
-            for (RK_U32 yy = y0; yy < y1; yy++)
-                for (RK_U32 xx = x0; xx < x1; xx++)
-                    acc += (o32[(size_t)yy * cw4 + xx / 4] >> (8 * (xx & 3))) & 0xffu;
+            for (RK_U32 xx = x0; xx < x1; xx++)
+                acc += col[xx];
             orow[ox] = (uint8_t)(acc / ((y1 - y0) * (x1 - x0)));
         }
     }
-    /* chroma: SSBO UV section is (u | v<<8) per 2x2 block, cw/2 x ch/2 */
-    const uint32_t *uvsrc = o32 + (size_t)ch * cw4;
-    uint8_t *uv = pv->stage + (size_t)pv->w * pv->h;
-    size_t cw2 = cw / 2, ch2 = ch / 2, pw2 = pv->w / 2, ph2 = pv->h / 2;
+    /* chroma: SSBO UV section is one uint per 2x2 block, cw/2 x ch/2 */
+    const uint32_t *uvsrc = (const uint32_t *)(src + (size_t)ch * cw);
+    uint8_t *uv = pv->stage + (size_t)pw * ph;
     for (RK_U32 oy = 0; oy < ph2; oy++) {
         RK_U32 y0 = (RK_U32)((uint64_t)oy * ch2 / ph2);
         RK_U32 y1 = (RK_U32)((uint64_t)(oy + 1) * ch2 / ph2);
         if (y1 <= y0) y1 = y0 + 1;
+        memset(col, 0, cw2 * sizeof col[0]);
+        memset(colv, 0, cw2 * sizeof colv[0]);
+        for (RK_U32 yy = y0; yy < y1; yy++)
+            colsum_uv(col, colv, uvsrc + (size_t)yy * cw2, cw2);
+        uint8_t *orow = uv + (size_t)oy * pw2 * 2;
         for (RK_U32 ox = 0; ox < pw2; ox++) {
-            RK_U32 x0 = (RK_U32)((uint64_t)ox * cw2 / pw2);
-            RK_U32 x1 = (RK_U32)((uint64_t)(ox + 1) * cw2 / pw2);
+            RK_U32 x0 = bx2[ox], x1 = bx2[ox + 1];
             if (x1 <= x0) x1 = x0 + 1;
-            RK_U32 accU = 0, accV = 0;
-            for (RK_U32 yy = y0; yy < y1; yy++)
-                for (RK_U32 xx = x0; xx < x1; xx++) {
-                    uint32_t pk = uvsrc[(size_t)yy * cw2 + xx];
-                    accU += pk & 0xffu;
-                    accV += (pk >> 8) & 0xffu;
-                }
-            size_t o = ((size_t)oy * pw2 + ox) * 2;
-            uv[o] = (uint8_t)(accU / ((y1 - y0) * (x1 - x0)));
-            uv[o + 1] = (uint8_t)(accV / ((y1 - y0) * (x1 - x0)));
+            RK_U32 au = 0, av = 0;
+            for (RK_U32 xx = x0; xx < x1; xx++) {
+                au += col[xx];
+                av += colv[xx];
+            }
+            RK_U32 n = (y1 - y0) * (x1 - x0);
+            orow[2 * ox] = (uint8_t)(au / n);
+            orow[2 * ox + 1] = (uint8_t)(av / n);
         }
     }
     pv->fresh = 1;
@@ -1239,7 +1294,7 @@ static void pv_put_drain(pv_t *pv, int64_t pts) {
 typedef struct {
     int slot;           /* GPU slot whose SSBO holds the packed frame */
     int64_t pts;        /* midpoint pts; < 0 = skip (startup padding) */
-    int enc_idx;        /* encoder input frame index */
+    int repack;         /* fill the master encoder input (recording only) */
 } work_item;
 
 typedef struct {
@@ -1278,30 +1333,21 @@ typedef struct {
  * buffer layout: row stride ehs, UV plane at ehs*evs, rows cw wide) */
 static void repack_ssbo_to(gpu_t *g, int slot, void *enc_ptr,
                            RK_U32 ehs, RK_U32 evs) {
-    uint32_t *o32 = g->slots[slot].ssbo_map;
+    /* little-endian: the SSBO's Y uints (x at the LSB) are already the
+     * row's bytes in order, so a Y row is a memcpy; a chroma uint is
+     * (u | v<<8), so its low 16 bits are the NV12 UV pair */
+    const uint8_t *src = g->slots[slot].ssbo_map;
     uint8_t *dst = enc_ptr;
     size_t cw = g->canvas_w, ch = g->canvas_h;
-    size_t cw4 = cw / 4;
-    for (size_t row = 0; row < ch; row++) {
-        uint8_t *orow = dst + row * ehs;
-        const uint32_t *irow = o32 + row * cw4;
-        for (size_t x = 0; x < cw4; x++) {
-            uint32_t pk = irow[x];
-            orow[4 * x + 0] = (uint8_t)(pk & 0xffu);
-            orow[4 * x + 1] = (uint8_t)((pk >> 8) & 0xffu);
-            orow[4 * x + 2] = (uint8_t)((pk >> 16) & 0xffu);
-            orow[4 * x + 3] = (uint8_t)((pk >> 24) & 0xffu);
-        }
-    }
+    for (size_t row = 0; row < ch; row++)
+        memcpy(dst + row * ehs, src + row * cw, cw);
+    const uint32_t *uvsrc = (const uint32_t *)(src + ch * cw);
     uint8_t *uv = dst + (size_t)ehs * evs;
     for (size_t row = 0; row < ch / 2; row++) {
-        uint8_t *orow = uv + row * ehs;
-        const uint32_t *irow = o32 + ch * cw4 + row * (cw / 2);
-        for (size_t x = 0; x < cw / 2; x++) {
-            uint32_t pk = irow[x];
-            orow[2 * x + 0] = (uint8_t)(pk & 0xffu);
-            orow[2 * x + 1] = (uint8_t)((pk >> 8) & 0xffu);
-        }
+        uint16_t *orow = (uint16_t *)(uv + row * ehs);
+        const uint32_t *irow = uvsrc + row * (cw / 2);
+        for (size_t x = 0; x < cw / 2; x++)
+            orow[x] = (uint16_t)irow[x];
     }
 }
 
@@ -1424,8 +1470,12 @@ static void *encode_worker(void *arg) {
          * The ENCODER (put/drain) runs on the MAIN thread — the old sync
          * design was clean for hours, while encoder calls from this worker
          * thread produced intermittent phantom/corrupt packets. */
-        void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[0]);
-        repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
+        /* standby: nothing encodes the master, so skip its repack (a
+         * full-canvas pass that kept one core busy between recordings) */
+        if (it.repack) {
+            void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[0]);
+            repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
+        }
         /* preview downscale (daemon mode): one extra SSBO read pass */
         if (w->pv)
             pv_downscale_ssbo(w->pv, w->g, it.slot);
@@ -2651,6 +2701,8 @@ int main(int argc, char **argv) {
         int pv_w = 1600;
         if (getenv("AFL_CAM_PREVIEW_VIDEO_W"))
             pv_w = atoi(getenv("AFL_CAM_PREVIEW_VIDEO_W"));
+        if (pv_w > 2048)
+            pv_w = 2048;    /* well past any phone preview */
         int pv_h = (int)((int64_t)pv_w * g.canvas_h / g.canvas_w) & ~1;
         if (pv_h < 2)
             pv_h = 2;
@@ -2835,7 +2887,7 @@ int main(int argc, char **argv) {
          * worker for repack, then wait before the GPU overwrites it */
         int64_t put_pts = pend_pts[k];
         pthread_mutex_lock(&w.q->mu);
-        w.q->items[w.q->tail % 16] = (work_item){ k, put_pts, 0 };
+        w.q->items[w.q->tail % 16] = (work_item){ k, put_pts, w.recording && !w.stopping };
         w.q->tail++; w.q->count++;
         pthread_cond_signal(&w.q->cv);
         pthread_mutex_unlock(&w.q->mu);
