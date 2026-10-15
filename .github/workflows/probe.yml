@@ -1,0 +1,23 @@
+# TEMP: investigation probes for #55 on the rig (removed before any PR)
+name: probe
+on:
+  push:
+    branches: [recording-stability-image-nf0rbx]
+    paths: ["probe/**", ".github/workflows/probe.yml"]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: [self-hosted, afl-cam-rig]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe
+        run: bash probe/run.sh "$GITHUB_WORKSPACE"
+      - name: Probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-out
+          path: probe-out/
+          if-no-files-found: ignore
