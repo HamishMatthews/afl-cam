@@ -12,7 +12,7 @@ for v in /dev/video0 /dev/video2; do echo "== $v"; v4l2-ctl -d $v --list-ctrls-m
 mkdir -p $TREE/rawcap && cd $TREE/rawcap
 v4l2-ctl -d /dev/video0 --set-fmt-video=width=3840,height=2160,pixelformat=MJPG -p 30
 echo "capture start $(date +%T)"
-v4l2-ctl -d /dev/video0 --stream-mmap=4 --stream-count=2400 --stream-to=cam0.mjpg 2>&1 | tail -1
+v4l2-ctl -d /dev/video0 --stream-mmap=4 --stream-count=900 --stream-to=cam0.mjpg 2>&1 | tail -1
 echo "capture end $(date +%T)"
 OUT=$OUT $PY - <<'PY'
 import cv2, numpy as np, os
@@ -27,7 +27,7 @@ print('frames',len(frames))
 Y=[];U=[];V=[]
 for f in frames:
     im=cv2.imdecode(np.frombuffer(f,np.uint8),cv2.IMREAD_REDUCED_COLOR_4)
-    yuv=cv2.cvtColor(im,cv2.COLOR_BGR2YUV).astype(np.float32)
+    yuv=cv2.cvtColor(im,cv2.COLOR_BGR2YUV).astype(np.int16)
     Y.append(yuv[...,0]);U.append(yuv[...,1]);V.append(yuv[...,2])
 n=len(Y)
 dy=np.array([0]+[np.abs(Y[k]-Y[k-1]).mean() for k in range(1,n)])
