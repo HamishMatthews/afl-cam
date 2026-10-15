@@ -1,0 +1,93 @@
+build rc=0
+daemon state: standby
+===== shock bright
+t=2s cam0 luma   0.0 exp 16.6ms b  0 g 100 | cam1 luma   0.0 exp 16.6ms b  0 g 100 | out 19
+t=4s cam0 luma 136.1 exp 16.6ms b  0 g 100 | cam1 luma 110.8 exp 16.6ms b  0 g 100 | out 65
+t=6s cam0 luma 134.0 exp 16.6ms b  0 g 100 | cam1 luma 109.6 exp 16.6ms b  0 g 100 | out 115
+t=8s cam0 luma 178.0 exp 30.0ms b 64 g 266 | cam1 luma 175.2 exp 30.0ms b 64 g 266 | out 173
+t=10s cam0 luma 167.7 exp 25.5ms b  0 g 100 | cam1 luma 212.9 exp 30.0ms b 40 g 100 | out 239
+t=12s cam0 luma 137.6 exp 16.2ms b  0 g 100 | cam1 luma 189.0 exp 30.0ms b  4 g 100 | out 300
+t=14s cam0 luma 133.9 exp 15.3ms b  0 g 100 | cam1 luma 175.1 exp 21.7ms b  0 g 100 | out 362
+t=16s cam0 luma 133.8 exp 15.3ms b  0 g 100 | cam1 luma 148.9 exp 14.7ms b  0 g 100 | out 424
+t=18s cam0 luma 133.7 exp 15.3ms b  0 g 100 | cam1 luma 136.7 exp 14.7ms b  0 g 100 | out 486
+t=20s cam0 luma 133.6 exp 15.3ms b  0 g 100 | cam1 luma 136.7 exp 14.7ms b  0 g 100 | out 548
+t=22s cam0 luma 133.6 exp 15.3ms b  0 g 100 | cam1 luma 136.6 exp 14.7ms b  0 g 100 | out 610
+t=24s cam0 luma 133.5 exp 15.3ms b  0 g 100 | cam1 luma 136.6 exp 14.7ms b  0 g 100 | out 672
+t=26s cam0 luma 133.5 exp 15.3ms b  0 g 100 | cam1 luma 136.6 exp 14.7ms b  0 g 100 | out 733
+t=28s cam0 luma 133.4 exp 15.3ms b  0 g 100 | cam1 luma 136.6 exp 14.7ms b  0 g 100 | out 795
+t=30s cam0 luma 133.4 exp 15.3ms b  0 g 100 | cam1 luma 136.6 exp 14.7ms b  0 g 100 | out 857
+/dev/video0: exposure: auto needs 42.0ms (>33ms) — capped at 30ms to hold the frame rate, lifting brightness to luma 130 (auto gave 134)
+/dev/video2: exposure: auto needs 43.4ms (>33ms) — capped at 30ms to hold the frame rate, lifting brightness to luma 130 (auto gave 110)
+/dev/video0: exposure: capped at 30ms, brightness 0 gamma 100, luma 178 (target 130)
+/dev/video0: SHOCK applied exp 300 lift 230
+/dev/video2: exposure: capped at 30ms, brightness 0 gamma 100, luma 175 (target 130)
+/dev/video2: SHOCK applied exp 300 lift 230
+/dev/video0: exposure: luma 252 (target 130) -> 30.0ms, brightness 64 gamma 100
+/dev/video2: exposure: luma 252 (target 130) -> 30.0ms, brightness 64 gamma 100
+/dev/video0: exposure: luma 229 (target 130) -> 30.0ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 220 (target 130) -> 30.0ms, brightness 52 gamma 100
+/dev/video0: exposure: luma 178 (target 130) -> 25.5ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 213 (target 130) -> 30.0ms, brightness 40 gamma 100
+/dev/video0: exposure: luma 168 (target 130) -> 21.7ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 205 (target 130) -> 30.0ms, brightness 28 gamma 100
+/dev/video0: exposure: luma 158 (target 130) -> 18.4ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 198 (target 130) -> 30.0ms, brightness 16 gamma 100
+/dev/video0: exposure: luma 148 (target 130) -> 16.2ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 189 (target 130) -> 30.0ms, brightness 4 gamma 100
+/dev/video2: exposure: luma 179 (target 130) -> 30.0ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 138 (target 130) -> 15.3ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 175 (target 130) -> 25.5ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 167 (target 130) -> 21.7ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 158 (target 130) -> 18.4ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 149 (target 130) -> 16.0ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 142 (target 130) -> 14.7ms, brightness 0 gamma 100
+loop-ms take 29.8 fence 0.3 ack 0.0 copy 14.1 upwait 5.1 enc 2.9 iter 33.1
+loop-ms take 30.0 fence 0.3 ack 0.0 copy 13.9 upwait 3.6 enc 2.7 iter 33.0
+===== shock dark
+t=2s cam0 luma 133.0 exp 16.6ms b  0 g 100 | cam1 luma   0.0 exp 16.6ms b  0 g 100 | out 32
+t=4s cam0 luma 133.0 exp 16.6ms b  0 g 100 | cam1 luma 109.1 exp 16.6ms b  0 g 100 | out 81
+t=6s cam0 luma 133.0 exp 30.0ms b  0 g 100 | cam1 luma 109.1 exp 16.6ms b  0 g 100 | out 129
+t=8s cam0 luma  14.9 exp  1.5ms b  0 g 100 | cam1 luma 177.9 exp  1.0ms b  0 g 100 | out 182
+t=10s cam0 luma  49.7 exp  5.3ms b  0 g 100 | cam1 luma  55.9 exp  3.5ms b  0 g 100 | out 249
+t=12s cam0 luma  83.9 exp  8.1ms b  0 g 100 | cam1 luma  81.7 exp  5.3ms b  0 g 100 | out 311
+t=14s cam0 luma 109.3 exp 12.3ms b  0 g 100 | cam1 luma  93.4 exp  8.1ms b  0 g 100 | out 373
+t=16s cam0 luma 124.5 exp 13.5ms b  0 g 100 | cam1 luma 124.0 exp 11.6ms b  0 g 100 | out 435
+t=18s cam0 luma 124.4 exp 13.5ms b  0 g 100 | cam1 luma 124.0 exp 11.6ms b  0 g 100 | out 495
+t=20s cam0 luma 124.5 exp 13.5ms b  0 g 100 | cam1 luma 124.0 exp 11.6ms b  0 g 100 | out 558
+t=22s cam0 luma 124.5 exp 13.5ms b  0 g 100 | cam1 luma 124.0 exp 11.6ms b  0 g 100 | out 620
+t=24s cam0 luma 124.4 exp 13.5ms b  0 g 100 | cam1 luma 124.0 exp 11.6ms b  0 g 100 | out 682
+t=26s cam0 luma 124.4 exp 13.5ms b  0 g 100 | cam1 luma 124.0 exp 11.6ms b  0 g 100 | out 744
+t=28s cam0 luma 124.4 exp 13.5ms b  0 g 100 | cam1 luma 124.0 exp 11.6ms b  0 g 100 | out 806
+t=30s cam0 luma 124.4 exp 13.5ms b  0 g 100 | cam1 luma 124.1 exp 11.6ms b  0 g 100 | out 867
+/dev/video0: exposure: auto needs 39.7ms (>33ms) — capped at 30ms to hold the frame rate, lifting brightness to luma 130 (auto gave 133)
+/dev/video2: exposure: auto needs 43.3ms (>33ms) — capped at 30ms to hold the frame rate, lifting brightness to luma 130 (auto gave 109)
+/dev/video0: exposure: capped at 30ms, brightness 0 gamma 100, luma 179 (target 130)
+/dev/video0: SHOCK applied exp 10 lift 0
+/dev/video2: exposure: capped at 30ms, brightness 0 gamma 100, luma 178 (target 130)
+/dev/video2: SHOCK applied exp 10 lift 0
+/dev/video0: exposure: luma 48 (target 130) -> 1.5ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 35 (target 130) -> 1.5ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 22 (target 130) -> 2.3ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 44 (target 130) -> 2.3ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 34 (target 130) -> 3.5ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 56 (target 130) -> 3.5ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 50 (target 130) -> 5.3ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 72 (target 130) -> 4.0ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 69 (target 130) -> 6.1ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 77 (target 130) -> 4.6ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 76 (target 130) -> 7.0ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 82 (target 130) -> 5.3ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 84 (target 130) -> 8.1ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 88 (target 130) -> 6.1ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 92 (target 130) -> 9.3ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 94 (target 130) -> 7.0ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 101 (target 130) -> 10.7ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 100 (target 130) -> 8.1ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 109 (target 130) -> 12.3ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 106 (target 130) -> 9.3ms, brightness 0 gamma 100
+/dev/video0: exposure: luma 118 (target 130) -> 13.5ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 113 (target 130) -> 10.7ms, brightness 0 gamma 100
+/dev/video2: exposure: luma 120 (target 130) -> 11.6ms, brightness 0 gamma 100
+loop-ms take 28.5 fence 0.7 ack 0.0 copy 14.0 upwait 0.0 enc 3.9 iter 33.1
+loop-ms take 28.5 fence 0.6 ack 0.0 copy 14.2 upwait 2.0 enc 3.6 iter 32.7
+restored
