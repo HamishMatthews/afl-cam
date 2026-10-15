@@ -1,11 +1,8 @@
-"""Native code warnings (#5): compile cam2stitch and cam2h264 with
--Wall -Wextra on the board and report them. Fails only once the tree is
-clean (WARN_BUDGET = 0), so new warnings are caught."""
+"""Native code warnings (#5): cam2stitch and cam2h264 compile with
+-Wall -Wextra on the board without a single warning."""
 
 import subprocess
 from pathlib import Path
-
-WARN_BUDGET = None      # None while the existing warnings are being fixed
 
 
 def test_native_code_has_no_warnings(capsys):
@@ -14,10 +11,10 @@ def test_native_code_has_no_warnings(capsys):
     out = r.stdout + r.stderr
     Path("rig-artifacts").mkdir(exist_ok=True)
     Path("rig-artifacts/native-warnings.txt").write_text(out)
-    n = sum(1 for l in out.splitlines() if ": warning:" in l)
-    errs = [l for l in out.splitlines() if ": error:" in l or "fatal error" in l]
+    lines = out.splitlines()
+    n = sum(1 for l in lines if ": warning:" in l)
+    errs = [l for l in lines if ": error:" in l or "fatal error" in l]
     with capsys.disabled():      # CI logs hide a passing test's prints
         print(f"\n[native] {n} warnings, {len(errs)} errors\n{out[-9000:]}")
     assert not errs, errs[:5]
-    if WARN_BUDGET is not None:
-        assert n <= WARN_BUDGET, f"{n} warnings (budget {WARN_BUDGET})"
+    assert n == 0, f"{n} compiler warnings"

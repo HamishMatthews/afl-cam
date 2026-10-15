@@ -200,7 +200,6 @@ static double frame_luma(MppFrame frame)
         return -1.0;
     RK_U8 *y = (RK_U8 *)mpp_buffer_get_ptr(buf);
     RK_U32 hstride = mpp_frame_get_hor_stride(frame);
-    RK_U32 vstride = mpp_frame_get_ver_stride(frame);
     RK_U32 w = mpp_frame_get_width(frame);
     RK_U32 h = mpp_frame_get_height(frame);
     RK_U64 sum = 0;
@@ -1294,7 +1293,6 @@ static void repack_ssbo_to(gpu_t *g, int slot, void *enc_ptr,
             orow[4 * x + 3] = (uint8_t)((pk >> 24) & 0xffu);
         }
     }
-    size_t uv_uints = (cw / 2) * (ch / 2);
     uint8_t *uv = dst + (size_t)ehs * evs;
     for (size_t row = 0; row < ch / 2; row++) {
         uint8_t *orow = uv + row * ehs;
@@ -2016,7 +2014,7 @@ typedef struct {
     int n_clients;
 } ctl_t;
 
-static void ctl_reply(ctl_t *c, int fd, const char *msg) {
+static void ctl_reply(int fd, const char *msg) {
     char line[512];
     int n = snprintf(line, sizeof line, "%s\n", msg);
     if (n > 0)
@@ -2208,7 +2206,7 @@ static int ctl_handle_line(ctl_t *c, int fd, char *line) {
         while (*dir == ' ')
             dir++;
         if (!*dir) {
-            ctl_reply(c, fd, "ERR missing dir");
+            ctl_reply(fd, "ERR missing dir");
             return 1;
         }
         int already = c->recording || c->start_pending;
@@ -2217,12 +2215,12 @@ static int ctl_handle_line(ctl_t *c, int fd, char *line) {
             c->start_dir[sizeof c->start_dir - 1] = 0;
             c->start_pending = 1;
         }
-        ctl_reply(c, fd, already ? "ERR already recording" : "OK");
+        ctl_reply(fd, already ? "ERR already recording" : "OK");
         return 1;
     }
     if (!strcmp(line, "REC_STOP")) {
         c->stop_pending = 1;
-        ctl_reply(c, fd, c->recording ? "OK" : "OK idle");
+        ctl_reply(fd, c->recording ? "OK" : "OK idle");
         return 1;
     }
     if (!strcmp(line, "STATUS")) {
@@ -2232,10 +2230,10 @@ static int ctl_handle_line(ctl_t *c, int fd, char *line) {
     }
     if (!strcmp(line, "QUIT")) {
         c->quit_pending = 1;
-        ctl_reply(c, fd, "OK");
+        ctl_reply(fd, "OK");
         return 1;
     }
-    ctl_reply(c, fd, "ERR unknown command");
+    ctl_reply(fd, "ERR unknown command");
     return 1;
 }
 

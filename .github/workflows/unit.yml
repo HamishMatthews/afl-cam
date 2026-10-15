@@ -27,3 +27,9 @@ jobs:
       # the mux tests skip without PyAV, so prove the group really landed
       - run: uv run python -c "import av; print('av', av.__version__)"
       - run: uv run pytest tests/unit -v --durations=15
+      # the committed shader binary must be what its source compiles to
+      - name: Shader binary matches its source
+        run: |
+          sudo apt-get install -y -q glslang-tools
+          make -C afl_cam/native -B stitch_nv12.spv
+          git diff --exit-code --stat afl_cam/native/stitch_nv12.spv
