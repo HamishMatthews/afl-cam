@@ -692,6 +692,13 @@ typedef struct {
     int k;
     void *src0, *src1;
     MppBuffer buf0, buf1;
+    /* the worker's progress: the job's submit rewrites slot k's SSBO, so it
+     * waits until the worker has finished item wait_seq (that slot's last
+     * result) */
+    pthread_mutex_t *done_mu;
+    pthread_cond_t *done_cv;
+    const int64_t *done_seq;
+    int64_t wait_seq;
     volatile int64_t last_us;     /* duration of the last job (stats) */
     /* helper thread: copies the cam1 frame while the upload thread copies
      * cam0 (one core moves ~1 GB/s here, so the pair takes half as long) */
@@ -735,6 +742,7 @@ static void *upload_thread(void *arg) {
         if (!u->has_job)
             break;
         int k = u->k;
+        int64_t wait_seq = u->wait_seq;
         void *s0 = u->src0, *s1 = u->src1;
         MppBuffer b0 = u->buf0, b1 = u->buf1;
         pthread_mutex_unlock(&u->mu);
@@ -759,6 +767,12 @@ static void *upload_thread(void *arg) {
         VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                    .memory = s->staging_mem, .offset = 0, .size = g->stage_size };
         vkFlushMappedMemoryRanges(g->dev, 1, &mr);
+        /* the worker may still be reading this slot's SSBO (usually done
+         * by now: the copy above takes longer) */
+        pthread_mutex_lock(u->done_mu);
+        while (*u->done_seq < wait_seq)
+            pthread_cond_wait(u->done_cv, u->done_mu);
+        pthread_mutex_unlock(u->done_mu);
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                             .commandBufferCount = 1, .pCommandBuffers = &s->cb };
         CHECK(vkQueueSubmit(g->queue, 1, &si, s->fence));
@@ -854,6 +868,7 @@ typedef struct {
     pthread_mutex_t mu;
     int fresh;
     uint8_t *stage;             /* tight pv->w * pv->h * 3/2 */
+    int64_t stage_pts;          /* pts of the frame in stage */
     /* outputs (main thread only) */
     FILE *fp_out, *fp_pts;      /* recording proxy files, NULL when idle */
     void *hdr_data;             /* SPS/PPS (Annex-B), re-sent before IDRs */
@@ -1061,7 +1076,7 @@ static void colsum_uv(uint16_t *cu, uint16_t *cv, const uint32_t *src, RK_U32 n)
     }
 }
 
-static void pv_downscale_ssbo(pv_t *pv, gpu_t *g, int slot) {
+static void pv_downscale_ssbo(pv_t *pv, gpu_t *g, int slot, int64_t pts) {
     if (!pv->ok)
         return;
     pthread_mutex_lock(&pv->mu);
@@ -1127,6 +1142,7 @@ static void pv_downscale_ssbo(pv_t *pv, gpu_t *g, int slot) {
             orow[2 * ox + 1] = (uint8_t)(av / n);
         }
     }
+    pv->stage_pts = pts;
     pv->fresh = 1;
     pthread_mutex_unlock(&pv->mu);
 }
@@ -1150,7 +1166,7 @@ static int pkt_has_idr(const RK_U8 *p, size_t n) {
 
 /* copy the tight staging frame into the strided encoder input buffer and
  * put + drain. MAIN THREAD ONLY (encoder invariant). */
-static void pv_put_drain(pv_t *pv, int64_t pts) {
+static void pv_put_drain(pv_t *pv) {
     if (!pv->ok)
         return;
     static const RK_U8 sc[4] = { 0, 0, 0, 1 };
@@ -1167,6 +1183,7 @@ static void pv_put_drain(pv_t *pv, int64_t pts) {
     uint8_t *duv = dst + (size_t)pv->hs * pv->vs;
     for (RK_U32 row = 0; row < pv->h / 2; row++)
         memcpy(duv + (size_t)row * pv->hs, uv + (size_t)row * pv->w, pv->w);
+    int64_t pts = pv->stage_pts;
     pv->fresh = 0;
     pthread_mutex_unlock(&pv->mu);
 
@@ -1299,6 +1316,8 @@ typedef struct {
     int slot;           /* GPU slot whose SSBO holds the packed frame */
     int64_t pts;        /* midpoint pts; < 0 = skip (startup padding) */
     int repack;         /* fill the master encoder input (recording only) */
+    int buf;            /* encoder input buffer to fill */
+    int64_t seq;        /* 1, 2, 3, ... in queue order */
 } work_item;
 
 typedef struct {
@@ -1326,7 +1345,7 @@ typedef struct {
     int use_hevc;               /* packet validator: H.264 whitelist vs HEVC */
     pthread_mutex_t ack_mu;
     pthread_cond_t ack_cv;
-    int ack_done[3];
+    int64_t done_seq;           /* last item the worker finished */
     int enc_count;
     int drained_total;
     int put_total;
@@ -1469,9 +1488,9 @@ static void *encode_worker(void *arg) {
             break;      /* EOS handled on the main thread */
 
         if (it.pts < 0) {
-            /* startup padding item — nothing to repack, release the ack */
+            /* startup padding item — nothing to repack */
             pthread_mutex_lock(&w->ack_mu);
-            w->ack_done[it.slot] = 1;
+            w->done_seq = it.seq;
             pthread_cond_broadcast(&w->ack_cv);
             pthread_mutex_unlock(&w->ack_mu);
             continue;
@@ -1484,14 +1503,14 @@ static void *encode_worker(void *arg) {
         /* standby: nothing encodes the master, so skip its repack (a
          * full-canvas pass that kept one core busy between recordings) */
         if (it.repack) {
-            void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[0]);
+            void *enc_ptr = mpp_buffer_get_ptr(w->enc_in_buf[it.buf]);
             repack_ssbo_to(w->g, it.slot, enc_ptr, w->ehs, w->evs);
         }
         /* preview downscale (daemon mode): one extra SSBO read pass */
         if (w->pv)
-            pv_downscale_ssbo(w->pv, w->g, it.slot);
+            pv_downscale_ssbo(w->pv, w->g, it.slot, it.pts);
         pthread_mutex_lock(&w->ack_mu);
-        w->ack_done[it.slot] = 1;
+        w->done_seq = it.seq;
         pthread_cond_broadcast(&w->ack_cv);
         pthread_mutex_unlock(&w->ack_mu);
     }
@@ -2631,7 +2650,9 @@ int main(int argc, char **argv) {
     if (ret) { fprintf(stderr, "enc set cfg failed %d\n", ret); return 1; }
     cma_print("after SET_CFG");
 
-    const int ENC_RING = 1;
+    /* two encoder inputs: the worker fills one while the encoder reads
+     * the other */
+    const int ENC_RING = 2;
     MppBufferGroup enc_pkt_grp = NULL;
     ret = mpp_buffer_group_get_internal(&enc_pkt_grp, MPP_BUFFER_TYPE_DRM);
     /* 8 buffers: 4 for the rotating output packets + headroom so
@@ -2793,8 +2814,7 @@ int main(int argc, char **argv) {
     pthread_cond_init(&w.q->cv, NULL);
     pthread_cond_init(&w.ack_cv, NULL);
     pthread_mutex_init(&w.ack_mu, NULL);
-    for (int k = 0; k < 3; k++)
-        w.ack_done[k] = 1;   /* nothing pending before the first submits */
+    w.done_seq = 0;
     pthread_t wthread;
     pthread_create(&wthread, NULL, encode_worker, &w);
 
@@ -2820,7 +2840,12 @@ int main(int argc, char **argv) {
      * the "submitted" line): where the frame period goes */
     int64_t acc_take = 0, acc_fence = 0, acc_ack = 0, acc_copy = 0, acc_enc = 0, acc_iter = 0;
     int64_t acc_upw = 0;
-    uploader_t up = { .g = &g };
+    uploader_t up = { .g = &g, .done_mu = &w.ack_mu, .done_cv = &w.ack_cv,
+                      .done_seq = &w.done_seq };
+    /* the worker's previous item: encoded once the worker has finished
+     * it, while the worker repacks the next one into the other buffer */
+    int64_t item_seq = 0, prev_seq = 0, prev_pts = -1;
+    int prev_repack = 0, prev_buf = 0;
     pthread_mutex_init(&up.mu, NULL);
     pthread_cond_init(&up.cv, NULL);
     pthread_t upthread;
@@ -2919,28 +2944,22 @@ int main(int argc, char **argv) {
             vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
         }
         acc_fence += now_us() - t_f0;
-        /* the slot's previous result (frame i-3) — hand it to the
-         * worker for repack, then wait before the GPU overwrites it */
+        /* the slot's previous result (frame i-3) — hand it to the worker
+         * for repack. The upload below waits for the worker to finish it
+         * before the GPU overwrites the slot. */
         int64_t put_pts = pend_pts[k];
+        int repack = w.recording && !w.stopping && put_pts >= 0;
+        int buf = (int)(++item_seq % 2);
         pthread_mutex_lock(&w.q->mu);
-        w.q->items[w.q->tail % 16] = (work_item){ k, put_pts, w.recording && !w.stopping };
+        w.q->items[w.q->tail % 16] = (work_item){ k, put_pts, repack, buf, item_seq };
         w.q->tail++; w.q->count++;
         pthread_cond_signal(&w.q->cv);
         pthread_mutex_unlock(&w.q->mu);
-        /* the worker must finish repacking slot k's SSBO before the GPU
-         * overwrites it with this frame's job (usually already done) */
-        int64_t t_a0 = now_us();
-        pthread_mutex_lock(&w.ack_mu);
-        while (!w.ack_done[k])
-            pthread_cond_wait(&w.ack_cv, &w.ack_mu);
-        w.ack_done[k] = 0;
-        pthread_mutex_unlock(&w.ack_mu);
-        int64_t t_c0 = now_us();
-        acc_ack += t_c0 - t_a0;
         /* hand this frame's pair to the upload thread (copy + flush +
          * submit); the encode below overlaps it */
         pthread_mutex_lock(&up.mu);
         up.k = k;
+        up.wait_seq = item_seq;
         up.src0 = y0_ptr;
         up.src1 = y1_ptr;
         up.buf0 = cams[0].ring.slots[f0_idx].buf;
@@ -2953,21 +2972,32 @@ int main(int argc, char **argv) {
         up_f0 = f0_idx;
         pend_pts[k] = mid;
         g.k = (g.k + 1) % RING_SLOTS;
+        /* the previous item must be fully repacked before the encoder
+         * reads it (usually long done: it was queued an iteration ago).
+         * Encoding a buffer the worker is still writing mixes two frames,
+         * and the chroma, written last, lags behind moving subjects. */
+        int64_t t_a0 = now_us();
+        pthread_mutex_lock(&w.ack_mu);
+        while (w.done_seq < prev_seq)
+            pthread_cond_wait(&w.ack_cv, &w.ack_mu);
+        pthread_mutex_unlock(&w.ack_mu);
         int64_t t_e0 = now_us();
-        /* encode frame i-3 (repacked by the worker into enc_in[0]) on
-         * the MAIN thread — the proven-clean sync path. The drain
-         * returns immediately: the encoder finished ~30ms ago. */
-        if (put_pts >= 0) {
-            if (w.recording && !w.stopping) {
-                mpp_frame_set_pts(enc_in[0], put_pts);
-                worker_put_frame(&w, enc_in[0], enc_out_buf[0]);
-                worker_drain(&w, put_pts);
-            }
-            /* stitched preview (daemon): every canvas frame, on the
-             * main thread — UDP best-effort + proxy while recording */
-            if (pv_ok)
-                pv_put_drain(&pv, put_pts);
+        acc_ack += t_e0 - t_a0;
+        /* stitched preview (daemon): UDP best-effort + proxy while
+         * recording. The worker hands over its latest downscale. */
+        if (pv_ok)
+            pv_put_drain(&pv);
+        /* encode the previous item on the MAIN thread — the proven-clean
+         * sync path */
+        if (prev_repack && w.recording) {
+            mpp_frame_set_pts(enc_in[prev_buf], prev_pts);
+            worker_put_frame(&w, enc_in[prev_buf], enc_out_buf[0]);
+            worker_drain(&w, prev_pts);
         }
+        prev_seq = item_seq;
+        prev_pts = put_pts;
+        prev_repack = repack;
+        prev_buf = buf;
         acc_enc += now_us() - t_e0;
         if (w.recording && w.stopping) {
             /* draining the encoder tail: no new puts. Outside the
@@ -3025,8 +3055,14 @@ int main(int argc, char **argv) {
     pthread_cond_signal(&w.q->cv);
     pthread_mutex_unlock(&w.q->mu);
     pthread_join(wthread, NULL);
+    /* the last repacked item, still unencoded */
+    if (prev_repack && w.recording) {
+        mpp_frame_set_pts(enc_in[prev_buf], prev_pts);
+        worker_put_frame(&w, enc_in[prev_buf], enc_out_buf[0]);
+        worker_drain(&w, prev_pts);
+    }
     {
-        MppFrame ef = enc_in[0];
+        MppFrame ef = enc_in[prev_buf];
         mpp_frame_set_eos(ef, 1);
         worker_put_frame(&w, ef, enc_out_buf[0]);
         worker_drain(&w, 0);
