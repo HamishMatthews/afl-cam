@@ -26,7 +26,7 @@ for v in bright dark; do
   env AE_SHOCK_${v^^}=1 AFL_CAM_CTL_SOCK=$T/ctl.sock AFL_CAM_PREVIEW_UDP=127.0.0.1:9 \
     $P/ae /dev/video0 /dev/video2 $RIG/calibration/stitch_live_full $T/placeholder.raw.h264 0 3840 2160 30 0 0 $TREE/afl_cam/native/stitch_nv12.spv > /dev/null 2> $T/$v.err &
   pid=$!
-  for i in $(seq 1 25); do sleep 2; echo "t=$((i*2))s $(st)"; done
+  for i in $(seq 1 15); do sleep 2; echo "t=$((i*2))s $(st)"; done
   kill $pid; wait $pid
   grep -E "exposure|SHOCK|failed" $T/$v.err | head -60
   grep loop-ms $T/$v.err | tail -2

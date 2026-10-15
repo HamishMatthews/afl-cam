@@ -1826,7 +1826,7 @@ static void exposure_track(cam_t *c, MppFrame dec_frame) {
     int ci = c->dev[strlen(c->dev) - 1] == '0' ? 0 : 1;
     if (!shocked[ci]) {
         shocked[ci] = 1;
-        if (getenv("AE_SHOCK_BRIGHT")) {   /* as if the light jumped up a lot */
+        if (getenv("AE_SHOCK_BRIGHT")) {
             c->lock_exp = 300; set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, 300);
             ae_apply_lift(c, 230);
         } else if (getenv("AE_SHOCK_DARK")) {
@@ -1852,14 +1852,17 @@ static void exposure_track(cam_t *c, MppFrame dec_frame) {
     c->ae_frames = 0; c->ae_acc = 0.0; c->ae_n = 0;
     double target = c->target_luma;
     int clipping = meas >= 225.0;
-    if (!clipping && meas > target * 0.92 && meas < target * 1.08)
+    if (!clipping && meas > target * 0.94 && meas < target * 1.06)
         return;
+    /* far off (a big change of light): larger steps */
+    int far = meas < target * 0.5 || meas > target * 1.5;
     int exp0 = c->lock_exp, lift0 = c->ae_lift;
     double err = target - meas;
     if (err > 0) {
         if (c->lock_exp < AE_CAP) {
-            double r = meas > 1.0 ? target / meas : 1.15;
-            if (r > 1.15) r = 1.15;
+            double r = meas > 1.0 ? target / meas : 2.0;
+            double rmax = far ? 1.5 : 1.15;
+            if (r > rmax) r = rmax;
             int e = (int)(c->lock_exp * r + 0.5);
             if (e <= c->lock_exp) e = c->lock_exp + 1;
             c->lock_exp = e > AE_CAP ? AE_CAP : e;
@@ -1882,7 +1885,8 @@ static void exposure_track(cam_t *c, MppFrame dec_frame) {
         }
     } else {
         double r = clipping ? 0.5 : target / meas;
-        if (r < 0.85 && !clipping) r = 0.85;
+        double rmin = far ? 0.67 : 0.85;
+        if (r < rmin && !clipping) r = rmin;
         int e = (int)(c->lock_exp * r + 0.5);
         if (e >= c->lock_exp) e = c->lock_exp - 1;
         c->lock_exp = e < 3 ? 3 : e;
@@ -1965,7 +1969,10 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
         if (c->refine_left == 0) {
             double meas = c->luma_n ? c->luma_acc / c->luma_n : c->target_luma;
             double err = c->target_luma - meas;
+            /* too bright with no lift to take off: exposure_track
+             * shortens the exposure from here */
             int done = (err < 0.12 * c->target_luma + 2.0 && err > -0.12 * c->target_luma - 2.0)
+                       || (err < 0 && c->cap_bright == 0 && c->cap_gamma <= 100)
                        || ++c->refine_rounds >= 8;
             if (done) {
                 c->lock_pending = 0;
