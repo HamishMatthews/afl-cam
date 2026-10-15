@@ -756,6 +756,27 @@ static void *upload_thread(void *arg) {
         while (!u->done2)
             pthread_cond_wait(&u->cv2, &u->mu2);
         pthread_mutex_unlock(&u->mu2);
+        if (getenv("AFL_CAM_COHERENCE")) {     /* PROBE: cached copy vs MPP mapping */
+            static int njob = 0;
+            if (++njob % 15 == 0) {
+                const uint8_t *ref = mpp_buffer_get_ptr(b0);
+                const uint8_t *cp = (const uint8_t *)s->staging_map + s->stage_off[0];
+                size_t W = g->src_w, H = g->src_h;
+                long dy = 0, duv = 0, ny = 0, nuv = 0, sy = 0, suv = 0;
+                for (size_t r = 0; r < H; r += 8) {
+                    const uint8_t *a = ref + r * W, *b = cp + r * W;
+                    for (size_t x = 0; x < W; x++) { int d = a[x] - b[x]; if (d) { dy++; sy += d < 0 ? -d : d; } }
+                    ny += W;
+                }
+                for (size_t r = 0; r < H / 2; r += 4) {
+                    const uint8_t *a = ref + W * H + r * W, *b = cp + W * H + r * W;
+                    for (size_t x = 0; x < W; x++) { int d = a[x] - b[x]; if (d) { duv++; suv += d < 0 ? -d : d; } }
+                    nuv += W;
+                }
+                fprintf(stderr, "COHERENCE job %d: Y diff %.4f%% (sum %ld)  UV diff %.4f%% (sum %ld)\n",
+                        njob, 100.0 * dy / ny, sy, 100.0 * duv / nuv, suv);
+            }
+        }
         VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                    .memory = s->staging_mem, .offset = 0, .size = g->stage_size };
         vkFlushMappedMemoryRanges(g->dev, 1, &mr);
