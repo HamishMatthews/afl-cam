@@ -50,3 +50,4 @@ print('SOF0', f[p:p+19].hex())
 PY
 rm -f cam0.mjpg
 ls -la $OUT/raw
+# run 1792028163
