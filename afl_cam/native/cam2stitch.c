@@ -2760,7 +2760,25 @@ int main(int argc, char **argv) {
             mpp_enc_cfg_set_s32(enc_cfg, keys[i], vals[i]);
         mpp_enc_cfg_set_s32(enc_cfg, "codec:type",
                             use_hevc ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC);
-        mpp_enc_cfg_set_s32(enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+        /* Rate control: AFL_CAM_STITCH_QP=N (1-51) encodes at a fixed QP
+         * instead of CBR. CBR spends its bits on static scenery and starves
+         * moving blocks: on wind-blown foliage (2026-10-17, vs the
+         * pre-encode canvas) CBR 160M scored 35.9 dB on moving pixels,
+         * fixed QP 22 at ~170 Mbps 39.2 dB. The bitrate then follows the
+         * scene. Fixed QP ignores the bps settings above, so MPP's 100 Mbps
+         * cap on them does not apply. */
+        int qp = getenv("AFL_CAM_STITCH_QP") ? atoi(getenv("AFL_CAM_STITCH_QP")) : 0;
+        if (qp >= 1 && qp <= 51) {
+            static const char *qk[] = { "rc:qp_init", "rc:qp_min", "rc:qp_max",
+                                        "rc:qp_min_i", "rc:qp_max_i", "rc:fqp_min_i",
+                                        "rc:fqp_max_i", "rc:fqp_min_p", "rc:fqp_max_p" };
+            mpp_enc_cfg_set_s32(enc_cfg, "rc:mode", MPP_ENC_RC_MODE_FIXQP);
+            for (int i = 0; i < 9; i++)
+                mpp_enc_cfg_set_s32(enc_cfg, qk[i], qp);
+            fprintf(stderr, "master encoder: fixed QP %d\n", qp);
+        } else {
+            mpp_enc_cfg_set_s32(enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+        }
         mpp_enc_cfg_set_s32(enc_cfg, "rc:gop", fps);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_in_flex", 0);
         mpp_enc_cfg_set_s32(enc_cfg, "rc:fps_in_num", fps);
@@ -2787,17 +2805,19 @@ int main(int argc, char **argv) {
     /* two encoder inputs: the worker fills one while the encoder reads
      * the other */
     const int ENC_RING = 2;
+    const size_t ENC_PKT_SIZE = 8 * 1024 * 1024;
     MppBufferGroup enc_pkt_grp = NULL;
     ret = mpp_buffer_group_get_internal(&enc_pkt_grp, MPP_BUFFER_TYPE_DRM);
     /* 8 buffers: 4 for the rotating output packets + headroom so
      * mpp_packet_init_with_buffer never fails while packets are in flight
      * (a 4-buffer limit exhausted → the SPS/PPS header get fails and
-     * encoder packets alias stale memory — corrupt CABAC streams) */
-    ret |= mpp_buffer_group_limit_config(enc_pkt_grp, 4 * 1024 * 1024, 8);
+     * encoder packets alias stale memory — corrupt CABAC streams).
+     * 8 MB each: a fixed-QP keyframe of a busy canvas can pass 4 MB. */
+    ret |= mpp_buffer_group_limit_config(enc_pkt_grp, ENC_PKT_SIZE, 8);
     if (ret) { fprintf(stderr, "enc pkt grp failed %d\n", ret); return 1; }
     MppBuffer enc_out_buf[4] = {0};
     for (int i = 0; i < ENC_RING; i++) {
-        ret = mpp_buffer_get(enc_pkt_grp, &enc_out_buf[i], 4 * 1024 * 1024);
+        ret = mpp_buffer_get(enc_pkt_grp, &enc_out_buf[i], ENC_PKT_SIZE);
         if (ret) { fprintf(stderr, "enc out buffer get failed %d\n", ret); return 1; }
     }
 
