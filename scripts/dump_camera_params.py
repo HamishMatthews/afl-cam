@@ -26,6 +26,21 @@ from afl_cam import lens, stitch_maps  # noqa: E402
 from afl_cam.stitcher import Stitcher, _build_uint8_weights, _spherical_bounds, _spherical_maps  # noqa: E402
 
 
+def _shared_matches(f0, f1) -> int:
+    """Cross-camera SIFT matches passing the ratio test, at ~1 MP: the number
+    the re-align failure message reports."""
+    sift = cv2.SIFT_create()
+    des = []
+    for f in (f0, f1):
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        s = (1e6 / (g.shape[0] * g.shape[1])) ** 0.5
+        des.append(sift.detectAndCompute(cv2.resize(g, None, fx=s, fy=s), None)[1])
+    if des[0] is None or des[1] is None or len(des[1]) < 2:
+        return 0
+    pairs = cv2.BFMatcher().knnMatch(des[0], des[1], k=2)
+    return sum(1 for p in pairs if len(p) == 2 and p[0].distance < 0.7 * p[1].distance)
+
+
 def main() -> None:
     argv = sys.argv[1:]
     canvas_width = None
@@ -80,7 +95,11 @@ def main() -> None:
                 break
             stitcher, cameras = None, None
     if stitcher is None:
-        raise SystemExit("bundle estimation failed")
+        raise SystemExit(
+            f"not enough shared detail where the cameras overlap ({_shared_matches(f0, f1)} "
+            "feature matches): point the rig at a distant, textured scene (the field, "
+            "or a street tens of metres away) and re-align. A nearby room has too "
+            "much parallax to align by")
 
     # override the estimator's intrinsics with the measured ones
     cam_dump = []
