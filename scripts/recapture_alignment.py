@@ -8,10 +8,13 @@ The next recording uses the new alignment automatically.
 
 Usage:
     python3 scripts/recapture_alignment.py [out_dir] [--canvas-width W]
+                                           [--stills cam0.png cam1.png]
 
     out_dir          default: calibration/stitch_live_full (native 5304-wide)
                      use calibration/stitch_live for the 3840 canvas
                      (--canvas-width 3840)
+    --stills         fit these stills instead of capturing from the cameras
+                     (the rig tests run the chain this way)
 """
 
 import subprocess
@@ -30,6 +33,34 @@ DUMP = REPO / "scripts" / "dump_camera_params.py"
 CALIB_PYTHON = "/home/hamish/venvs/cv2-new/bin/python3"
 
 
+def capture_stills(tmp: Path) -> dict[str, Path]:
+    dev0 = camera_device("cam0")
+    dev1 = camera_device("cam1")
+    if not dev0 or not dev1:
+        raise SystemExit("both cameras must be connected (and not recording)")
+    stills = {}
+    for label, dev in (("cam0", dev0), ("cam1", dev1)):
+        out = tmp / f"{label}.jpg"
+        # the pipeline leaves the exposure cap's manual exposure, brightness
+        # and gamma lift on the camera: back to plain auto for the stills
+        subprocess.run(["v4l2-ctl", "-d", str(dev), "--set-ctrl=brightness=0",
+                        "--set-ctrl=gamma=100", "--set-ctrl=auto_exposure=3"],
+                       capture_output=True, timeout=10)
+        # 4 s lets auto-exposure settle; -update 1 keeps the last frame
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error",
+             "-f", "v4l2", "-input_format", "mjpeg",
+             "-video_size", "3840x2160", "-framerate", "30",
+             "-i", str(dev), "-t", "4", "-update", "1", "-y", str(out)],
+            capture_output=True, text=True, timeout=30)
+        if result.returncode != 0 or not out.exists():
+            raise SystemExit(f"still capture failed for {label}: "
+                             f"{result.stderr.strip()}")
+        stills[label] = out
+        print(f"{label}: captured {out.stat().st_size // 1024} KB from {dev}")
+    return stills
+
+
 def main() -> int:
     argv = sys.argv[1:]
     canvas_width = None
@@ -37,37 +68,17 @@ def main() -> int:
         i = argv.index("--canvas-width")
         canvas_width = int(argv[i + 1])
         del argv[i:i + 2]
+    given = None
+    if "--stills" in argv:
+        i = argv.index("--stills")
+        given = {"cam0": Path(argv[i + 1]), "cam1": Path(argv[i + 2])}
+        del argv[i:i + 3]
     out_dir = Path(argv[0]) if argv else REPO / "calibration" / "stitch_live_full"
     if len(argv) > 1:
         raise SystemExit(__doc__.split("Usage:")[1].split("\n")[0])
 
-    dev0 = camera_device("cam0")
-    dev1 = camera_device("cam1")
-    if not dev0 or not dev1:
-        raise SystemExit("both cameras must be connected (and not recording)")
-
     with tempfile.TemporaryDirectory(prefix="aflcam-align-") as tmp:
-        tmp = Path(tmp)
-        stills = {}
-        for label, dev in (("cam0", dev0), ("cam1", dev1)):
-            out = tmp / f"{label}.jpg"
-            # the pipeline leaves the exposure cap's manual exposure, brightness
-            # and gamma lift on the camera: back to plain auto for the stills
-            subprocess.run(["v4l2-ctl", "-d", str(dev), "--set-ctrl=brightness=0",
-                            "--set-ctrl=gamma=100", "--set-ctrl=auto_exposure=3"],
-                           capture_output=True, timeout=10)
-            # 4 s lets auto-exposure settle; -update 1 keeps the last frame
-            result = subprocess.run(
-                ["ffmpeg", "-v", "error",
-                 "-f", "v4l2", "-input_format", "mjpeg",
-                 "-video_size", "3840x2160", "-framerate", "30",
-                 "-i", str(dev), "-t", "4", "-update", "1", "-y", str(out)],
-                capture_output=True, text=True, timeout=30)
-            if result.returncode != 0 or not out.exists():
-                raise SystemExit(f"still capture failed for {label}: "
-                                 f"{result.stderr.strip()}")
-            stills[label] = out
-            print(f"{label}: captured {out.stat().st_size // 1024} KB from {dev}")
+        stills = given or capture_stills(Path(tmp))
 
         cmd = [CALIB_PYTHON, str(DUMP), str(stills["cam0"]), str(stills["cam1"]),
                str(out_dir)]
