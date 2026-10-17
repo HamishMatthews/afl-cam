@@ -8,13 +8,10 @@ The next recording uses the new alignment automatically.
 
 Usage:
     python3 scripts/recapture_alignment.py [out_dir] [--canvas-width W]
-                                           [--stills cam0.jpg cam1.jpg]
 
     out_dir          default: calibration/stitch_live_full (native 5304-wide)
                      use calibration/stitch_live for the 3840 canvas
                      (--canvas-width 3840)
-    --stills         fit from these two stills instead of capturing from the
-                     cameras (the deterministic test uses a stored pair)
 """
 
 import subprocess
@@ -40,29 +37,19 @@ def main() -> int:
         i = argv.index("--canvas-width")
         canvas_width = int(argv[i + 1])
         del argv[i:i + 2]
-    given = None
-    if "--stills" in argv:
-        i = argv.index("--stills")
-        given = argv[i + 1:i + 3]
-        if len(given) != 2:
-            raise SystemExit("--stills needs two images: cam0 then cam1")
-        del argv[i:i + 3]
     out_dir = Path(argv[0]) if argv else REPO / "calibration" / "stitch_live_full"
     if len(argv) > 1:
         raise SystemExit(__doc__.split("Usage:")[1].split("\n")[0])
 
-    if given:
-        dev0 = dev1 = None
-    else:
-        dev0 = camera_device("cam0")
-        dev1 = camera_device("cam1")
-        if not dev0 or not dev1:
-            raise SystemExit("both cameras must be connected (and not recording)")
+    dev0 = camera_device("cam0")
+    dev1 = camera_device("cam1")
+    if not dev0 or not dev1:
+        raise SystemExit("both cameras must be connected (and not recording)")
 
     with tempfile.TemporaryDirectory(prefix="aflcam-align-") as tmp:
         tmp = Path(tmp)
         stills = {}
-        for label, dev in (() if given else (("cam0", dev0), ("cam1", dev1))):
+        for label, dev in (("cam0", dev0), ("cam1", dev1)):
             out = tmp / f"{label}.jpg"
             # the pipeline leaves the exposure cap's manual exposure, brightness
             # and gamma lift on the camera: back to plain auto for the stills
@@ -82,8 +69,6 @@ def main() -> int:
             stills[label] = out
             print(f"{label}: captured {out.stat().st_size // 1024} KB from {dev}")
 
-        if given:
-            stills = {"cam0": Path(given[0]), "cam1": Path(given[1])}
         cmd = [CALIB_PYTHON, str(DUMP), str(stills["cam0"]), str(stills["cam1"]),
                str(out_dir)]
         if canvas_width:
