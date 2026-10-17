@@ -84,7 +84,7 @@ from . import cropsig, framing, selftest, sysmon
 from .config import (
     ALIGN_PYTHON, ALIGN_SCRIPT, AUDIO_DEVICES, CAMERAS, DB_PATH,
     ENCODE_CODEC, EXPOSURE_TIME, NATIVE_BITRATE_KBPS, OUTPUTS_DIR,
-    PREVIEW_INTERVAL_SECS, ROOT_DIR, STITCH_BITRATE_KBPS,
+    PREVIEW_INTERVAL_SECS, ROOT_DIR, STITCH_BITRATE_KBPS, STITCH_QP,
     CROP_PARAMS_DIR, STITCH_CANVAS_WIDTH, STITCH_PARAMS_DIR, STITCH_RECORDER_BIN,
     STITCH_SHADER, _discover_cameras, build_cam2h264, build_cam2stitch,
     rediscover_cameras, vk_env,
@@ -245,6 +245,7 @@ class StitchSupervisor(threading.Thread):
             "AFL_CAM_PREVIEW_BITRATE_KBPS": "3500",
             "AFL_CAM_CODEC": ENCODE_CODEC,
             "AFL_CAM_STITCH_BITRATE_KBPS": str(STITCH_BITRATE_KBPS),
+            "AFL_CAM_STITCH_QP": str(STITCH_QP),
         })
         cmd = [
             str(STITCH_RECORDER_BIN),
@@ -2596,7 +2597,9 @@ class CamDaemon:
         if st and st.get("rec_elapsed_s") and st.get("rec_bytes"):
             rate_bps = st["rec_bytes"] * 8 / max(1.0, st["rec_elapsed_s"])
         else:
-            rate_bps = STITCH_BITRATE_KBPS * 1000 * 2.5  # + proxy slack
+            # fixed QP has no nominal rate: budget the busiest measured
+            nominal_kbps = 200000 if STITCH_QP > 0 else STITCH_BITRATE_KBPS
+            rate_bps = nominal_kbps * 1000 * 2.5  # + proxy slack
         return du.free * 8 / max(1.0, rate_bps) / 60
 
     # -- clock ------------------------------------------------------------
