@@ -148,6 +148,39 @@ static void set_ctrl(int fd, __u32 id, RK_S32 value)
         fprintf(stderr, "set control 0x%x failed: %s\n", id, strerror(errno));
 }
 
+static int get_ctrl(int fd, __u32 id, RK_S32 *value)
+{
+    struct v4l2_control ctrl;
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id = id;
+    if (ioctl(fd, VIDIOC_G_CTRL, &ctrl) < 0)
+        return -1;
+    *value = ctrl.value;
+    return 0;
+}
+
+/* Fixed white balance, read back: a camera that ignores the write would sit
+ * on a different colour from the other one (2026-10-17: the left half of the
+ * preview came up blue with no error logged). Retry, and log what it holds. */
+static void set_fixed_wb(const char *dev, int fd, int wbk)
+{
+    RK_S32 a = -1, t = -1;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
+        set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, wbk);
+        a = t = -1;
+        get_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, &a);
+        get_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, &t);
+        if (a == 0 && t >= wbk - 60 && t <= wbk + 60) {
+            fprintf(stderr, "%s: white balance fixed at %d K\n", dev, (int)t);
+            return;
+        }
+        usleep(100000);
+    }
+    fprintf(stderr, "%s: white balance would not hold (auto %d, %d K, wanted %d K)\n",
+            dev, (int)a, (int)t, wbk);
+}
+
 /* Atomic JPEG snapshot write: the raw UVC MJPEG payload is a complete JPEG —
  * write it straight to *preview_path* via a temp file + rename so the UI
  * (which polls the file) never sees a half-written frame. */
@@ -1626,8 +1659,10 @@ static void ring_release(ring_t *r, int idx) {
 
 /* ========================== camera thread ========================== */
 
-typedef struct {
+typedef struct cam_s {
     const char *dev;
+    int idx;                    /* 0 = left, 1 = right */
+    struct cam_s *peer;         /* the other camera (joint exposure) */
     int fd;
     v4l2_buf_t bufs[V4L2_BUFS];
     uint32_t n_v4l2;
@@ -1724,8 +1759,7 @@ static int v4l2_open(cam_t *c) {
             const char *wbs = getenv("AFL_CAM_WB_K");
             int wbk = wbs ? atoi(wbs) : 5500;
             if (wbk >= 2800 && wbk <= 6500) {
-                set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
-                set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, wbk);
+                set_fixed_wb(c->dev, fd, wbk);
             } else {
                 set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
             }
@@ -1825,7 +1859,28 @@ static void ae_apply_lift(cam_t *c, int lift) {
     c->ae_lift = lift;
 }
 
-static void exposure_track(cam_t *c, MppFrame dec_frame) {
+/* The two cameras are metered as ONE camera: left and right see different
+ * halves of the scene, so metering each against the same luma gave them
+ * different exposures and a brightness step at the seam. Now cam0's thread
+ * decides from the mean of both cameras' meters (highlights protected: either
+ * camera clipping counts) and applies the SAME exposure and lift to both.
+ * The two sensors' own sensitivity difference is left to the seam gain. */
+static pthread_mutex_t g_ae_mu = PTHREAD_MUTEX_INITIALIZER;
+static double g_ae_meas[2] = { -1.0, -1.0 };   /* latest window mean per camera */
+static int g_ae_synced;
+
+static void ae_share(cam_t *c, cam_t *p) {
+    if (p->lock_exp != c->lock_exp) {
+        p->lock_exp = c->lock_exp;
+        set_exposure(p->fd, V4L2_EXPOSURE_MANUAL, p->lock_exp);
+    }
+    ae_apply_lift(p, c->ae_lift);
+    p->ae_settle = AE_SETTLE;
+    p->ae_frames = 0; p->ae_acc = 0.0; p->ae_n = 0;
+    g_ae_meas[p->idx] = -1.0;
+}
+
+static void exposure_track_locked(cam_t *c, MppFrame dec_frame) {
     if (c->ae_settle > 0) {
         c->ae_settle--;
         return;
@@ -1839,8 +1894,23 @@ static void exposure_track(cam_t *c, MppFrame dec_frame) {
         return;
     double meas = c->ae_acc / c->ae_n;
     c->ae_frames = 0; c->ae_acc = 0.0; c->ae_n = 0;
-    double target = c->target_luma;
+    cam_t *p = c->peer;
+    g_ae_meas[c->idx] = meas;
     int clipping = meas >= 225.0;
+    if (p) {
+        if (c->idx != 0 || g_ae_meas[1] < 0.0)
+            return;             /* cam0 decides, once cam1 has a fresh meter */
+        if (!g_ae_synced) {     /* first joint decision: both start from cam0's */
+            g_ae_synced = 1;
+            ae_share(c, p);
+            c->ae_settle = AE_SETTLE;
+            return;
+        }
+        double m1 = g_ae_meas[1];
+        clipping = meas >= 225.0 || m1 >= 225.0;
+        meas = 0.5 * (meas + m1);
+    }
+    double target = c->target_luma;
     if (!clipping && meas > target * 0.94 && meas < target * 1.06)
         return;
     /* far off (a big change of light): larger steps */
@@ -1886,6 +1956,10 @@ static void exposure_track(cam_t *c, MppFrame dec_frame) {
         return;
     c->ae_settle = AE_SETTLE;
     c->ae_changes++;
+    if (p) {
+        ae_share(c, p);
+        p->ae_changes++;
+    }
     int64_t now = now_us();
     if (now - c->ae_last_log > 5000000) {
         c->ae_last_log = now;
@@ -1893,6 +1967,12 @@ static void exposure_track(cam_t *c, MppFrame dec_frame) {
                 "brightness %d gamma %d\n", c->dev, meas, target,
                 c->lock_exp / 10.0, c->cap_bright, c->cap_gamma);
     }
+}
+
+static void exposure_track(cam_t *c, MppFrame dec_frame) {
+    pthread_mutex_lock(&g_ae_mu);
+    exposure_track_locked(c, dec_frame);
+    pthread_mutex_unlock(&g_ae_mu);
 }
 
 /* per-frame exposure state machine — ported verbatim from cam2h264.c */
@@ -2698,6 +2778,7 @@ int main(int argc, char **argv) {
     cams[0].dev = dev0; cams[1].dev = dev1;
     for (int i = 0; i < 2; i++) {
         cam_t *c = &cams[i];
+        c->idx = i; c->peer = &cams[1 - i];
         c->width = width; c->height = height; c->fps = fps; c->exposure = exposure;
         c->lock_pending = (exposure <= 0);
         c->lock_exp = 166;
