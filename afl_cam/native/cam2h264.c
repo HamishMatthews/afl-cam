@@ -61,6 +61,16 @@ static void set_exposure(int fd, int mode, RK_S32 value)
     }
 }
 
+static void set_ctrl(int fd, __u32 id, RK_S32 value)
+{
+    struct v4l2_control ctrl;
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id = id;
+    ctrl.value = value;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+        fprintf(stderr, "set control 0x%x failed: %s\n", id, strerror(errno));
+}
+
 /* Atomic JPEG snapshot write: the raw UVC MJPEG payload is a complete JPEG —
  * write it straight to *preview_path* via a temp file + rename so the UI
  * (which polls the file) never sees a half-written frame. */
@@ -383,7 +393,13 @@ int main(int argc, char **argv)
      * brightness via a short closed loop), or a fixed manual value in 100us
      * units (daytime: 100 = 10ms). Auto mode can settle at ~50ms and cap
      * the sensor at ~20 fps; locking keeps the rate consistent. Set AFTER
-     * S_FMT (stream open can reset controls) and BEFORE STREAMON. */
+     * S_FMT (stream open can reset controls) and BEFORE STREAMON.
+     * The cameras keep controls across opens: drop the brightness/gamma lift
+     * a dim-light cam2stitch run may have left, and backlight compensation
+     * (it lifts the blacks, see cam2stitch.c). */
+    set_ctrl(fd, V4L2_CID_BRIGHTNESS, 0);
+    set_ctrl(fd, V4L2_CID_GAMMA, 100);
+    set_ctrl(fd, V4L2_CID_BACKLIGHT_COMPENSATION, 0);
     if (exposure > 0) {
         set_exposure(fd, V4L2_EXPOSURE_MANUAL, exposure);
         fprintf(stderr, "exposure: fixed manual, %d (%dms)\n", exposure, exposure / 10);
