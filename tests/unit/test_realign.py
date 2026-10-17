@@ -109,8 +109,10 @@ def test_realign_failure_keeps_old_alignment(rig):
 def cam_daemon(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "DB_PATH", tmp_path / "rec.db")
     monkeypatch.setattr(d, "OUTPUTS_DIR", tmp_path)
+    monkeypatch.setattr(d, "SETTINGS_PATH", tmp_path / "settings.json")
     daemon = d.CamDaemon()
     daemon._last_http = 0.0          # no phone: idle stays idle
+    daemon.align_locked = False      # locked is the default; tests re-align
     yield daemon
     daemon.db.close()
 
@@ -157,3 +159,22 @@ def threading_tick(daemon):
     daemon.stopping = True
     t.join(5)
     return daemon.state
+
+
+def test_alignment_is_locked_by_default_and_the_lock_persists(cam_daemon, tmp_path):
+    fresh = d.CamDaemon()                       # no settings file: locked
+    try:
+        assert fresh.align_locked is True
+        fresh.state = "standby"
+        ok, msg = fresh.intent_realign()
+        assert not ok and "locked" in msg and fresh._pending_realign is False
+        assert fresh.realign_status()["locked"] is True
+        assert fresh.set_align_locked("no")[0] is False
+        assert fresh.set_align_locked(False) == (True, "")
+        assert fresh.intent_realign() == (True, "")
+        assert d._load_settings()["align_locked"] is False
+        assert d.CamDaemon().align_locked is False   # survives a restart
+        fresh.set_align_locked(True)
+        assert d.CamDaemon().align_locked is True
+    finally:
+        fresh.db.close()

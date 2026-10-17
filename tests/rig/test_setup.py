@@ -1,14 +1,13 @@
-"""The phone's Setup view: pre-game self-test, framing guides, PWA files,
-and (slow) a full re-align from the phone into a scratch map dir
-(rig_test.sh sets AFL_CAM_ALIGN_OUT; calibration/ is never written)."""
+"""The phone's Setup view: pre-game self-test, framing guides, PWA files and
+the alignment lock. Nothing here re-aligns: the fit is tested on stored
+stills in test_realign_chain.py."""
 
 import json
-import os
 import urllib.request
 
 import pytest
 
-from .conftest import BASE, get, post, stitch, wait_until, wake_standby
+from .conftest import BASE, get, post, wake_standby
 
 
 def test_selftest_reports_every_check():
@@ -46,25 +45,12 @@ def test_pwa_files_served(path, ctype):
         assert body[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-@pytest.mark.slow
-def test_realign_from_the_phone():
-    assert os.environ.get("AFL_CAM_TEST_BASE"), \
-        "run via rig_test.sh (it points the re-align at a scratch dir)"
-    wake_standby()
+def test_realign_is_locked_by_default_and_refuses():
+    """The field alignment is locked until the phone unlocks it, so a stray
+    tap (or a test) can never replace it. The chain itself is covered by
+    test_realign_chain.py on stored stills, with no cameras or daylight."""
+    assert post("/api/align-lock", {"locked": True})["ok"] is True
     j = post("/api/realign")
-    assert j["ok"] is True, j
-    # the pipeline closes so the chain can open the cameras
-    wait_until(lambda: get("/api/status")["state"] == "realigning",
-               15, what="realigning state")
-    wait_until(lambda: not stitch(), 15, what="pipeline closed")
-    assert post("/api/record/start", timeout=30)["ok"] is False
-    ra = wait_until(lambda: (lambda r: r if not r["running"] else None)(
-        get("/api/realign")), 900, interval=5, what="re-align finished")
-    assert ra["ok"] is True, "\n".join(ra.get("log", [])[-40:])
-    assert ra["after"] and ra["after"]["misalign_median"] is not None
-    assert ra["before"] and ra["before"]["misalign_median"] is not None
-    print(f"[realign] before {ra['before']} after {ra['after']}")
-    with urllib.request.urlopen(BASE + "/api/realign/seam.jpg", timeout=10) as r:
-        assert r.read()[:2] == b"\xff\xd8"
-    # and the pipeline comes back on the next wake
-    wake_standby(120)
+    assert j["ok"] is False and "locked" in j["error"], j
+    assert get("/api/status")["realign"]["locked"] is True
+    assert get("/api/status")["state"] != "realigning"

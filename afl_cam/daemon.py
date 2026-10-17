@@ -34,7 +34,8 @@ Endpoints (default port 80, AFL_CAM_PORT overrides)::
     GET  /api/recordings/<id>/thumb.jpg
     DELETE /api/recordings/<id>
     POST /api/schedule              {"start_at": epoch_ms, "stop_after": s}
-    POST /api/realign               re-align the cameras (closes the pipeline)
+    POST /api/realign               re-align the cameras (closes the pipeline; refused while locked)
+    POST /api/align-lock            {"locked": bool} — the field alignment is locked by default
     GET  /api/realign               re-align progress + full log + scores
     GET  /api/realign/seam.jpg      seam crop from the last re-align
     GET  /api/selftest              pre-game checks (cameras, alignment, …)
@@ -1459,6 +1460,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._err("forbidden", status=403)
             ok, msg = self.daemon.set_crop((body or {}).get("enabled"))
             return self._json({"ok": ok, "error": msg})
+        if path == "/api/align-lock":
+            if not self._authed():
+                return self._err("forbidden", status=403)
+            ok, msg = self.daemon.set_align_locked((body or {}).get("locked"))
+            return self._json({"ok": ok, "error": msg})
         if path == "/api/realign":
             if not self._authed():
                 return self._err("forbidden", status=403)
@@ -1612,7 +1618,11 @@ class CamDaemon:
         self._pending_realign = False
         self.realign: Optional[RealignJob] = None
         self.mode = "live"            # live | separate (resets on restart)
-        self.crop_enabled = bool(_load_settings().get("crop"))
+        settings = _load_settings()
+        self.crop_enabled = bool(settings.get("crop"))
+        # the rig is static: once a field alignment is good, a stray tap on
+        # Re-align must not replace it, so re-align is locked until unlocked
+        self.align_locked = settings.get("align_locked", True) is not False
         # the map set the running pipeline was started with (framing guides
         # and the status canvas must match what the preview shows)
         self.params_dir = self._settled_params_dir()
@@ -1930,6 +1940,8 @@ class CamDaemon:
         """Queue a re-align; the tick loop closes the pipeline and starts
         it. Progress is in the snapshot's "realign" block."""
         with self._intents_lock:
+            if self.align_locked:
+                return False, "alignment is locked: unlock it in Setup to re-align"
             if self.state == "realigning" or self._pending_realign:
                 return False, "already re-aligning"
             if self.state in ("recording", "finalizing") or self.session:
@@ -1937,11 +1949,24 @@ class CamDaemon:
             self._pending_realign = True
         return True, ""
 
+    def set_align_locked(self, locked) -> tuple[bool, str]:
+        if not isinstance(locked, bool):
+            return False, "locked must be true or false"
+        with self._intents_lock:
+            self.align_locked = locked
+            settings = _load_settings()
+            settings["align_locked"] = locked
+            _save_settings(settings)
+        log.info("alignment: %s", "locked" if locked else "unlocked")
+        return True, ""
+
     def realign_status(self, full: bool = False) -> dict:
         job = self.realign
         if job is None:
-            return {"running": self._pending_realign, "ok": None}
+            return {"running": self._pending_realign, "ok": None,
+                    "locked": self.align_locked}
         out = job.summary()
+        out["locked"] = self.align_locked
         out["running"] = out["running"] or self._pending_realign
         if full:
             out["log"] = job.lines()
