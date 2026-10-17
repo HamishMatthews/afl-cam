@@ -55,6 +55,7 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -362,6 +363,59 @@ static void create_plane(VkDevice dev, VkPhysicalDeviceMemoryProperties *mprops,
     CHECK(vkCreateImageView(dev, &ivci, NULL, &pl->iv));
 }
 
+/* Live seam gain. The static per-camera gain in params [5]/[6] was fitted on
+ * whatever scene the re-align stills showed, so it is wrong the moment the
+ * light changes. Instead the capture threads measure the mean luma of both
+ * cameras over the SAME scene points (a grid over the overlap, taken through
+ * the warp maps) and cam0's thread steers the two gains until those means
+ * match. The params SSBO stays mapped; the shader reads [5]/[6] as before. */
+#define OV_STEP 20
+static volatile float *g_pl;           /* live params mapping */
+static int *g_ov_pts[2];               /* x,y source pixel pairs per camera */
+static int g_ov_n;
+static double g_ov_mean[2] = { -1.0, -1.0 };
+static double g_lg[2] = { 1.0, 1.0 };
+static int g_ov_frames[2];
+
+static void ov_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
+                     const float *m0d, const float *m1d) {
+    int cw = (int)pf[0], ch = (int)pf[1];
+    const float *md[2] = { m0d, m1d };
+    int off[2][2], mw[2], mh[2];
+    for (int c = 0; c < 2; c++) {
+        int base = 8 + c * 28;
+        off[c][0] = (int)pf[base + 11]; off[c][1] = (int)pf[base + 12];
+        mw[c] = (int)pf[base + 13]; mh[c] = (int)pf[base + 14];
+    }
+    size_t cap = (size_t)(cw / OV_STEP + 1) * (ch / OV_STEP + 1);
+    for (int c = 0; c < 2; c++)
+        g_ov_pts[c] = malloc(cap * 2 * sizeof(int));
+    int n = 0;
+    for (int y = OV_STEP / 2; y < ch; y += OV_STEP)
+        for (int x = OV_STEP / 2; x < cw; x += OV_STEP) {
+            size_t i = ((size_t)y * cw + x) * 4;
+            if (w0d[i] < 32 || w1d[i] < 32)
+                continue;
+            int ok = 1, sx[2], sy[2];
+            for (int c = 0; c < 2 && ok; c++) {
+                int mx = x - off[c][0], my = y - off[c][1];
+                if (mx < 0 || my < 0 || mx >= mw[c] || my >= mh[c]) { ok = 0; break; }
+                const float *m = md[c] + ((size_t)my * mw[c] + mx) * 2;
+                sx[c] = (int)m[0]; sy[c] = (int)m[1];
+                if (m[0] < 8.0f || m[1] < 8.0f) ok = 0;
+            }
+            if (!ok)
+                continue;
+            for (int c = 0; c < 2; c++) {
+                g_ov_pts[c][2 * n] = sx[c];
+                g_ov_pts[c][2 * n + 1] = sy[c];
+            }
+            n++;
+        }
+    g_ov_n = n;
+    fprintf(stderr, "seam gain: %d overlap sample points\n", n);
+}
+
 static void gpu_init(gpu_t *g, const char *spv_path,
                      void *params_data, void *w0d, void *w1d,
                      void *m0d, void *m1d) {
@@ -527,7 +581,9 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     void *pmap;
     CHECK(vkMapMemory(g->dev, pbmem, 0, pbci.size, 0, &pmap));
     memcpy(pmap, params_data, pbci.size);
-    vkUnmapMemory(g->dev, pbmem);
+    g_pl = (volatile float *)pmap;      /* stays mapped: live seam gain */
+    ov_build(pf, (const uint8_t *)w0d, (const uint8_t *)w1d,
+             (const float *)m0d, (const float *)m1d);
 
     /* ---- command pool + per-slot resources + pre-recorded cbs ---- */
     VkCommandPoolCreateInfo cpc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -1975,11 +2031,73 @@ static void exposure_track(cam_t *c, MppFrame dec_frame) {
     pthread_mutex_unlock(&g_ae_mu);
 }
 
+/* Mean luma of this camera over the shared overlap points. */
+static double ov_luma(const int *pts, MppFrame frame) {
+    MppBuffer buf = mpp_frame_get_buffer(frame);
+    if (!buf || g_ov_n <= 0)
+        return -1.0;
+    RK_U8 *y = (RK_U8 *)mpp_buffer_get_ptr(buf);
+    RK_U32 hs = mpp_frame_get_hor_stride(frame);
+    RK_U32 w = mpp_frame_get_width(frame), h = mpp_frame_get_height(frame);
+    RK_U64 sum = 0;
+    RK_U32 n = 0;
+    for (int i = 0; i < g_ov_n; i++) {
+        RK_U32 x = (RK_U32)pts[2 * i], yy = (RK_U32)pts[2 * i + 1];
+        if (x >= w || yy >= h)
+            continue;
+        sum += y[yy * hs + x];
+        n++;
+    }
+    return n ? (double)sum / n : -1.0;
+}
+
+/* Both cameras' overlap means in, cam0's thread steers the gains so the two
+ * match: g0*m0 == g1*m1 with g0*g1 == 1 (overall brightness is the joint
+ * meter's job). Eased and clamped; a clipped or dark overlap is ignored. */
+static void overlap_balance(cam_t *c, MppFrame dec_frame) {
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("AFL_CAM_SEAM_GAIN");
+        off = (e && *e == '0') || !c->peer;
+    }
+    if (off || !g_pl || g_ov_n < 200)
+        return;
+    if (++g_ov_frames[c->idx] % 6)
+        return;
+    double m = ov_luma(g_ov_pts[c->idx], dec_frame);
+    pthread_mutex_lock(&g_ae_mu);
+    g_ov_mean[c->idx] = m;
+    if (c->idx == 0 && g_ov_mean[0] >= 0.0 && g_ov_mean[1] >= 0.0) {
+        double m0 = g_ov_mean[0], m1 = g_ov_mean[1];
+        g_ov_mean[0] = g_ov_mean[1] = -1.0;
+        if (m0 > 20.0 && m1 > 20.0 && m0 < 232.0 && m1 < 232.0) {
+            double r = sqrt(m1 / m0);               /* wanted g0 (g1 = 1/g0) */
+            if (r < 0.8) r = 0.8;
+            if (r > 1.25) r = 1.25;
+            if (fabs(r - g_lg[0]) > 0.01) {
+                g_lg[0] += 0.25 * (r - g_lg[0]);
+                g_lg[1] = 1.0 / g_lg[0];
+                g_pl[5] = (float)g_lg[0];
+                g_pl[6] = (float)g_lg[1];
+                static int64_t last;
+                int64_t now = now_us();
+                if (now - last > 5000000) {
+                    last = now;
+                    fprintf(stderr, "seam gain: overlap luma %.1f | %.1f -> "
+                            "gain %.3f / %.3f\n", m0, m1, g_lg[0], g_lg[1]);
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_ae_mu);
+}
+
 /* per-frame exposure state machine — ported verbatim from cam2h264.c */
 static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
     if (!c->lock_pending) {
         if (c->exposure <= 0)
             exposure_track(c, dec_frame);
+        overlap_balance(c, dec_frame);
         return;
     }
     if (c->prev_pts > 0 && pts_us > c->prev_pts) {

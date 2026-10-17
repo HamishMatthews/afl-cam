@@ -14,7 +14,7 @@ ALLFLAGS  = $(CFLAGS) $(WARN) $(WERROR) -I$(MPP_INC)
 all: cam2stitch cam2h264 stitch_nv12.spv
 
 cam2stitch: cam2stitch.c
-	$(CC) $(ALLFLAGS) -o $@ $< -L$(MPP_LIB) -lrockchip_mpp -lvulkan -lpthread
+	$(CC) $(ALLFLAGS) -o $@ $< -L$(MPP_LIB) -lrockchip_mpp -lvulkan -lpthread -lm
 
 cam2h264: cam2h264.c
 	$(CC) $(ALLFLAGS) -o $@ $< -L$(MPP_LIB) -lrockchip_mpp -lpthread
