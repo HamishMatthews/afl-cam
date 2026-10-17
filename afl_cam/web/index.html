@@ -437,6 +437,11 @@
         <button id="crop-on">Crop</button>
       </div>
     </div>
+    <div class="row stack" id="quality-row">
+      <label class="lab" for="quality">Quality
+        <span class="info" tabindex="0" role="button" aria-label="About quality">i<span class="tip">Lower QP keeps more detail and uses more storage. GB per hour is the most a busy scene uses, and a grass field uses less. The bitrate chip in Health shows the real rate while recording.</span></span></label>
+      <select class="field" id="quality" style="width:100%"></select>
+    </div>
   </section>
 
   <section id="sched" class="card" data-view="record">
@@ -588,6 +593,7 @@ function applyStatus(s) {
   applyRealign(s.realign);
   applyMode(s);
   applyCrop(s);
+  applyQuality(s);
   applyRestitch(s.restitch);
   const lr = s.last_recording;
   $("st-last").innerHTML = lr
@@ -706,7 +712,7 @@ function applyHealth(s, fpsNow) {
     const now = Date.now();
     if (s.recording && prevBytes != null && st.rec_bytes >= prevBytes) {
       const mbps = (st.rec_bytes - prevBytes) * 8 / 1e6 / Math.max(0.5, (now - prevBytesAt) / 1000);
-      chips.push(`<span class="chip"><b>bitrate</b>${mbps.toFixed(0)} Mb/s</span>`);
+      chips.push(`<span class="chip"><b>bitrate</b>${mbps.toFixed(0)} Mb/s · ${Math.round(mbps * 0.45)} GB/h</span>`);
     }
     prevBytes = s.recording ? st.rec_bytes : null; prevBytesAt = now;
     chips.push(`<span class="chip${(st.cam0.errors + st.cam1.errors) ? " warn" : ""}"><b>cam errors</b>${st.cam0.errors + st.cam1.errors}</span>`);
@@ -800,11 +806,12 @@ function pvPipelineText() {
        : "Connecting";
 }
 
-// A mode or crop change restarts the pipeline: drop the picture at once and
+// A mode, crop or quality change restarts the pipeline: drop the picture at once and
 // give the daemon a moment to publish the new state before reconnecting.
 let pvKey = null;
 function pvWatchConfig(s) {
-  const key = (s.mode || "live") + "|" + !!(s.crop && s.crop.enabled) + "|" + !!(s.crop && s.crop.active);
+  const key = (s.mode || "live") + "|" + !!(s.crop && s.crop.enabled) + "|" + !!(s.crop && s.crop.active)
+            + "|" + (s.quality ? s.quality.qp : "");
   if (pvKey !== null && key !== pvKey) {
     pv.hold = Date.now() + 2500;
     previewAttempt();
@@ -1372,6 +1379,35 @@ async function setCrop(enabled) {
 }
 $("crop-off").addEventListener("click", () => setCrop(false));
 $("crop-on").addEventListener("click", () => setCrop(true));
+
+/* ---------- quality (live-stitch master QP) ---------- */
+let qualityKey = null;
+function applyQuality(s) {
+  const q = s.quality, sel = $("quality");
+  $("quality-row").style.display = (s.mode || "live") === "live" && q ? "" : "none";
+  if (!q) return;
+  const key = JSON.stringify(q.options);
+  if (key !== qualityKey) {           // rebuild only when the list changes (keeps an open picker open)
+    sel.innerHTML = q.options.map(o => {
+      const name = o.qp ? "QP " + o.qp : "Old CBR " + o.mbps + " Mb/s";
+      const gb = o.gb_per_hour != null ? " · up to " + o.gb_per_hour + " GB/h" : "";
+      return `<option value="${o.qp}">${name}${gb}</option>`;
+    }).join("");
+    qualityKey = key;
+  }
+  if (document.activeElement !== sel) sel.value = String(q.qp);
+  sel.disabled = !!(s.recording || s.state === "finalizing" || s.state === "realigning");
+}
+$("quality").addEventListener("change", async e => {
+  const qp = Number(e.target.value);
+  const r = await fetch("/api/quality", {method: "POST",
+    headers: {"Content-Type": "application/json", ...AUTH}, body: JSON.stringify({qp})});
+  const j = await r.json();
+  if (!j.ok) flashHint(j.error || "Could not change quality");
+  else if (S) S.quality = {...S.quality, qp};
+  e.target.blur();
+  if (S) applyQuality(S);
+});
 
 /* ---------- re-stitch (separate-mode sessions) ---------- */
 let RS = null, rsWasRunning = false;

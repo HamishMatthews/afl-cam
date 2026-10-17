@@ -167,6 +167,12 @@ STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "80000")
 # over CBR at 200M; past QP 20 the extra bits mostly keep the cameras' own
 # JPEG noise (2026-10-17). The bitrate follows the scene.
 STITCH_QP = int(os.environ.get("AFL_CAM_STITCH_QP", "20"))
+# The phone's Quality setting: (QP, Mbps measured on the busy foliage
+# canvas above, 2026-10-17). QP 0 = the old CBR at STITCH_BITRATE_KBPS.
+# The rate is a busy-scene ceiling for the GB/hour the page shows; a grass
+# field encodes smaller.
+STITCH_QUALITY_PRESETS = [(16, 333), (18, 271), (20, 215), (22, 170), (24, 132),
+                          (0, STITCH_BITRATE_KBPS // 1000)]
 # The native recorders write the raw UVC JPEG payload to
 # <session>/camN_preview.jpg this often; the phone page polls those files
 # for a live preview while recording in separate mode. 1 fps: the

@@ -90,3 +90,32 @@ def test_changing_it_restarts_an_idle_pipeline(env):
     cam2.crop_enabled = True
     assert cam2.set_crop(False) == (True, "")
     assert cam2.supervisor.proc.signals == []
+
+
+# -- quality (the live-stitch master QP) shares the crop plumbing --------------
+
+def test_quality_persists_validates_and_restarts(env):
+    cam = make_daemon()
+    status = cam.quality_status()
+    assert status["qp"] == d.STITCH_QP
+    by_qp = {o["qp"]: o for o in status["options"]}
+    assert by_qp[20]["gb_per_hour"] == 97                # 215 Mb/s
+    assert cam.set_quality(19)[0] is False               # not a preset
+    assert cam.set_quality(True)[0] is False
+    cam.state = "standby"
+    stopped = []
+    cam.preview_chain.stop = lambda: stopped.append(True)
+    assert cam.set_quality(24) == (True, "")
+    assert cam.state == "idle" and cam.supervisor.proc.signals == [15]
+    assert stopped == []                                 # same canvas: the pusher keeps going
+    assert d._load_settings() == {"stitch_qp": 24}
+    assert make_daemon().stitch_qp == 24                 # survives a restart
+
+    cam.state = "recording"
+    ok, msg = cam.set_quality(20)
+    assert not ok and "recording" in msg and cam.stitch_qp == 24
+
+
+def test_bad_saved_quality_falls_back_to_the_default(env):
+    d._save_settings({"stitch_qp": "high"})
+    assert make_daemon().stitch_qp == d.STITCH_QP

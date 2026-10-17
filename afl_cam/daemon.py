@@ -40,6 +40,7 @@ Endpoints (default port 80, AFL_CAM_PORT overrides)::
     GET  /api/selftest              pre-game checks (cameras, alignment, …)
     GET  /api/framing               seam + horizon positions for the preview
     POST /api/mode                  {"mode": "live"|"separate"} (not while recording)
+    POST /api/quality               {"qp": 16..24 | 0 = CBR} live-stitch quality (not while recording)
     POST /api/recordings/<id>/stitch   re-stitch a separate-mode session
     GET  /api/live/cam0.jpg|cam1.jpg   separate-mode recording snapshots
     GET  /manifest.webmanifest, /icon-*.png   PWA (Add to Home Screen)
@@ -85,6 +86,7 @@ from .config import (
     ALIGN_PYTHON, ALIGN_SCRIPT, AUDIO_DEVICES, CAMERAS, DB_PATH,
     ENCODE_CODEC, EXPOSURE_TIME, NATIVE_BITRATE_KBPS, OUTPUTS_DIR,
     PREVIEW_INTERVAL_SECS, ROOT_DIR, STITCH_BITRATE_KBPS, STITCH_QP,
+    STITCH_QUALITY_PRESETS,
     CROP_PARAMS_DIR, STITCH_CANVAS_WIDTH, STITCH_PARAMS_DIR, STITCH_RECORDER_BIN,
     STITCH_SHADER, _discover_cameras, build_cam2h264, build_cam2stitch,
     rediscover_cameras, vk_env,
@@ -123,7 +125,7 @@ HLS_PORT = 8888
 RESOLUTION = {"width": 3840, "height": 2160, "fps": 30}   # stitch pipeline
 HEVC = ENCODE_CODEC != "h264"
 INTENT_PATH = LIVE_SNAP_DIR / "intent.json"   # afl_cam/resume.py
-SETTINGS_PATH = LIVE_SNAP_DIR / "settings.json"   # persisted phone settings (crop)
+SETTINGS_PATH = LIVE_SNAP_DIR / "settings.json"   # persisted phone settings (crop, quality)
 CROP_TIMEOUT_S = 120
 # a reboot later than this after the last heartbeat finalizes the
 # recording instead of resuming it (the game is over; don't record the shed)
@@ -245,7 +247,7 @@ class StitchSupervisor(threading.Thread):
             "AFL_CAM_PREVIEW_BITRATE_KBPS": "3500",
             "AFL_CAM_CODEC": ENCODE_CODEC,
             "AFL_CAM_STITCH_BITRATE_KBPS": str(STITCH_BITRATE_KBPS),
-            "AFL_CAM_STITCH_QP": str(STITCH_QP),
+            "AFL_CAM_STITCH_QP": str(self.daemon.stitch_qp),
         })
         cmd = [
             str(STITCH_RECORDER_BIN),
@@ -1460,6 +1462,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._err("forbidden", status=403)
             ok, msg = self.daemon.set_crop((body or {}).get("enabled"))
             return self._json({"ok": ok, "error": msg})
+        if path == "/api/quality":
+            if not self._authed():
+                return self._err("forbidden", status=403)
+            ok, msg = self.daemon.set_quality((body or {}).get("qp"))
+            return self._json({"ok": ok, "error": msg})
         if path == "/api/realign":
             if not self._authed():
                 return self._err("forbidden", status=403)
@@ -1613,7 +1620,10 @@ class CamDaemon:
         self._pending_realign = False
         self.realign: Optional[RealignJob] = None
         self.mode = "live"            # live | separate (resets on restart)
-        self.crop_enabled = bool(_load_settings().get("crop"))
+        settings = _load_settings()
+        self.crop_enabled = bool(settings.get("crop"))
+        qp = settings.get("stitch_qp")
+        self.stitch_qp = qp if self._quality_ok(qp) else STITCH_QP
         # the map set the running pipeline was started with (framing guides
         # and the status canvas must match what the preview shows)
         self.params_dir = self._settled_params_dir()
@@ -1884,25 +1894,67 @@ class CamDaemon:
             # a running pipeline restarts on the other map set (the phone's
             # WebSocket brings it straight back up); the encoder and the
             # preview take their size from the maps at start
-            if self.state == "standby" and (
-                    self.supervisor.proc is not None or self.supervisor._adopted):
-                log.info("crop: %s — restarting the pipeline", "on" if enabled else "off")
-                self._idle_sigterm = True
-                self._set_state("idle")
-                self._sigterm_sent_at = time.monotonic()
-                self._sigterm_target = self.supervisor.proc
-                if self.supervisor.proc is not None:
-                    self.supervisor.proc.send_signal(15)
-                else:
-                    try:
-                        self.supervisor.command("QUIT", timeout=3)
-                    except Exception:
-                        pass
-                # the preview changes size: a running ffmpeg pusher cannot
-                # follow a new resolution mid-stream (it would drop out later,
-                # taking the HLS/WebRTC stream with it), so start it afresh
-                self.preview_chain.stop()
+            self._restart_idle_pipeline("crop %s" % ("on" if enabled else "off"),
+                                        new_size=True)
         log.info("crop: %s", "on" if enabled else "off")
+        return True, ""
+
+    def _restart_idle_pipeline(self, why: str, new_size: bool = False) -> None:
+        """Restart a standby pipeline so it picks up a changed setting (the
+        phone's WebSocket brings it straight back up). Call with
+        _intents_lock held; a stopped pipeline just starts with it later."""
+        if self.state != "standby" or (
+                self.supervisor.proc is None and not self.supervisor._adopted):
+            return
+        log.info("%s — restarting the pipeline", why)
+        self._idle_sigterm = True
+        self._set_state("idle")
+        self._sigterm_sent_at = time.monotonic()
+        self._sigterm_target = self.supervisor.proc
+        if self.supervisor.proc is not None:
+            self.supervisor.proc.send_signal(15)
+        else:
+            try:
+                self.supervisor.command("QUIT", timeout=3)
+            except Exception:
+                pass
+        if new_size:
+            # the preview changes size: a running ffmpeg pusher cannot
+            # follow a new resolution mid-stream (it would drop out later,
+            # taking the HLS/WebRTC stream with it), so start it afresh
+            self.preview_chain.stop()
+
+    # -- quality setting ---------------------------------------------------
+
+    @staticmethod
+    def _quality_ok(qp) -> bool:
+        return isinstance(qp, int) and not isinstance(qp, bool) \
+            and any(qp == p for p, _ in STITCH_QUALITY_PRESETS)
+
+    def quality_status(self) -> dict:
+        # GB/hour = Mbps * 3600 / 8 / 1000
+        opts = [{"qp": qp, "mbps": mbps, "gb_per_hour": round(mbps * 0.45)}
+                for qp, mbps in STITCH_QUALITY_PRESETS]
+        if not any(o["qp"] == self.stitch_qp for o in opts):   # env override
+            opts.append({"qp": self.stitch_qp, "mbps": None, "gb_per_hour": None})
+        return {"qp": self.stitch_qp, "options": opts}
+
+    def set_quality(self, qp) -> tuple[bool, str]:
+        if not self._quality_ok(qp):
+            return False, "unknown quality"
+        with self._intents_lock:
+            if self.session is not None or self.state in (
+                    "recording", "finalizing") or self._pending_start:
+                return False, "can't change quality while recording"
+            if qp == self.stitch_qp:
+                return True, ""
+            self.stitch_qp = qp
+            settings = _load_settings()
+            settings["stitch_qp"] = qp
+            _save_settings(settings)
+            # the encoder takes its rate control at start
+            self._restart_idle_pipeline("quality QP %d" % qp)
+        log.info("quality: QP %d", qp)
         return True, ""
 
     def start_restitch(self, session_id: int) -> tuple[bool, str]:
@@ -2597,8 +2649,9 @@ class CamDaemon:
         if st and st.get("rec_elapsed_s") and st.get("rec_bytes"):
             rate_bps = st["rec_bytes"] * 8 / max(1.0, st["rec_elapsed_s"])
         else:
-            # fixed QP has no nominal rate: budget about QP 20 on busy content
-            nominal_kbps = 220000 if STITCH_QP > 0 else STITCH_BITRATE_KBPS
+            # fixed QP has no nominal rate: budget its busy-scene rate
+            nominal_kbps = next((mbps * 1000 for qp, mbps in STITCH_QUALITY_PRESETS
+                                 if qp == self.stitch_qp), 220000)
             rate_bps = nominal_kbps * 1000 * 2.5  # + proxy slack
         return du.free * 8 / max(1.0, rate_bps) / 60
 
@@ -2844,6 +2897,7 @@ class CamDaemon:
             "realign": self.realign_status(),
             "mode": self.mode,
             "crop": self.crop_status(),
+            "quality": self.quality_status(),
             "session_kind": self.session.kind if self.session else None,
             "restitch": self.restitch.summary() if self.restitch else None,
             "last_recording": self.last_recording,
