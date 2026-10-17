@@ -1711,6 +1711,10 @@ static int v4l2_open(cam_t *c) {
         set_ctrl(fd, V4L2_CID_GAMMA, 100);
         c->cap_bright = 0;
         c->cap_gamma = 100;
+        /* backlight compensation lifts the shadows: on the balcony view it
+         * held blacks at ~40 with 4-5% of the frame clipped; off, blacks sit
+         * at ~28 with ~2% clipped (2026-10-17) */
+        set_ctrl(fd, V4L2_CID_BACKLIGHT_COMPENSATION, 0);
         set_exposure(fd, 3, 0);
         /* both cameras on the SAME fixed white balance: on the rig their own
          * auto white balance disagreed by ~15 in U and V (a visible colour

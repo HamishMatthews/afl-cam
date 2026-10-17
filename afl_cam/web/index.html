@@ -497,6 +497,11 @@
     <div class="card-h">Re-align cameras
       <span class="info" tabindex="0" role="button" aria-label="About re-aligning">i<span class="tip">Run after the rig has been knocked or re-aimed. It captures a still from each camera and refits the stitch, which takes about 2 minutes, and the preview stops meanwhile. Stand someone in the overlap at playing distance so the fit has something to lock onto. The guides on the preview show the overlap (blue), the seam and the horizon.</span></span>
       <button class="btn sm" id="ra-run">Re-align</button></div>
+    <div class="row">
+      <label class="lab" for="ra-lock">Alignment locked
+        <span class="info" tabindex="0" role="button" aria-label="About the alignment lock">i<span class="tip">The rig is fixed, so a good alignment should not change. While locked, Re-align refuses. Unlock it only after the rig has been knocked or moved to a new ground.</span></span></label>
+      <input type="checkbox" id="ra-lock" checked>
+    </div>
     <div id="ra-state"></div>
     <table id="ra-score">
       <tr><th></th><th>before</th><th>after</th></tr>
@@ -1268,7 +1273,10 @@ function applyRealign(ra) {
   if (!ra) return;
   const running = !!ra.running;
   const busy = running || (S && (S.recording || S.state === "finalizing"));
-  $("ra-run").disabled = !!busy;
+  const locked = ra.locked !== false;
+  if (document.activeElement !== $("ra-lock")) $("ra-lock").checked = locked;
+  $("ra-lock").disabled = !!busy;
+  $("ra-run").disabled = !!busy || locked;
   const st = $("ra-state");
   if (running) {
     st.className = "lv-warn";
@@ -1308,6 +1316,15 @@ function applyRealign(ra) {
   } else if (running) { crop.style.display = "none"; }
   raWasRunning = running;
 }
+$("ra-lock").addEventListener("change", async e => {
+  const locked = e.target.checked;
+  const r = await fetch("/api/align-lock", {method: "POST",
+    headers: {"Content-Type": "application/json", ...AUTH}, body: JSON.stringify({locked})});
+  const j = await r.json();
+  if (!j.ok) { flashHint(j.error || "Could not change the lock"); e.target.checked = !locked; }
+  else if (S && S.realign) { S.realign = {...S.realign, locked}; applyRealign(S.realign); }
+  e.target.blur();
+});
 $("ra-run").addEventListener("click", async () => {
   if (!confirm("Re-align now? The preview stops for about 2 minutes.")) return;
   $("ra-run").disabled = true;
