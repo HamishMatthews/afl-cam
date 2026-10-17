@@ -162,10 +162,11 @@ ENCODE_CODEC = os.environ.get("AFL_CAM_CODEC", "hevc")   # "hevc" | "h264"
 NATIVE_BITRATE_KBPS = int(os.environ.get("AFL_CAM_BITRATE_KBPS", "60000"))
 STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "80000"))
 # Live-stitch master rate control: a fixed QP (1-51) instead of CBR at
-# STITCH_BITRATE_KBPS; 0 = CBR. QP 22 measured ~170 Mbps on wind-blown
-# foliage (a grass field encodes smaller) with +3.3 dB on moving pixels
-# over CBR at the same rate (2026-10-17). The bitrate follows the scene.
-STITCH_QP = int(os.environ.get("AFL_CAM_STITCH_QP", "22"))
+# STITCH_BITRATE_KBPS; 0 = CBR. QP 20 measured ~215 Mbps on wind-blown
+# foliage (a grass field encodes smaller), +4.3 dB on moving pixels
+# over CBR at 200M; past QP 20 the extra bits mostly keep the cameras' own
+# JPEG noise (2026-10-17). The bitrate follows the scene.
+STITCH_QP = int(os.environ.get("AFL_CAM_STITCH_QP", "20"))
 # The native recorders write the raw UVC JPEG payload to
 # <session>/camN_preview.jpg this often; the phone page polls those files
 # for a live preview while recording in separate mode. 1 fps: the

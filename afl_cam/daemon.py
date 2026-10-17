@@ -2597,8 +2597,8 @@ class CamDaemon:
         if st and st.get("rec_elapsed_s") and st.get("rec_bytes"):
             rate_bps = st["rec_bytes"] * 8 / max(1.0, st["rec_elapsed_s"])
         else:
-            # fixed QP has no nominal rate: budget the busiest measured
-            nominal_kbps = 200000 if STITCH_QP > 0 else STITCH_BITRATE_KBPS
+            # fixed QP has no nominal rate: budget about QP 20 on busy content
+            nominal_kbps = 220000 if STITCH_QP > 0 else STITCH_BITRATE_KBPS
             rate_bps = nominal_kbps * 1000 * 2.5  # + proxy slack
         return du.free * 8 / max(1.0, rate_bps) / 60
 
