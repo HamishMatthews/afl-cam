@@ -167,6 +167,13 @@ STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "80000")
 # over CBR at 200M; past QP 20 the extra bits mostly keep the cameras' own
 # JPEG noise (2026-10-17). The bitrate follows the scene.
 STITCH_QP = int(os.environ.get("AFL_CAM_STITCH_QP", "20"))
+# The 30 fps lock (phone Record tab, default on): the cameras' exposure is
+# capped at 30 ms so the sensor holds 30 fps, and a dim scene is lifted with
+# camera gamma, then shader gain. Off lets exposure run up to this long, so a
+# dim scene is exposed properly (cleaner) at the cost of the frame rate:
+# 40 ms ~26 fps, 66 ms ~17 fps measured on the rig (2026-10-19).
+FPS_LOCK_EXPOSURE_MS = 30
+UNLOCKED_EXPOSURE_MS = int(os.environ.get("AFL_CAM_UNLOCKED_EXPOSURE_MS", "100"))
 # The phone's Quality setting: (QP, Mbps measured on the busy foliage
 # canvas above, 2026-10-17). QP 0 = the old CBR at STITCH_BITRATE_KBPS.
 # The rate is a busy-scene ceiling for the GB/hour the page shows; a grass
