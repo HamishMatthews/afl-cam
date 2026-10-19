@@ -168,12 +168,6 @@ static int g_wbk;                   /* fixed white balance (K), 0 = camera auto 
 static void set_fixed_wb(const char *dev, int fd, int wbk)
 {
     RK_S32 a = -1, t = -1;
-    /* step the temperature away and back: a camera that reads back the
-     * value but still renders on its own auto (2026-10-19: the left half
-     * neutral, the right warm, both reading 5500 K) only re-applies on a
-     * change */
-    set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
-    set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, wbk > 3000 ? wbk - 200 : wbk + 200);
     for (int attempt = 0; attempt < 4; attempt++) {
         set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
         set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, wbk);
@@ -402,8 +396,11 @@ static struct {
     int frames[2], settle[2];
     int settled, changes;
     double med, hi_pct;
-    uint8_t *ov[2];
+    uint8_t *ov[2], *ovu[2], *ovv[2];
     int ov_fresh[2];
+    int wbk[2];                     /* white balance each camera holds (K) */
+    double wb_off;                  /* cam0 - cam1 temperature, the colour trim */
+    int wb_cycles;
     int64_t last_log, last_trim_log;
 } g_vc = { .ev = 100.0, .exp = 100, .cap = 300, .lift = 100, .boost = 1.0, .gain = 1.0,
            .trim = { 1.0, 1.0 } };
@@ -1852,6 +1849,7 @@ static int v4l2_open(cam_t *c) {
             int wbk = wbs ? atoi(wbs) : 5500;
             if (wbk >= 2800 && wbk <= 6500) {
                 g_wbk = wbk;
+                g_vc.wbk[c->idx] = wbk;
                 set_fixed_wb(c->dev, fd, wbk);
             } else {
                 set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
@@ -1901,7 +1899,7 @@ static int v4l2_open(cam_t *c) {
     /* again once streaming: UVC firmware may reset its controls on stream
      * start, and nothing else would notice */
     if (g_wbk)
-        set_fixed_wb(c->dev, fd, g_wbk);
+        set_fixed_wb(c->dev, fd, g_vc.wbk[c->idx]);
     return 0;
 }
 
@@ -2005,7 +2003,9 @@ static void vc_init(void) {
         g_vc.ev = atof(e) * 10.0;
     for (int c = 0; c < 2; c++) {
         g_vc.ov[c] = calloc(g_on > 0 ? (size_t)g_on : 1, 1);
-        if (!g_vc.ov[c]) { fprintf(stderr, "overlap alloc failed\n"); exit(1); }
+        g_vc.ovu[c] = calloc(g_on > 0 ? (size_t)g_on : 1, 1);
+        g_vc.ovv[c] = calloc(g_on > 0 ? (size_t)g_on : 1, 1);
+        if (!g_vc.ov[c] || !g_vc.ovu[c] || !g_vc.ovv[c]) { fprintf(stderr, "overlap alloc failed\n"); exit(1); }
     }
     vc_split();
     vc_apply();
@@ -2025,28 +2025,70 @@ static void vc_meter(MppFrame frame, const int *pts, int n, uint32_t *hist) {
         hist[y[(size_t)pts[2 * i + 1] * hs + pts[2 * i]]]++;
 }
 
-static void vc_overlap(MppFrame frame, const int *pts, uint8_t *out) {
+static void vc_overlap(MppFrame frame, const int *pts, uint8_t *out, uint8_t *ou, uint8_t *ov) {
     MppBuffer buf = mpp_frame_get_buffer(frame);
     if (!buf)
         return;
     const RK_U8 *y = mpp_buffer_get_ptr(buf);
     RK_U32 hs = mpp_frame_get_hor_stride(frame);
-    for (int i = 0; i < g_on; i++)
-        out[i] = y[(size_t)pts[2 * i + 1] * hs + pts[2 * i]];
+    const RK_U8 *uv = y + (size_t)hs * mpp_frame_get_ver_stride(frame);
+    for (int i = 0; i < g_on; i++) {
+        int sx = pts[2 * i], sy = pts[2 * i + 1];
+        out[i] = y[(size_t)sy * hs + sx];
+        const RK_U8 *c = uv + (size_t)(sy / 2) * hs + (sx & ~1);
+        ou[i] = c[0];
+        ov[i] = c[1];
+    }
+}
+
+/* The colour half of the seam trim. One white balance temperature does not
+ * give the two units one colour: on the rig the same 5500 K rendered the
+ * left half neutral and the right warm (2026-10-19, indoors at gamma 300).
+ * So each camera holds its own temperature, split symmetrically around
+ * AFL_CAM_WB_K, steered until the overlap's warmth (V - U) matches. A higher
+ * temperature renders warmer: ~0.014 warmth per K (rig diag, 4000-6500 K). */
+#define VC_WB_TRIM_EVERY 5          /* overlap readings per colour step (~1 s) */
+#define VC_WB_PER_K 0.014
+#define VC_WB_OFF_MAX 2000.0
+static void vc_colour(cam_t *c, double dw) {
+    if (!g_wbk || ++g_vc.wb_cycles % VC_WB_TRIM_EVERY != 0 || fabs(dw) < 1.0)
+        return;
+    /* cam1 warmer (dw > 0): cam0 up, cam1 down; half the gap per step */
+    double st = 0.5 * dw / VC_WB_PER_K;
+    if (st > 200.0) st = 200.0;
+    if (st < -200.0) st = -200.0;
+    g_vc.wb_off += st;
+    if (g_vc.wb_off > VC_WB_OFF_MAX) g_vc.wb_off = VC_WB_OFF_MAX;
+    if (g_vc.wb_off < -VC_WB_OFF_MAX) g_vc.wb_off = -VC_WB_OFF_MAX;
+    int k[2] = { (int)(g_wbk + g_vc.wb_off / 2.0 + 0.5), (int)(g_wbk - g_vc.wb_off / 2.0 + 0.5) };
+    for (int i = 0; i < 2; i++) {
+        if (k[i] < 2800) k[i] = 2800;
+        if (k[i] > 6500) k[i] = 6500;
+    }
+    cam_t *cam[2] = { c->idx == 0 ? c : c->peer, c->idx == 0 ? c->peer : c };
+    for (int i = 0; i < 2; i++)
+        if (k[i] != g_vc.wbk[i]) {
+            g_vc.wbk[i] = k[i];
+            set_ctrl(cam[i]->fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, k[i]);
+        }
 }
 
 /* both cameras' overlap readings in: steer the trim (g_ae_mu held) */
-static void vc_trim(void) {
-    double s0 = 0.0, s1 = 0.0;
+static void vc_trim(cam_t *c) {
+    double s0 = 0.0, s1 = 0.0, w0 = 0.0, w1 = 0.0;
     int n = 0;
     for (int i = 0; i < g_on; i++) {
         int a = g_vc.ov[0][i], b = g_vc.ov[1][i];
         if (a < 32 || b < 32 || a > 230 || b > 230)
             continue;
         s0 += a - 16; s1 += b - 16; n++;
+        /* warmth: V - U, the axis the white balance temperature moves */
+        w0 += g_vc.ovv[0][i] - g_vc.ovu[0][i];
+        w1 += g_vc.ovv[1][i] - g_vc.ovu[1][i];
     }
     if (n < 200)
         return;
+    vc_colour(c, (w1 - w0) / n);
     double want = sqrt(s1 / s0);
     if (want < 0.92) want = 0.92;
     if (want > 1.08) want = 1.08;
@@ -2056,8 +2098,9 @@ static void vc_trim(void) {
     int64_t now = now_us();
     if (now - g_vc.last_trim_log > 10000000) {
         g_vc.last_trim_log = now;
-        fprintf(stderr, "seam trim: overlap %.1f | %.1f over %d points -> %.3f / %.3f\n",
-                s0 / n + 16, s1 / n + 16, n, g_vc.trim[0], g_vc.trim[1]);
+        fprintf(stderr, "seam trim: overlap %.1f | %.1f over %d points -> %.3f / %.3f, "
+                "warmth %.1f | %.1f -> %d K / %d K\n", s0 / n + 16, s1 / n + 16, n,
+                g_vc.trim[0], g_vc.trim[1], w0 / n, w1 / n, g_vc.wbk[0], g_vc.wbk[1]);
     }
 }
 
@@ -2138,17 +2181,16 @@ static void vc_decide(cam_t *c) {
     }
 }
 
-/* the fixed white balance, re-checked on the camera's own thread: a
- * camera drifting back to auto puts a colour step at the seam that no
- * brightness trim can hide */
-static void vc_check_wb(cam_t *c) {
+/* each camera's white balance, re-checked on its own thread: a camera
+ * drifting back to auto puts a colour step at the seam */
+static void vc_check_wb(cam_t *c, int want) {
     RK_S32 a = -1, t = -1;
     get_ctrl(c->fd, V4L2_CID_AUTO_WHITE_BALANCE, &a);
     get_ctrl(c->fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, &t);
-    if (a != 0 || t < g_wbk - 60 || t > g_wbk + 60) {
+    if (a != 0 || t < want - 60 || t > want + 60) {
         fprintf(stderr, "%s: white balance drifted (auto %d, %d K), fixing at %d K\n",
-                c->dev, (int)a, (int)t, g_wbk);
-        set_fixed_wb(c->dev, c->fd, g_wbk);
+                c->dev, (int)a, (int)t, want);
+        set_fixed_wb(c->dev, c->fd, want);
     }
 }
 
@@ -2163,11 +2205,12 @@ static void vc_step(cam_t *c, MppFrame frame) {
     }
     int n = ++g_vc.frames[i];
     int wb_check = g_wbk && ++c->wb_frames % VC_WB_EVERY == 0;
+    int wb_want = g_vc.wbk[i];
     int want_ov = g_on >= 200 && n % VC_TRIM_EVERY == 0 && !g_vc.ov_fresh[i];
     pthread_mutex_unlock(&g_ae_mu);
     /* the frame reads run outside the lock (uncached MPP memory) */
     if (wb_check)
-        vc_check_wb(c);
+        vc_check_wb(c, wb_want);
     uint32_t h[256];
     int metered = n % VC_EVERY == 0;
     if (metered) {
@@ -2175,7 +2218,7 @@ static void vc_step(cam_t *c, MppFrame frame) {
         vc_meter(frame, g_mp[i], g_mn[i], h);
     }
     if (want_ov)
-        vc_overlap(frame, g_op[i], g_vc.ov[i]);
+        vc_overlap(frame, g_op[i], g_vc.ov[i], g_vc.ovu[i], g_vc.ovv[i]);
     pthread_mutex_lock(&g_ae_mu);
     if (metered)
         for (int b = 0; b < 256; b++) g_vc.hist[b] += h[b];
@@ -2183,7 +2226,7 @@ static void vc_step(cam_t *c, MppFrame frame) {
         g_vc.ov_fresh[i] = 1;
     if (i == 0 && c->peer) {
         if (g_vc.ov_fresh[0] && g_vc.ov_fresh[1]) {
-            vc_trim();
+            vc_trim(c);
             g_vc.ov_fresh[0] = g_vc.ov_fresh[1] = 0;
         }
         if (g_vc.frames[0] >= VC_WINDOW && g_vc.frames[1] >= VC_WINDOW)
