@@ -182,16 +182,22 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
 - **Recording files are fdatasync'd every ~2 s by `sync_thread`** (opens the
   live session's files by name, touches no encoder or FILE*), so a power cut
   loses seconds, not the page cache; REC_STOP syncs once more after closing.
-- **White balance is fixed and identical on both cameras** (`AFL_CAM_WB_K`,
-  default 5500 K, 0 = camera auto): on the rig the cameras' own auto WB
-  differed by ~15 in U and V. One temperature is not one colour, though:
-  indoors at gamma 300 the same 5500 K rendered the left half neutral and
-  the right warm (2026-10-19; both cameras do follow the control). So
-  cam2stitch splits the temperature per camera around `AFL_CAM_WB_K` and
-  steers it until the overlap's warmth (V - U) matches (the colour half of
-  the seam trim, logged on the `seam trim:` line), re-checking each
-  camera's value every 300 frames. The dim-light
-  cap (30 ms) is lifted with the camera's brightness then gamma.
+- **White balance (cam2stitch, 2026-10-19)**: both cameras start on their
+  own auto white balance for ~3 s, then go manual at ONE temperature. A
+  manual temperature written before the camera's auto has run on the stream
+  is IGNORED (rig diag: 2800-6500 K all gave the same strongly blue U/V in
+  daylight, until auto had been on once) — that was the "blue picture" and
+  the earlier "one half blue" bugs. The canvas warmth (V - U over mid-tone,
+  low-colour points of the whole canvas) the auto gave is the reference:
+  with `AFL_CAM_WB_K` unset the common temperature follows the light to keep
+  it (slowly, ~0.02 warmth per K); a kelvin value holds that temperature; 0
+  leaves the cameras on their own auto. The units differ: cam1 renders ~6
+  warmer in the overlap at any temperature (and under auto), so the
+  temperature is split per camera, steered until the overlap's warmth
+  matches (logged on the `seam trim:` line; `white balance:` lines log the
+  lock and the follow). Each camera's value is re-checked every 300 frames.
+  The dim-light cap (30 ms) is lifted with the camera's brightness then
+  gamma.
 - **Encoder packet group limit must exceed the rotating buffers** (8 with a
   4-ring): exhaustion makes SPS/PPS header gets fail and packets alias stale
   memory.

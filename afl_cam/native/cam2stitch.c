@@ -163,7 +163,8 @@ static int get_ctrl(int fd, __u32 id, RK_S32 *value)
 /* Fixed white balance, read back: a camera that ignores the write would sit
  * on a different colour from the other one (2026-10-17: the left half of the
  * preview came up blue with no error logged). Retry, and log what it holds. */
-static int g_wbk;                   /* fixed white balance (K), 0 = camera auto */
+static int g_wbk;                   /* white balance start temperature (K), 0 = camera auto */
+static int g_wb_track;              /* follow the light (AFL_CAM_WB_K unset) */
 
 static void set_fixed_wb(const char *dev, int fd, int wbk)
 {
@@ -378,6 +379,7 @@ static volatile float *g_pl;        /* params SSBO, stays mapped: [5]/[6] = gain
 static double g_horizon;            /* AFL_CAM_HORIZON: canvas fraction, field below */
 static int *g_mp[2], g_mn[2];       /* field points per camera: x,y source pairs */
 static int *g_op[2], g_on;          /* overlap points, the same scene point per camera */
+static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
 
 /* The one exposure both cameras run, guarded by g_ae_mu. ev is the exposure
  * wanted (100 us units, continuous, up to the cap); past the cap the camera
@@ -398,12 +400,23 @@ static struct {
     double med, hi_pct;
     uint8_t *ov[2], *ovu[2], *ovv[2];
     int ov_fresh[2];
+    /* white balance: the cameras' own auto runs for the first seconds (a
+     * manual temperature written before that is ignored), then both go
+     * manual at one temperature kc, split by the overlap's colour trim */
+    int wb_phase;                   /* 0 = camera auto warm-up, 1 = manual */
+    int wb_frames, wb_skip, wb_steps;
+    double wb_ref;                  /* canvas warmth under the cameras' auto, NAN = none */
+    double wb_kc;                   /* common temperature (K) */
     int wbk[2];                     /* white balance each camera holds (K) */
     double wb_off;                  /* cam0 - cam1 temperature, the colour trim */
     int wb_cycles;
+    double cw_sum;                  /* canvas warmth, this window */
+    long cw_n;
+    double cw_last;
+    int64_t last_wb_log;
     int64_t last_log, last_trim_log;
 } g_vc = { .ev = 100.0, .exp = 100, .cap = 300, .lift = 100, .boost = 1.0, .gain = 1.0,
-           .trim = { 1.0, 1.0 } };
+           .trim = { 1.0, 1.0 }, .wb_ref = NAN };
 
 /* canvas pixel -> camera c's source pixel through its map; 0 outside it */
 static int vc_src(const float *pf, const float *md, int c, int x, int y, int *sx, int *sy) {
@@ -429,7 +442,8 @@ static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
     for (int c = 0; c < 2; c++) {
         g_mp[c] = malloc(cap * sizeof(int));
         g_op[c] = malloc(cap * sizeof(int));
-        if (!g_mp[c] || !g_op[c]) { fprintf(stderr, "meter alloc failed\n"); exit(1); }
+        g_cp[c] = malloc(cap * sizeof(int));
+        if (!g_mp[c] || !g_op[c] || !g_cp[c]) { fprintf(stderr, "meter alloc failed\n"); exit(1); }
     }
     int row0 = (int)(g_horizon * ch);
     for (int pass = 0; pass < 2; pass++) {
@@ -450,6 +464,20 @@ static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
         fprintf(stderr, "exposure: too little canvas below the horizon, metering it all\n");
         row0 = 0;
     }
+    /* the white balance reads the whole canvas (sky and stands too: the
+     * light's colour, not the grass's) on a coarser grid */
+    g_cn[0] = g_cn[1] = 0;
+    for (int y = VC_STEP; y < ch; y += 2 * VC_STEP)
+        for (int x = VC_STEP; x < cw; x += 2 * VC_STEP) {
+            size_t i = ((size_t)y * cw + x) * 4;
+            int c = wd[1][i] > wd[0][i];
+            int sx, sy;
+            if (wd[c][i] == 0 || !vc_src(pf, md[c], c, x, y, &sx, &sy))
+                continue;
+            g_cp[c][2 * g_cn[c]] = sx;
+            g_cp[c][2 * g_cn[c] + 1] = sy;
+            g_cn[c]++;
+        }
     g_on = 0;
     for (int y = VC_OV_STEP / 2; y < ch; y += VC_OV_STEP)
         for (int x = VC_OV_STEP / 2; x < cw; x += VC_OV_STEP) {
@@ -461,7 +489,8 @@ static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
             g_on++;
         }
     fprintf(stderr, "exposure: field meter %d + %d points below canvas row %d, "
-            "overlap %d points\n", g_mn[0], g_mn[1], row0, g_on);
+            "overlap %d points, colour %d + %d points\n", g_mn[0], g_mn[1], row0, g_on,
+            g_cn[0], g_cn[1]);
 }
 
 static void gpu_init(gpu_t *g, const char *spv_path,
@@ -1840,20 +1869,21 @@ static int v4l2_open(cam_t *c) {
         /* the shared exposure from the first frame: no per-camera auto
          * phase (it left the two at different settings for seconds) */
         set_exposure(fd, V4L2_EXPOSURE_MANUAL, g_vc.exp);
-        /* both cameras on the SAME fixed white balance: on the rig their own
-         * auto white balance disagreed by ~15 in U and V (a visible colour
-         * step at the seam), fixed at one temperature they are within ~3.
-         * AFL_CAM_WB_K = kelvin (2800-6500), 0 = leave the cameras on auto */
+        /* white balance: both cameras start on their own auto, then hold one
+         * manual temperature (vc_wb_step). A manual temperature written
+         * before the camera's auto has run on the stream is ignored and the
+         * picture comes out blue (2026-10-19, rig diag: 2800-6500 K all gave
+         * the same U/V until auto had been on). AFL_CAM_WB_K unset = follow
+         * the light the cameras' auto found; a kelvin value (2800-6500) =
+         * hold that temperature; 0 = leave the cameras on their own auto. */
         {
             const char *wbs = getenv("AFL_CAM_WB_K");
             int wbk = wbs ? atoi(wbs) : 5500;
             if (wbk >= 2800 && wbk <= 6500) {
                 g_wbk = wbk;
-                g_vc.wbk[c->idx] = wbk;
-                set_fixed_wb(c->dev, fd, wbk);
-            } else {
-                set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
+                g_wb_track = !wbs;
             }
+            set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
         }
     }
 
@@ -1896,10 +1926,9 @@ static int v4l2_open(cam_t *c) {
         return -1;
     }
     c->stream_on = 1;
-    /* again once streaming: UVC firmware may reset its controls on stream
-     * start, and nothing else would notice */
+    /* auto again once streaming: the warm-up needs it running on the stream */
     if (g_wbk)
-        set_fixed_wb(c->dev, fd, g_vc.wbk[c->idx]);
+        set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
     return 0;
 }
 
@@ -2041,17 +2070,51 @@ static void vc_overlap(MppFrame frame, const int *pts, uint8_t *out, uint8_t *ou
     }
 }
 
-/* The colour half of the seam trim. One white balance temperature does not
- * give the two units one colour: on the rig the same 5500 K rendered the
- * left half neutral and the right warm (2026-10-19, indoors at gamma 300).
- * So each camera holds its own temperature, split symmetrically around
- * AFL_CAM_WB_K, steered until the overlap's warmth (V - U) matches. A higher
- * temperature renders warmer: ~0.014 warmth per K (rig diag, 4000-6500 K). */
-#define VC_WB_TRIM_EVERY 5          /* overlap readings per colour step (~1 s) */
-#define VC_WB_PER_K 0.014
+/* White balance (g_ae_mu held throughout).
+ *
+ * One temperature on both cameras: kc. The cameras' own auto runs for the
+ * first seconds, and the canvas warmth it gives (V - U over the whole canvas,
+ * mid-tones and low colour only) is the reference kc then holds: kc follows
+ * the light so the canvas keeps that warmth (AFL_CAM_WB_K unset), or stays at
+ * AFL_CAM_WB_K. A higher temperature renders warmer, ~0.02 warmth per K on
+ * the rig (2026-10-19, daylight: 3000 K -40, 5500 K +10, 6500 K +30).
+ *
+ * The two units do not render one temperature the same: cam1 reads ~6
+ * warmer in the overlap at any temperature, and so does their auto. So kc is
+ * split, cam0 = kc + off / 2 and cam1 = kc - off / 2, with off steered until
+ * the overlap's warmth matches (the colour half of the seam trim). */
+#define VC_WB_WARM 60               /* frames on the cameras' auto before the reference */
+#define VC_WB_REF 30                /* frames of reference reading */
+#define VC_WB_TRACK 30              /* frames per follow-the-light step (~1 s) */
+#define VC_WB_TRIM_EVERY 5          /* overlap readings per split step (~1 s) */
+#define VC_WB_PER_K 0.02
 #define VC_WB_OFF_MAX 2000.0
+
+static void vc_wb_apply(cam_t *c) {
+    double lo = 2800.0 + fabs(g_vc.wb_off) / 2.0, hi = 6500.0 - fabs(g_vc.wb_off) / 2.0;
+    if (g_vc.wb_kc < lo) g_vc.wb_kc = lo;
+    if (g_vc.wb_kc > hi) g_vc.wb_kc = hi;
+    int k[2] = { (int)(g_vc.wb_kc + g_vc.wb_off / 2.0 + 0.5),
+                 (int)(g_vc.wb_kc - g_vc.wb_off / 2.0 + 0.5) };
+    cam_t *cam[2] = { c->idx == 0 ? c : c->peer, c->idx == 0 ? c->peer : c };
+    int changed = 0;
+    for (int i = 0; i < 2; i++) {
+        if (k[i] < 2800) k[i] = 2800;
+        if (k[i] > 6500) k[i] = 6500;
+        if (k[i] != g_vc.wbk[i]) {
+            g_vc.wbk[i] = k[i];
+            set_ctrl(cam[i]->fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, k[i]);
+            changed = 1;
+        }
+    }
+    if (changed)                    /* readings from before the change show */
+        g_vc.wb_skip = VC_SETTLE;
+}
+
+/* the colour split, from one overlap reading: dw = cam1 - cam0 warmth */
 static void vc_colour(cam_t *c, double dw) {
-    if (!g_wbk || ++g_vc.wb_cycles % VC_WB_TRIM_EVERY != 0 || fabs(dw) < 1.0)
+    if (!g_wbk || g_vc.wb_phase != 1 || g_vc.wb_skip > 0 ||
+        ++g_vc.wb_cycles % VC_WB_TRIM_EVERY != 0 || fabs(dw) < 1.0)
         return;
     /* cam1 warmer (dw > 0): cam0 up, cam1 down; half the gap per step */
     double st = 0.5 * dw / VC_WB_PER_K;
@@ -2060,17 +2123,96 @@ static void vc_colour(cam_t *c, double dw) {
     g_vc.wb_off += st;
     if (g_vc.wb_off > VC_WB_OFF_MAX) g_vc.wb_off = VC_WB_OFF_MAX;
     if (g_vc.wb_off < -VC_WB_OFF_MAX) g_vc.wb_off = -VC_WB_OFF_MAX;
-    int k[2] = { (int)(g_wbk + g_vc.wb_off / 2.0 + 0.5), (int)(g_wbk - g_vc.wb_off / 2.0 + 0.5) };
-    for (int i = 0; i < 2; i++) {
-        if (k[i] < 2800) k[i] = 2800;
-        if (k[i] > 6500) k[i] = 6500;
+    vc_wb_apply(c);
+}
+
+/* this camera's colour points: warmth (V - U) summed over mid-tone,
+ * low-colour points (saturated jerseys, sky and signage say little about
+ * the light) */
+static void vc_cmeter(MppFrame frame, const int *pts, int n, double *sum, long *cnt) {
+    MppBuffer buf = mpp_frame_get_buffer(frame);
+    if (!buf)
+        return;
+    const RK_U8 *y = mpp_buffer_get_ptr(buf);
+    RK_U32 hs = mpp_frame_get_hor_stride(frame);
+    const RK_U8 *uv = y + (size_t)hs * mpp_frame_get_ver_stride(frame);
+    for (int i = 0; i < n; i++) {
+        int sx = pts[2 * i], sy = pts[2 * i + 1];
+        int l = y[(size_t)sy * hs + sx];
+        if (l < 40 || l > 220)
+            continue;
+        const RK_U8 *p = uv + (size_t)(sy / 2) * hs + (sx & ~1);
+        int du = p[0] - 128, dv = p[1] - 128;
+        if (abs(du) + abs(dv) > 60)
+            continue;
+        *sum += dv - du;
+        (*cnt)++;
     }
-    cam_t *cam[2] = { c->idx == 0 ? c : c->peer, c->idx == 0 ? c->peer : c };
-    for (int i = 0; i < 2; i++)
-        if (k[i] != g_vc.wbk[i]) {
-            g_vc.wbk[i] = k[i];
-            set_ctrl(cam[i]->fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, k[i]);
+}
+
+/* once per camera-0 frame */
+static void vc_wb_step(cam_t *c) {
+    if (!g_wbk)
+        return;
+    if (g_vc.wb_skip > 0) {
+        g_vc.wb_skip--;
+        g_vc.cw_sum = 0.0;
+        g_vc.cw_n = 0;
+        return;
+    }
+    int f = ++g_vc.wb_frames;
+    if (g_vc.wb_phase == 0) {
+        if (f == VC_WB_WARM) {
+            g_vc.cw_sum = 0.0;
+            g_vc.cw_n = 0;
         }
+        if (f < VC_WB_WARM + VC_WB_REF)
+            return;
+        /* the cameras' auto has settled: take its canvas warmth, go manual */
+        g_vc.wb_ref = g_vc.cw_n >= 500 ? g_vc.cw_sum / g_vc.cw_n : NAN;
+        g_vc.wb_kc = g_wbk;
+        cam_t *cam[2] = { c->idx == 0 ? c : c->peer, c->idx == 0 ? c->peer : c };
+        for (int i = 0; i < 2; i++) {
+            set_ctrl(cam[i]->fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
+            g_vc.wbk[i] = 0;        /* vc_wb_apply writes the temperature */
+        }
+        g_vc.wb_phase = 1;
+        vc_wb_apply(c);
+        fprintf(stderr, "white balance: the cameras' auto gave canvas warmth %.1f over %ld "
+                "points; manual at %d K, %s\n", g_vc.wb_ref, g_vc.cw_n, g_wbk,
+                g_wb_track && !isnan(g_vc.wb_ref) ? "following the light" : "held");
+        g_vc.wb_frames = 0;
+        g_vc.cw_sum = 0.0;
+        g_vc.cw_n = 0;
+        return;
+    }
+    if (f % VC_WB_TRACK != 0)
+        return;
+    double w = g_vc.cw_n >= 500 ? g_vc.cw_sum / g_vc.cw_n : NAN;
+    g_vc.cw_sum = 0.0;
+    g_vc.cw_n = 0;
+    if (isnan(w))
+        return;
+    g_vc.cw_last = w;
+    if (g_wb_track && !isnan(g_vc.wb_ref)) {
+        double err = g_vc.wb_ref - w;   /* > 0: too cool, warm it */
+        if (fabs(err) > 1.0) {
+            /* the first step after auto goes most of the way; then slowly,
+             * so a passing jersey or cloud does not swing the colour */
+            double gain = g_vc.wb_steps++ == 0 ? 0.7 : 0.3;
+            double st = gain * err / VC_WB_PER_K;
+            if (st > 300.0) st = 300.0;
+            if (st < -300.0) st = -300.0;
+            g_vc.wb_kc += st;
+            vc_wb_apply(c);
+        }
+    }
+    int64_t now = now_us();
+    if (now - g_vc.last_wb_log > 10000000) {
+        g_vc.last_wb_log = now;
+        fprintf(stderr, "white balance: canvas warmth %.1f (reference %.1f) -> %.0f K, "
+                "%d K / %d K\n", w, g_vc.wb_ref, g_vc.wb_kc, g_vc.wbk[0], g_vc.wbk[1]);
+    }
 }
 
 /* both cameras' overlap readings in: steer the trim (g_ae_mu held) */
@@ -2204,8 +2346,9 @@ static void vc_step(cam_t *c, MppFrame frame) {
         return;
     }
     int n = ++g_vc.frames[i];
-    int wb_check = g_wbk && ++c->wb_frames % VC_WB_EVERY == 0;
+    int wb_check = g_wbk && g_vc.wb_phase == 1 && ++c->wb_frames % VC_WB_EVERY == 0;
     int wb_want = g_vc.wbk[i];
+    int want_col = g_wbk && n % (2 * VC_EVERY) == 0;
     int want_ov = g_on >= 200 && n % VC_TRIM_EVERY == 0 && !g_vc.ov_fresh[i];
     pthread_mutex_unlock(&g_ae_mu);
     /* the frame reads run outside the lock (uncached MPP memory) */
@@ -2219,12 +2362,21 @@ static void vc_step(cam_t *c, MppFrame frame) {
     }
     if (want_ov)
         vc_overlap(frame, g_op[i], g_vc.ov[i], g_vc.ovu[i], g_vc.ovv[i]);
+    double cs = 0.0;
+    long cn = 0;
+    if (want_col)
+        vc_cmeter(frame, g_cp[i], g_cn[i], &cs, &cn);
     pthread_mutex_lock(&g_ae_mu);
     if (metered)
         for (int b = 0; b < 256; b++) g_vc.hist[b] += h[b];
+    if (want_col) {
+        g_vc.cw_sum += cs;
+        g_vc.cw_n += cn;
+    }
     if (want_ov)
         g_vc.ov_fresh[i] = 1;
     if (i == 0 && c->peer) {
+        vc_wb_step(c);
         if (g_vc.ov_fresh[0] && g_vc.ov_fresh[1]) {
             vc_trim(c);
             g_vc.ov_fresh[0] = g_vc.ov_fresh[1] = 0;
@@ -2488,12 +2640,13 @@ static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
     snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
              "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f,\"u\":%.1f,\"v\":%.1f,"
              "\"exp_ms\":%.1f,\"gamma\":%d,\"gain\":%.3f,\"field_med\":%.0f,\"field_clip_pct\":%.2f,"
-             "\"ae_settled\":%s,\"ae_changes\":%d",
+             "\"ae_settled\":%s,\"ae_changes\":%d,\"wb_k\":%d,\"wb_auto\":%s",
              c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
              c->ts_gap, c->seq_lost, c->luma_last, c->u_last, c->v_last,
              (c->exposure > 0 ? c->exposure : g_vc.exp) / 10.0, g_vc.lift,
              g_pl ? g_pl[5 + c->idx] : 1.0, g_vc.med, g_vc.hi_pct,
-             g_vc.settled ? "true" : "false", g_vc.changes);
+             g_vc.settled ? "true" : "false", g_vc.changes, g_vc.wbk[c->idx],
+             g_wbk && g_vc.wb_phase == 1 ? "false" : "true");
     return buf;
 }
 
@@ -2503,7 +2656,7 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
                         int skipped_start, int64_t skew_sum, int64_t skew_n) {
     if (!c)
         return;
-    char tbuf0[256], tbuf1[256];
+    char tbuf0[512], tbuf1[512];
     pthread_mutex_lock(&c->mu);
     c->rec_bytes = w->rec_bytes;
     int64_t elapsed = c->recording ? now_us() - c->rec_start_us : 0;
