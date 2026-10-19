@@ -169,7 +169,7 @@ STITCH_BITRATE_KBPS = int(os.environ.get("AFL_CAM_STITCH_BITRATE_KBPS", "80000")
 STITCH_QP = int(os.environ.get("AFL_CAM_STITCH_QP", "20"))
 # The 30 fps lock (phone Record tab, default on): the cameras' exposure is
 # capped at 30 ms so the sensor holds 30 fps, and a dim scene is lifted with
-# brightness/gamma instead. Off lets exposure run up to this long, so a dim
+# camera gamma, then the stitch shader gain, instead. Off lets exposure run up to this long, so a dim
 # scene is exposed properly (cleaner, brighter) at the cost of the frame rate.
 FPS_LOCK_EXPOSURE_MS = 30
 UNLOCKED_EXPOSURE_MS = int(os.environ.get("AFL_CAM_UNLOCKED_EXPOSURE_MS", "100"))
