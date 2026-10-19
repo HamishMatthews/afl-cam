@@ -163,9 +163,17 @@ static int get_ctrl(int fd, __u32 id, RK_S32 *value)
 /* Fixed white balance, read back: a camera that ignores the write would sit
  * on a different colour from the other one (2026-10-17: the left half of the
  * preview came up blue with no error logged). Retry, and log what it holds. */
+static int g_wbk;                   /* fixed white balance (K), 0 = camera auto */
+
 static void set_fixed_wb(const char *dev, int fd, int wbk)
 {
     RK_S32 a = -1, t = -1;
+    /* step the temperature away and back: a camera that reads back the
+     * value but still renders on its own auto (2026-10-19: the left half
+     * neutral, the right warm, both reading 5500 K) only re-applies on a
+     * change */
+    set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
+    set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, wbk > 3000 ? wbk - 200 : wbk + 200);
     for (int attempt = 0; attempt < 4; attempt++) {
         set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
         set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, wbk);
@@ -1762,6 +1770,7 @@ typedef struct cam_s {
     const char *dev;
     int idx;                    /* 0 = left, 1 = right */
     struct cam_s *peer;         /* the other camera (joint exposure) */
+    int wb_frames;              /* frames since the last white balance check */
     int fd;
     v4l2_buf_t bufs[V4L2_BUFS];
     uint32_t n_v4l2;
@@ -1842,6 +1851,7 @@ static int v4l2_open(cam_t *c) {
             const char *wbs = getenv("AFL_CAM_WB_K");
             int wbk = wbs ? atoi(wbs) : 5500;
             if (wbk >= 2800 && wbk <= 6500) {
+                g_wbk = wbk;
                 set_fixed_wb(c->dev, fd, wbk);
             } else {
                 set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
@@ -1888,6 +1898,10 @@ static int v4l2_open(cam_t *c) {
         return -1;
     }
     c->stream_on = 1;
+    /* again once streaming: UVC firmware may reset its controls on stream
+     * start, and nothing else would notice */
+    if (g_wbk)
+        set_fixed_wb(c->dev, fd, g_wbk);
     return 0;
 }
 
@@ -1950,6 +1964,7 @@ static int dec_init(cam_t *c) {
 #define VC_WINDOW 15                /* frames per decision (~0.5 s) */
 #define VC_SETTLE 6                 /* frames an exposure change takes to show */
 #define VC_TRIM_EVERY 6
+#define VC_WB_EVERY 300            /* frames between white balance checks */
 #define VC_GAMMA 2.2                /* encoded luma ~ light^(1 / 2.2) */
 #define VC_LIFT_MAX 300
 #define VC_MAX_BOOST 2.0
@@ -2123,6 +2138,20 @@ static void vc_decide(cam_t *c) {
     }
 }
 
+/* the fixed white balance, re-checked on the camera's own thread: a
+ * camera drifting back to auto puts a colour step at the seam that no
+ * brightness trim can hide */
+static void vc_check_wb(cam_t *c) {
+    RK_S32 a = -1, t = -1;
+    get_ctrl(c->fd, V4L2_CID_AUTO_WHITE_BALANCE, &a);
+    get_ctrl(c->fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, &t);
+    if (a != 0 || t < g_wbk - 60 || t > g_wbk + 60) {
+        fprintf(stderr, "%s: white balance drifted (auto %d, %d K), fixing at %d K\n",
+                c->dev, (int)a, (int)t, g_wbk);
+        set_fixed_wb(c->dev, c->fd, g_wbk);
+    }
+}
+
 /* per decoded frame, on each camera's own thread */
 static void vc_step(cam_t *c, MppFrame frame) {
     int i = c->idx;
@@ -2133,9 +2162,12 @@ static void vc_step(cam_t *c, MppFrame frame) {
         return;
     }
     int n = ++g_vc.frames[i];
+    int wb_check = g_wbk && ++c->wb_frames % VC_WB_EVERY == 0;
     int want_ov = g_on >= 200 && n % VC_TRIM_EVERY == 0 && !g_vc.ov_fresh[i];
     pthread_mutex_unlock(&g_ae_mu);
     /* the frame reads run outside the lock (uncached MPP memory) */
+    if (wb_check)
+        vc_check_wb(c);
     uint32_t h[256];
     int metered = n % VC_EVERY == 0;
     if (metered) {

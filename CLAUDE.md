@@ -184,7 +184,10 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   loses seconds, not the page cache; REC_STOP syncs once more after closing.
 - **White balance is fixed and identical on both cameras** (`AFL_CAM_WB_K`,
   default 5500 K, 0 = camera auto): on the rig the cameras' own auto WB
-  differed by ~15 in U and V, fixed at one temperature by ~3. The dim-light
+  differed by ~15 in U and V, fixed at one temperature by ~3. A camera can
+  read back the fixed value yet render on its own auto (2026-10-19: left half
+  neutral, right warm), so cam2stitch steps the temperature away and back,
+  re-applies it after STREAMON and re-checks it every 300 frames. The dim-light
   cap (30 ms) is lifted with the camera's brightness then gamma.
 - **Encoder packet group limit must exceed the rotating buffers** (8 with a
   4-ring): exhaustion makes SPS/PPS header gets fail and packets alias stale
