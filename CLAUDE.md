@@ -59,8 +59,9 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   files while recording.
 - `afl_cam/native/stitch_nv12.comp` (+ `.spv`) — map-texture shader, BT.601
   limited (jpegd outputs Y 16–235 exactly, `RANGE_FULL=0`), 4-Y-bytes-per-uint
-  SSBO packing; per-camera exposure gain from params.bin [5..6] (set by
-  seam_refine, 0 = 1.0). Rebuild the .spv with `glslangValidator -V
+  SSBO packing; per-camera gain at params [5..6]. Live, cam2stitch writes
+  it (shader gain x seam trim) into the mapped params buffer; params.bin's
+  stored value is only used by -src and the offline paths. Rebuild the .spv with `glslangValidator -V
   stitch_nv12.comp -o stitch_nv12.spv` (byte-reproducible).
 - `afl_cam/native/cam2h264.c` — per-camera recorder (separate mode).
 - `afl_cam/daemon.py` — afl-camd (stdlib only): supervises cam2stitch
@@ -236,12 +237,23 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   cross-correlation with a sub-pixel peak (2026-10-12): the old phase
   correlation of gradient energy UNDER-read small shifts ~2× (a 2 px ghost
   read 1.0 px), so older "~0.5 px" figures are optimistic.
-- **Exposure**: the cameras' auto-exposure picks the sensor rate (dim scene =
-  ~50 ms exposure = 20 fps); manual exposure without light records BLACK
-  frames (no V4L2 gain control exists, only brightness and gamma, which
-  cam2stitch uses to lift the picture at the 30 ms cap). The recorder's "auto-settle-then-lock"
-  checks mean frame interval. Never assume fps limits from time-of-day — the
-  pipeline capacity is ~30 fps at full canvas when light allows.
+- **Exposure (cam2stitch, 2026-10-19)**: one virtual camera. Both cameras
+  run the SAME manual exposure and gamma from the first frame (no camera
+  auto phase), brightness 0, fixed WB. The meter is a canvas-space grid over
+  the field (below `AFL_CAM_HORIZON`, which the daemon passes from the
+  framing guides), read from whichever camera renders each point: the field
+  median goes to `AFL_CAM_TARGET_LUMA` (120), held above 1% field clipping,
+  pulled down above 2%; the sky may clip. Brighter = exposure up to the cap
+  (`AFL_CAM_AE_CAP_MS`, default 30), then camera gamma to 300, then up to 2x
+  shader gain; darker in reverse. Exposure snaps to 10 ms steps above 10 ms
+  (`AFL_CAM_FLICKER_HZ`, 50; 0 = off). A slow overlap trim (+-8%) matches
+  the two units. Measured: no analog gain exists in manual mode (no XU
+  control changes the image), the brightness control is a pure offset
+  (blacks 63 at 64), gamma 300 lifts a dark field 2 -> 23 with blacks 1 ->
+  10, and the two units differ ~1% unlifted, ~5% at gamma 300. Never assume
+  fps limits from time-of-day: exposure past 33 ms drops the sensor rate
+  (40 ms ~26 fps, 66 ms ~17-20 fps). cam2h264 (separate mode) still runs its
+  own per-camera auto-settle-then-lock.
 - **Camera discovery** (`config.py`): the cameras carry IDENTICAL USB
   descriptors (serial `01.00.00`, same mfr/firmware — descriptor blobs
   verified byte-identical, 2026-10-09), so identity = the PHYSICALLY

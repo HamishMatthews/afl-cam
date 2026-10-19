@@ -250,6 +250,10 @@ class StitchSupervisor(threading.Thread):
             "AFL_CAM_STITCH_BITRATE_KBPS": str(STITCH_BITRATE_KBPS),
             "AFL_CAM_STITCH_QP": str(self.daemon.stitch_qp),
         })
+        # the exposure meters the field: canvas rows below the horizon guide
+        guides = framing.framing(params_dir)
+        if guides and guides.get("horizon") is not None:
+            env["AFL_CAM_HORIZON"] = f"{guides['horizon']:.4f}"
         cmd = [
             str(STITCH_RECORDER_BIN),
             cams["cam0"], cams["cam1"],
@@ -259,7 +263,7 @@ class StitchSupervisor(threading.Thread):
             str(RESOLUTION["width"]),
             str(RESOLUTION["height"]),
             str(RESOLUTION["fps"]),
-            "0",                          # exposure: auto-settle-then-lock
+            "0",                          # exposure: the shared field meter
             "0",                          # wall_sec: no deadline
             str(STITCH_SHADER),
         ]
