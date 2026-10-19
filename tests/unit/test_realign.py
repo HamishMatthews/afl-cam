@@ -178,3 +178,20 @@ def test_alignment_is_locked_by_default_and_the_lock_persists(cam_daemon, tmp_pa
         assert d.CamDaemon().align_locked is True
     finally:
         fresh.db.close()
+
+
+def test_fps_lock_is_on_by_default_and_persists(cam_daemon):
+    fresh = d.CamDaemon()
+    try:
+        assert fresh.fps_lock is True
+        assert fresh.set_fps_lock("no")[0] is False
+        fresh.state = "recording"
+        assert fresh.set_fps_lock(False)[0] is False     # not while recording
+        fresh.state = "standby"
+        assert fresh.set_fps_lock(False) == (True, "")
+        assert d._load_settings()["fps_lock"] is False
+        assert d.CamDaemon().fps_lock is False           # survives a restart
+        assert fresh.set_fps_lock(True) == (True, "")
+        assert d.CamDaemon().fps_lock is True
+    finally:
+        fresh.db.close()
