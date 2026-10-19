@@ -442,6 +442,11 @@
         <span class="info" tabindex="0" role="button" aria-label="About quality">i<span class="tip">Lower QP keeps more detail and uses more storage. GB per hour is the most a busy scene uses, and a grass field uses less. The bitrate chip in Health shows the real rate while recording.</span></span></label>
       <select class="field" id="quality" style="width:100%"></select>
     </div>
+    <div class="row" id="fps-lock-row">
+      <label class="lab" for="fps-lock">30 fps lock
+        <span class="info" tabindex="0" role="button" aria-label="About the 30 fps lock">i<span class="tip">On holds 30 frames a second by capping exposure at 30 ms and lifting a dim scene instead. Off lets exposure run longer, so a dim scene is exposed properly and looks cleaner, but the frame rate drops as the light falls.</span></span></label>
+      <input type="checkbox" id="fps-lock" checked>
+    </div>
   </section>
 
   <section id="sched" class="card" data-view="record">
@@ -599,6 +604,7 @@ function applyStatus(s) {
   applyMode(s);
   applyCrop(s);
   applyQuality(s);
+  applyFpsLock(s);
   applyRestitch(s.restitch);
   const lr = s.last_recording;
   $("st-last").innerHTML = lr
@@ -816,7 +822,7 @@ function pvPipelineText() {
 let pvKey = null;
 function pvWatchConfig(s) {
   const key = (s.mode || "live") + "|" + !!(s.crop && s.crop.enabled) + "|" + !!(s.crop && s.crop.active)
-            + "|" + (s.quality ? s.quality.qp : "");
+            + "|" + (s.quality ? s.quality.qp : "") + "|" + s.fps_lock;
   if (pvKey !== null && key !== pvKey) {
     pv.hold = Date.now() + 2500;
     previewAttempt();
@@ -1424,6 +1430,23 @@ $("quality").addEventListener("change", async e => {
   else if (S) S.quality = {...S.quality, qp};
   e.target.blur();
   if (S) applyQuality(S);
+});
+
+/* ---------- 30 fps lock (exposure cap) ---------- */
+function applyFpsLock(s) {
+  const box = $("fps-lock");
+  $("fps-lock-row").style.display = (s.mode || "live") === "live" ? "" : "none";
+  if (document.activeElement !== box) box.checked = s.fps_lock !== false;
+  box.disabled = !!(s.recording || s.state === "finalizing" || s.state === "realigning");
+}
+$("fps-lock").addEventListener("change", async e => {
+  const locked = e.target.checked;
+  const r = await fetch("/api/fps-lock", {method: "POST",
+    headers: {"Content-Type": "application/json", ...AUTH}, body: JSON.stringify({locked})});
+  const j = await r.json();
+  if (!j.ok) { flashHint(j.error || "Could not change the 30 fps lock"); e.target.checked = !locked; }
+  else if (S) S.fps_lock = locked;
+  e.target.blur();
 });
 
 /* ---------- re-stitch (separate-mode sessions) ---------- */

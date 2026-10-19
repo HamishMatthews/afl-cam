@@ -55,6 +55,7 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -83,9 +84,9 @@
     fprintf(stderr, "VK error %d at %s:%d\n", r_, __FILE__, __LINE__); exit(1); } } while (0)
 
 static volatile int g_running = 1;
-/* mean luma the exposure loop holds both cameras at (BT.601 limited range,
- * 16-235); AFL_CAM_TARGET_LUMA overrides */
-static double g_target_luma = 130.0;
+/* field median luma the exposure loop aims at (BT.601 limited range,
+ * 16-235): mid-grey grass; AFL_CAM_TARGET_LUMA overrides */
+static double g_target_luma = 120.0;
 
 static void cma_print(const char *tag) {
     FILE *f = fopen("/proc/meminfo", "r");
@@ -362,6 +363,102 @@ static void create_plane(VkDevice dev, VkPhysicalDeviceMemoryProperties *mprops,
     CHECK(vkCreateImageView(dev, &ivci, NULL, &pl->iv));
 }
 
+/* ===================== exposure: meter geometry =====================
+ * The meter samples a fixed grid in CANVAS space, so every part of the field
+ * counts by its area in the final video whichever camera renders it. Each
+ * point is read from the camera that renders it (the larger blend weight),
+ * through the warp map, in that camera's decoded frame. Points above the
+ * horizon (sky, stands, trees) are not metered. The overlap points are the
+ * same scene points read from BOTH cameras, for the seam trim. */
+#define VC_STEP 16                  /* canvas grid for the field meter */
+#define VC_OV_STEP 8                /* canvas grid for the overlap trim */
+static volatile float *g_pl;        /* params SSBO, stays mapped: [5]/[6] = gains */
+static double g_horizon;            /* AFL_CAM_HORIZON: canvas fraction, field below */
+static int *g_mp[2], g_mn[2];       /* field points per camera: x,y source pairs */
+static int *g_op[2], g_on;          /* overlap points, the same scene point per camera */
+
+/* The one exposure both cameras run, guarded by g_ae_mu. ev is the exposure
+ * wanted (100 us units, continuous, up to the cap); past the cap the camera
+ * gamma (lift) and then a shader gain (boost) brighten further. */
+static pthread_mutex_t g_ae_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    double ev;                      /* light wanted, 100 us units */
+    RK_S32 exp;                     /* exposure applied to both cameras */
+    RK_S32 cap;                     /* AFL_CAM_AE_CAP_MS */
+    RK_S32 half;                    /* mains half-cycle (100 us), 0 = no flicker guard */
+    int lift;                       /* camera gamma 100..300, both cameras */
+    double boost;                   /* shader gain past the full lift, 1..2 */
+    double gain;                    /* shader gain: flicker fill x boost */
+    double trim[2];                 /* per-camera overlap trim, trim0 * trim1 = 1 */
+    uint32_t hist[256];             /* field luma, both cameras, this window */
+    int frames[2], settle[2];
+    int settled, changes;
+    double med, hi_pct;
+    uint8_t *ov[2];
+    int ov_fresh[2];
+    int64_t last_log, last_trim_log;
+} g_vc = { .ev = 100.0, .exp = 100, .cap = 300, .lift = 100, .boost = 1.0, .gain = 1.0,
+           .trim = { 1.0, 1.0 } };
+
+/* canvas pixel -> camera c's source pixel through its map; 0 outside it */
+static int vc_src(const float *pf, const float *md, int c, int x, int y, int *sx, int *sy) {
+    int base = 8 + c * 28;
+    int mx = x - (int)pf[base + 11], my = y - (int)pf[base + 12];
+    int mw = (int)pf[base + 13], mh = (int)pf[base + 14];
+    if (mx < 0 || my < 0 || mx >= mw || my >= mh)
+        return 0;
+    const float *m = md + ((size_t)my * mw + mx) * 2;
+    if (m[0] < 1.0f || m[1] < 1.0f || m[0] >= pf[2] - 2.0f || m[1] >= pf[3] - 2.0f)
+        return 0;
+    *sx = (int)m[0];
+    *sy = (int)m[1];
+    return 1;
+}
+
+static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
+                     const float *m0d, const float *m1d) {
+    int cw = (int)pf[0], ch = (int)pf[1];
+    const float *md[2] = { m0d, m1d };
+    const uint8_t *wd[2] = { w0d, w1d };
+    size_t cap = (size_t)(cw / VC_OV_STEP + 1) * (ch / VC_OV_STEP + 1) * 2;
+    for (int c = 0; c < 2; c++) {
+        g_mp[c] = malloc(cap * sizeof(int));
+        g_op[c] = malloc(cap * sizeof(int));
+        if (!g_mp[c] || !g_op[c]) { fprintf(stderr, "meter alloc failed\n"); exit(1); }
+    }
+    int row0 = (int)(g_horizon * ch);
+    for (int pass = 0; pass < 2; pass++) {
+        g_mn[0] = g_mn[1] = 0;
+        for (int y = row0 + VC_STEP / 2; y < ch; y += VC_STEP)
+            for (int x = VC_STEP / 2; x < cw; x += VC_STEP) {
+                size_t i = ((size_t)y * cw + x) * 4;     /* RGBA8 weights, R used */
+                int c = wd[1][i] > wd[0][i];
+                int sx, sy;
+                if (wd[c][i] == 0 || !vc_src(pf, md[c], c, x, y, &sx, &sy))
+                    continue;
+                g_mp[c][2 * g_mn[c]] = sx;
+                g_mp[c][2 * g_mn[c] + 1] = sy;
+                g_mn[c]++;
+            }
+        if (g_mn[0] + g_mn[1] >= 500 || row0 == 0)
+            break;
+        fprintf(stderr, "exposure: too little canvas below the horizon, metering it all\n");
+        row0 = 0;
+    }
+    g_on = 0;
+    for (int y = VC_OV_STEP / 2; y < ch; y += VC_OV_STEP)
+        for (int x = VC_OV_STEP / 2; x < cw; x += VC_OV_STEP) {
+            int s0x, s0y, s1x, s1y;
+            if (!vc_src(pf, m0d, 0, x, y, &s0x, &s0y) || !vc_src(pf, m1d, 1, x, y, &s1x, &s1y))
+                continue;
+            g_op[0][2 * g_on] = s0x; g_op[0][2 * g_on + 1] = s0y;
+            g_op[1][2 * g_on] = s1x; g_op[1][2 * g_on + 1] = s1y;
+            g_on++;
+        }
+    fprintf(stderr, "exposure: field meter %d + %d points below canvas row %d, "
+            "overlap %d points\n", g_mn[0], g_mn[1], row0, g_on);
+}
+
 static void gpu_init(gpu_t *g, const char *spv_path,
                      void *params_data, void *w0d, void *w1d,
                      void *m0d, void *m1d) {
@@ -527,7 +624,9 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     void *pmap;
     CHECK(vkMapMemory(g->dev, pbmem, 0, pbci.size, 0, &pmap));
     memcpy(pmap, params_data, pbci.size);
-    vkUnmapMemory(g->dev, pbmem);
+    g_pl = (volatile float *)pmap;      /* stays mapped: live exposure gain */
+    vc_build(pf, (const uint8_t *)w0d, (const uint8_t *)w1d,
+             (const float *)m0d, (const float *)m1d);
 
     /* ---- command pool + per-slot resources + pre-recorded cbs ---- */
     VkCommandPoolCreateInfo cpc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -1690,22 +1789,6 @@ typedef struct cam_s {
     int seq_lost;               /* V4L2 sequence numbers skipped by the driver */
     volatile double luma_last;  /* mean Y of a sampled frame (every 30th) */
     volatile double u_last, v_last;  /* mean U/V of the same frame */
-    int cap_bright, cap_gamma;  /* dim-light lift at the exposure cap */
-    /* after the lock, exposure keeps following the light (exposure_track):
-     * time first (up to the 30 ms cap), then the brightness/gamma lift */
-    int ae_lift;                /* 0..64 brightness, 65..264 gamma 101..300 */
-    int ae_settle, ae_frames;   /* frames to skip after a change / counter */
-    double ae_acc;
-    int ae_n, ae_changes;
-    int64_t ae_last_log;
-    /* exposure state machine (cam2h264.c) */
-    int lock_pending, lock_phase, refine_left, refine_rounds;
-    double target_luma, luma_acc;
-    int luma_n;
-    int64_t prev_pts;
-    int64_t dt_sum;
-    int dt_n;
-    RK_S32 lock_exp;
     /* recording-time live preview: raw-JPEG snapshot path + pacing */
     char preview_path[512];
     int64_t snap_interval_us;
@@ -1740,17 +1823,17 @@ static int v4l2_open(cam_t *c) {
     if (c->exposure > 0) {
         set_exposure(fd, V4L2_EXPOSURE_MANUAL, c->exposure);
     } else {
-        /* this camera's auto mode is menu value 3 (cam2h264.c); also drop
-         * any brightness/gamma lift an earlier run left in the camera */
+        /* no lift in the camera: the brightness control is an offset that
+         * greys the blacks before JPEG; past the cap, gain is the shader's */
         set_ctrl(fd, V4L2_CID_BRIGHTNESS, 0);
         set_ctrl(fd, V4L2_CID_GAMMA, 100);
-        c->cap_bright = 0;
-        c->cap_gamma = 100;
         /* backlight compensation lifts the shadows: on the balcony view it
          * held blacks at ~40 with 4-5% of the frame clipped; off, blacks sit
          * at ~28 with ~2% clipped (2026-10-17) */
         set_ctrl(fd, V4L2_CID_BACKLIGHT_COMPENSATION, 0);
-        set_exposure(fd, 3, 0);
+        /* the shared exposure from the first frame: no per-camera auto
+         * phase (it left the two at different settings for seconds) */
+        set_exposure(fd, V4L2_EXPOSURE_MANUAL, g_vc.exp);
         /* both cameras on the SAME fixed white balance: on the rig their own
          * auto white balance disagreed by ~15 in U and V (a visible colour
          * step at the seam), fixed at one temperature they are within ~3.
@@ -1834,261 +1917,247 @@ static int dec_init(cam_t *c) {
     return ret;
 }
 
-/* After the start-up lock the light still changes (cloud, sun, a move from
- * the shed to the ground): keep the mean luma near the target. Brighter:
- * drop the dim-light lift first, then shorten the exposure. Darker: lengthen
- * the exposure up to the 30 ms cap (the frame rate), then lift. Steps are
- * small and spaced (~0.7 s) so a recording sees a gradual change, except
- * when the picture is clipping, where they are coarse to recover fast. */
-#define AE_CAP 300              /* 30 ms: longer drops the sensor below 30 fps */
-#define AE_WINDOW 15            /* frames measured per decision */
-#define AE_SETTLE 6             /* frames a control change takes to show */
-static void ae_apply_lift(cam_t *c, int lift) {
-    if (lift < 0) lift = 0;
-    if (lift > 264) lift = 264;
-    int bright = lift < 64 ? lift : 64;
-    int gamma = lift > 64 ? 100 + (lift - 64) : 100;
-    if (bright != c->cap_bright) {
-        c->cap_bright = bright;
-        set_ctrl(c->fd, V4L2_CID_BRIGHTNESS, bright);
+/* ===================== exposure: one virtual camera =====================
+ * The two cameras are identical units: at the same exposure, brightness,
+ * gamma and white balance they match within ~1% over the overlap
+ * (2026-10-19, on the rig). So the seam is made by giving both the SAME
+ * settings, always, from the first frame. The camera's brightness stays 0
+ * (it is an offset that greys the blacks before JPEG).
+ *
+ * What brightness to aim for comes from the FIELD as it lands in the
+ * stitched canvas (vc_build), not from either camera's frame: the field's
+ * median luma goes to the target, unless more than 2% of the field is
+ * clipping (white lines and a few jerseys may), which pulls it down. The sky is free to
+ * clip. Control is in exposure units through the camera's ~2.2 transfer
+ * curve: slow once settled (~0.25 stop/s, so a recording sees fades, not
+ * pumping), fast only when far off (wake, a cloud, a walk outside).
+ *
+ * Brighter, in order: exposure time up to the cap (AFL_CAM_AE_CAP_MS, the
+ * frame rate's limit); then the camera's gamma, the same on both, a curve
+ * applied before 8-bit and JPEG (in the dark at 30 ms, gamma 300 took the
+ * field median 2 -> 23 with blacks 1 -> 10, where the brightness control
+ * only adds an offset: blacks 63 at brightness 64); then up to 2x shader
+ * gain on both cameras alike (params [5]/[6]). Darker undoes it in reverse.
+ * Above one mains half-cycle the exposure snaps to whole half-cycles
+ * (AFL_CAM_FLICKER_HZ, default 50) so floodlights don't band; the shader
+ * gain fills the difference.
+ *
+ * A slow trim over the overlap absorbs the units' ~1% difference: the same
+ * scene points read from both cameras, only where neither clips, clamped to
+ * +-8% (the pair differs ~1% at no lift, ~5% at gamma 300 in the dark),
+ * trim0 * trim1 = 1 so it never moves overall brightness. */
+#define VC_EVERY 3                  /* meter every 3rd frame per camera */
+#define VC_WINDOW 15                /* frames per decision (~0.5 s) */
+#define VC_SETTLE 6                 /* frames an exposure change takes to show */
+#define VC_TRIM_EVERY 6
+#define VC_GAMMA 2.2                /* encoded luma ~ light^(1 / 2.2) */
+#define VC_LIFT_MAX 300
+#define VC_MAX_BOOST 2.0
+
+static void vc_apply(void) {
+    if (g_pl) {
+        g_pl[5] = (float)(g_vc.gain * g_vc.trim[0]);
+        g_pl[6] = (float)(g_vc.gain * g_vc.trim[1]);
     }
-    if (gamma != c->cap_gamma) {
-        c->cap_gamma = gamma;
-        set_ctrl(c->fd, V4L2_CID_GAMMA, gamma);
-    }
-    c->ae_lift = lift;
 }
 
-/* The two cameras are metered as ONE camera: left and right see different
- * halves of the scene, so metering each against the same luma gave them
- * different exposures and a brightness step at the seam. Now cam0's thread
- * decides from the mean of both cameras' meters (highlights protected: either
- * camera clipping counts) and applies the SAME exposure and lift to both.
- * The two sensors' own sensitivity difference is left to the seam gain. */
-static pthread_mutex_t g_ae_mu = PTHREAD_MUTEX_INITIALIZER;
-static double g_ae_meas[2] = { -1.0, -1.0 };   /* latest window mean per camera */
-static int g_ae_synced;
-
-static void ae_share(cam_t *c, cam_t *p) {
-    if (p->lock_exp != c->lock_exp) {
-        p->lock_exp = c->lock_exp;
-        set_exposure(p->fd, V4L2_EXPOSURE_MANUAL, p->lock_exp);
-    }
-    ae_apply_lift(p, c->ae_lift);
-    p->ae_settle = AE_SETTLE;
-    p->ae_frames = 0; p->ae_acc = 0.0; p->ae_n = 0;
-    g_ae_meas[p->idx] = -1.0;
+/* ev -> the exposure both cameras get; the shader gain fills a flicker snap */
+static void vc_split(void) {
+    if (g_vc.ev < 3.0) g_vc.ev = 3.0;
+    if (g_vc.ev > g_vc.cap) g_vc.ev = g_vc.cap;
+    RK_S32 e = (RK_S32)(g_vc.ev + 0.5);
+    if (g_vc.half && e >= g_vc.half)
+        e = e / g_vc.half * g_vc.half;
+    g_vc.exp = e;
+    if (g_vc.boost < 1.0) g_vc.boost = 1.0;
+    if (g_vc.boost > VC_MAX_BOOST) g_vc.boost = VC_MAX_BOOST;
+    g_vc.gain = pow(g_vc.ev / e, 1.0 / VC_GAMMA) * g_vc.boost;
 }
 
-static void exposure_track_locked(cam_t *c, MppFrame dec_frame) {
-    if (c->ae_settle > 0) {
-        c->ae_settle--;
+/* gamma units for a wanted brightness change r: ~60 per doubling */
+static int vc_lift_step(double r) {
+    int st = (int)(60.0 * log2(r) + 0.5);
+    return st < 2 ? 2 : st > 40 ? 40 : st;
+}
+
+static void vc_init(void) {
+    const char *e;
+    if ((e = getenv("AFL_CAM_AE_CAP_MS")) && atof(e) >= 1.0)
+        g_vc.cap = (RK_S32)(atof(e) * 10.0 + 0.5);
+    int hz = (e = getenv("AFL_CAM_FLICKER_HZ")) ? atoi(e) : 50;
+    g_vc.half = hz > 0 ? (RK_S32)(10000.0 / (2.0 * hz) + 0.5) : 0;
+    if ((e = getenv("AFL_CAM_EXP_SEED_MS")) && atof(e) > 0.0)
+        g_vc.ev = atof(e) * 10.0;
+    for (int c = 0; c < 2; c++) {
+        g_vc.ov[c] = calloc(g_on > 0 ? (size_t)g_on : 1, 1);
+        if (!g_vc.ov[c]) { fprintf(stderr, "overlap alloc failed\n"); exit(1); }
+    }
+    vc_split();
+    vc_apply();
+    fprintf(stderr, "exposure: one virtual camera, field median target %.0f, "
+            "start %.1f ms, cap %.1f ms, flicker guard %d Hz\n", g_target_luma,
+            g_vc.exp / 10.0, g_vc.cap / 10.0, g_vc.half ? hz : 0);
+}
+
+/* this camera's field points into a luma histogram */
+static void vc_meter(MppFrame frame, const int *pts, int n, uint32_t *hist) {
+    MppBuffer buf = mpp_frame_get_buffer(frame);
+    if (!buf)
         return;
-    }
-    /* sparse sample (16 px grid) through MPP's uncached mapping */
-    if (++c->ae_frames % 3 == 0) {
-        double l = frame_luma_step(dec_frame, 16);
-        if (l >= 0) { c->ae_acc += l; c->ae_n++; }
-    }
-    if (c->ae_frames < AE_WINDOW || c->ae_n == 0)
+    const RK_U8 *y = mpp_buffer_get_ptr(buf);
+    RK_U32 hs = mpp_frame_get_hor_stride(frame);
+    for (int i = 0; i < n; i++)
+        hist[y[(size_t)pts[2 * i + 1] * hs + pts[2 * i]]]++;
+}
+
+static void vc_overlap(MppFrame frame, const int *pts, uint8_t *out) {
+    MppBuffer buf = mpp_frame_get_buffer(frame);
+    if (!buf)
         return;
-    double meas = c->ae_acc / c->ae_n;
-    c->ae_frames = 0; c->ae_acc = 0.0; c->ae_n = 0;
-    cam_t *p = c->peer;
-    g_ae_meas[c->idx] = meas;
-    int clipping = meas >= 225.0;
-    if (p) {
-        if (c->idx != 0 || g_ae_meas[1] < 0.0)
-            return;             /* cam0 decides, once cam1 has a fresh meter */
-        if (!g_ae_synced) {     /* first joint decision: both start from cam0's */
-            g_ae_synced = 1;
-            ae_share(c, p);
-            c->ae_settle = AE_SETTLE;
-            return;
-        }
-        double m1 = g_ae_meas[1];
-        clipping = meas >= 225.0 || m1 >= 225.0;
-        meas = 0.5 * (meas + m1);
+    const RK_U8 *y = mpp_buffer_get_ptr(buf);
+    RK_U32 hs = mpp_frame_get_hor_stride(frame);
+    for (int i = 0; i < g_on; i++)
+        out[i] = y[(size_t)pts[2 * i + 1] * hs + pts[2 * i]];
+}
+
+/* both cameras' overlap readings in: steer the trim (g_ae_mu held) */
+static void vc_trim(void) {
+    double s0 = 0.0, s1 = 0.0;
+    int n = 0;
+    for (int i = 0; i < g_on; i++) {
+        int a = g_vc.ov[0][i], b = g_vc.ov[1][i];
+        if (a < 32 || b < 32 || a > 230 || b > 230)
+            continue;
+        s0 += a - 16; s1 += b - 16; n++;
     }
-    double target = c->target_luma;
-    if (!clipping && meas > target * 0.94 && meas < target * 1.06)
+    if (n < 200)
         return;
-    /* far off (a big change of light): larger steps */
-    int far = meas < target * 0.5 || meas > target * 1.5;
-    int exp0 = c->lock_exp, lift0 = c->ae_lift;
-    double err = target - meas;
-    if (err > 0) {
-        if (c->lock_exp < AE_CAP) {
-            double r = meas > 1.0 ? target / meas : 2.0;
-            double rmax = far ? 1.5 : 1.15;
-            if (r > rmax) r = rmax;
-            int e = (int)(c->lock_exp * r + 0.5);
-            if (e <= c->lock_exp) e = c->lock_exp + 1;
-            c->lock_exp = e > AE_CAP ? AE_CAP : e;
-        } else {
-            int step = c->ae_lift < 64 ? (int)(err / 1.2) : (int)(err / 0.3);
-            int lim = c->ae_lift < 64 ? 12 : 30;
-            if (step < 1) step = 1;
-            if (step > lim) step = lim;
-            ae_apply_lift(c, c->ae_lift + step);
-        }
-    } else if (c->ae_lift > 0) {
-        if (clipping) {
-            ae_apply_lift(c, c->ae_lift > 64 ? 64 : 0);
-        } else {
-            int step = c->ae_lift > 64 ? (int)(-err / 0.3) : (int)(-err / 1.2);
-            int lim = c->ae_lift > 64 ? 30 : 12;
-            if (step < 1) step = 1;
-            if (step > lim) step = lim;
-            ae_apply_lift(c, c->ae_lift - step);
-        }
-    } else {
-        double r = clipping ? 0.5 : target / meas;
-        double rmin = far ? 0.67 : 0.85;
-        if (r < rmin && !clipping) r = rmin;
-        int e = (int)(c->lock_exp * r + 0.5);
-        if (e >= c->lock_exp) e = c->lock_exp - 1;
-        c->lock_exp = e < 3 ? 3 : e;
-    }
-    if (c->lock_exp != exp0)
-        set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
-    if (c->lock_exp == exp0 && c->ae_lift == lift0)
-        return;
-    c->ae_settle = AE_SETTLE;
-    c->ae_changes++;
-    if (p) {
-        ae_share(c, p);
-        p->ae_changes++;
-    }
+    double want = sqrt(s1 / s0);
+    if (want < 0.92) want = 0.92;
+    if (want > 1.08) want = 1.08;
+    g_vc.trim[0] += 0.1 * (want - g_vc.trim[0]);
+    g_vc.trim[1] = 1.0 / g_vc.trim[0];
+    vc_apply();
     int64_t now = now_us();
-    if (now - c->ae_last_log > 5000000) {
-        c->ae_last_log = now;
-        fprintf(stderr, "%s: exposure: luma %.0f (target %.0f) -> %.1fms, "
-                "brightness %d gamma %d\n", c->dev, meas, target,
-                c->lock_exp / 10.0, c->cap_bright, c->cap_gamma);
+    if (now - g_vc.last_trim_log > 10000000) {
+        g_vc.last_trim_log = now;
+        fprintf(stderr, "seam trim: overlap %.1f | %.1f over %d points -> %.3f / %.3f\n",
+                s0 / n + 16, s1 / n + 16, n, g_vc.trim[0], g_vc.trim[1]);
     }
 }
 
-static void exposure_track(cam_t *c, MppFrame dec_frame) {
+/* a window of both cameras' field histograms in: one decision (g_ae_mu held) */
+static void vc_decide(cam_t *c) {
+    uint64_t tot = 0, acc = 0, hi = 0;
+    int raw = 0;
+    for (int b = 0; b < 256; b++) tot += g_vc.hist[b];
+    for (int b = 0; b < 256 && acc * 2 < tot; b++) { acc += g_vc.hist[b]; raw = b; }
+    /* the meter reads the cameras; the video has the shader gain on top */
+    int clip_from = 16 + (int)(217.0 / g_vc.gain);
+    for (int b = clip_from < 255 ? clip_from : 255; b < 256; b++) hi += g_vc.hist[b];
+    memset(g_vc.hist, 0, sizeof g_vc.hist);
+    g_vc.frames[0] = g_vc.frames[1] = 0;
+    if (tot < 100)
+        return;
+    double med = 16.0 + (raw - 16.0) * g_vc.gain;
+    g_vc.med = med;
+    g_vc.hi_pct = 100.0 * (double)hi / (double)tot;
+    /* wanted change of the encoded luma above black. White lines and a few
+     * jerseys may clip; more than that is a field over-exposed */
+    double r = (g_target_luma - 16.0) / (med > 17.0 ? med - 16.0 : 1.0);
+    if (g_vc.hi_pct > 2.0 && r > 0.97)
+        r = 0.97;                   /* field highlights clipping: come down */
+    else if (g_vc.hi_pct > 1.0 && r > 1.0)
+        r = 1.0;                    /* close to clipping: hold */
+    if (r > 1.0 / 1.06 && r < 1.06) {
+        if (!g_vc.settled)
+            fprintf(stderr, "exposure: settled, field median %.0f, field clipping %.2f%% "
+                    "-> %.1f ms, gamma %d, gain %.2f\n", med, g_vc.hi_pct, g_vc.exp / 10.0,
+                    g_vc.lift, g_vc.gain);
+        g_vc.settled = 1;
+        return;
+    }
+    /* fast on wake, when far off, or with the field heavily clipped (a
+     * clipped median under-reads how far over it is) */
+    double lim = (!g_vc.settled || fabs(log2(r)) > 0.5 || g_vc.hi_pct > 5.0) ? 1.3 : 1.04;
+    if (r > lim) r = lim;
+    if (r < 1.0 / lim) r = 1.0 / lim;
+    RK_S32 e0 = g_vc.exp;
+    int l0 = g_vc.lift;
+    if (r > 1.0) {                  /* exposure, then lift, then boost */
+        if (g_vc.ev < g_vc.cap)
+            g_vc.ev *= pow(r, VC_GAMMA);
+        else if (g_vc.lift < VC_LIFT_MAX)
+            g_vc.lift += vc_lift_step(r);
+        else
+            g_vc.boost *= r;
+    } else {                        /* and back down in reverse */
+        if (g_vc.boost > 1.0)
+            g_vc.boost *= r;
+        else if (g_vc.lift > 100)
+            g_vc.lift -= vc_lift_step(1.0 / r);
+        else
+            g_vc.ev *= pow(r, VC_GAMMA);
+    }
+    if (g_vc.lift > VC_LIFT_MAX) g_vc.lift = VC_LIFT_MAX;
+    if (g_vc.lift < 100) g_vc.lift = 100;
+    vc_split();
+    vc_apply();
+    if (g_vc.exp != e0) {
+        set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, g_vc.exp);
+        set_exposure(c->peer->fd, V4L2_EXPOSURE_MANUAL, g_vc.exp);
+    }
+    if (g_vc.lift != l0) {
+        set_ctrl(c->fd, V4L2_CID_GAMMA, g_vc.lift);
+        set_ctrl(c->peer->fd, V4L2_CID_GAMMA, g_vc.lift);
+    }
+    if (g_vc.exp != e0 || g_vc.lift != l0)
+        g_vc.settle[0] = g_vc.settle[1] = VC_SETTLE;
+    g_vc.changes++;
+    int64_t now = now_us();
+    if (now - g_vc.last_log > 5000000) {
+        g_vc.last_log = now;
+        fprintf(stderr, "exposure: field median %.0f (target %.0f), field clipping %.2f%% "
+                "-> %.1f ms, gamma %d, gain %.2f\n", med, g_target_luma, g_vc.hi_pct,
+                g_vc.exp / 10.0, g_vc.lift, g_vc.gain);
+    }
+}
+
+/* per decoded frame, on each camera's own thread */
+static void vc_step(cam_t *c, MppFrame frame) {
+    int i = c->idx;
     pthread_mutex_lock(&g_ae_mu);
-    exposure_track_locked(c, dec_frame);
+    if (g_vc.settle[i] > 0) {
+        g_vc.settle[i]--;
+        pthread_mutex_unlock(&g_ae_mu);
+        return;
+    }
+    int n = ++g_vc.frames[i];
+    int want_ov = g_on >= 200 && n % VC_TRIM_EVERY == 0 && !g_vc.ov_fresh[i];
     pthread_mutex_unlock(&g_ae_mu);
-}
-
-/* per-frame exposure state machine — ported verbatim from cam2h264.c */
-static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
-    if (!c->lock_pending) {
-        if (c->exposure <= 0)
-            exposure_track(c, dec_frame);
-        return;
+    /* the frame reads run outside the lock (uncached MPP memory) */
+    uint32_t h[256];
+    int metered = n % VC_EVERY == 0;
+    if (metered) {
+        memset(h, 0, sizeof h);
+        vc_meter(frame, g_mp[i], g_mn[i], h);
     }
-    if (c->prev_pts > 0 && pts_us > c->prev_pts) {
-        c->dt_sum += pts_us - c->prev_pts;
-        c->dt_n++;
+    if (want_ov)
+        vc_overlap(frame, g_op[i], g_vc.ov[i]);
+    pthread_mutex_lock(&g_ae_mu);
+    if (metered)
+        for (int b = 0; b < 256; b++) g_vc.hist[b] += h[b];
+    if (want_ov)
+        g_vc.ov_fresh[i] = 1;
+    if (i == 0 && c->peer) {
+        if (g_vc.ov_fresh[0] && g_vc.ov_fresh[1]) {
+            vc_trim();
+            g_vc.ov_fresh[0] = g_vc.ov_fresh[1] = 0;
+        }
+        if (g_vc.frames[0] >= VC_WINDOW && g_vc.frames[1] >= VC_WINDOW)
+            vc_decide(c);
     }
-    c->prev_pts = pts_us;
-    double l = frame_luma(dec_frame);
-    if (l < 0)
-        return;
-    if (c->lock_phase == 0) {
-        if (c->count >= 60) { c->luma_acc += l; c->luma_n++; }
-        if (c->count >= 119) {
-            /* both cameras aim at the same luma (the seam stays even);
-             * what auto gave is only used for the starting exposure */
-            double auto_luma = c->luma_n ? c->luma_acc / c->luma_n : 64.0;
-            c->target_luma = g_target_luma;
-            if (c->dt_n > 0 && (c->dt_sum / c->dt_n) > 33333) {
-                /* frame rate first: auto wants a longer exposure than one
-                 * 30 fps frame, which drops the sensor to ~20 fps. Cap at
-                 * 30ms (image is darker, rate holds near 28 fps). */
-                c->lock_exp = 300;
-                set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
-                /* manual exposure drops the camera's own boost, so the
-                 * picture goes much darker than auto: lift it with the
-                 * camera's brightness (then gamma) until the mean luma
-                 * is back near what auto gave (phase 2) */
-                c->lock_phase = 2;
-                c->refine_left = 40;
-                c->refine_rounds = 0;
-                c->cap_bright = 0;
-                c->cap_gamma = 100;
-                c->luma_acc = 0.0; c->luma_n = 0;
-                fprintf(stderr, "%s: exposure: auto needs %.1fms (>33ms) — "
-                        "capped at 30ms to hold the frame rate, lifting "
-                        "brightness to luma %.0f (auto gave %.0f)\n",
-                        c->dev, (c->dt_sum / c->dt_n) / 1000.0, c->target_luma,
-                        auto_luma);
-            } else {
-                if (c->dt_n > 0) {
-                    c->lock_exp = (RK_S32)((c->dt_sum / c->dt_n) / 100);
-                    if (c->lock_exp < 30) c->lock_exp = 30;
-                    if (c->lock_exp > 330) c->lock_exp = 330;
-                }
-                set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
-                c->lock_phase = 1;
-                c->refine_left = 30;
-                c->luma_acc = 0.0; c->luma_n = 0;
-                fprintf(stderr, "%s: exposure: auto settled at luma %.0f -> manual %d (%dms), refining to luma %.0f...\n",
-                        c->dev, auto_luma, c->lock_exp, c->lock_exp / 10, c->target_luma);
-            }
-        }
-    } else if (c->lock_phase == 2) {
-        /* the control change takes a few frames: measure the last 15 of 40 */
-        if (--c->refine_left <= 15) { c->luma_acc += l; c->luma_n++; }
-        if (c->refine_left == 0) {
-            double meas = c->luma_n ? c->luma_acc / c->luma_n : c->target_luma;
-            double err = c->target_luma - meas;
-            /* too bright with no lift to take off: exposure_track
-             * shortens the exposure from here */
-            int done = (err < 0.12 * c->target_luma + 2.0 && err > -0.12 * c->target_luma - 2.0)
-                       || (err < 0 && c->cap_bright == 0 && c->cap_gamma <= 100)
-                       || ++c->refine_rounds >= 8;
-            if (done) {
-                c->lock_pending = 0;
-                c->ae_lift = c->cap_bright + (c->cap_gamma > 100 ? c->cap_gamma - 100 : 0);
-                fprintf(stderr, "%s: exposure: capped at 30ms, brightness %d gamma %d, "
-                        "luma %.0f (target %.0f)\n", c->dev, c->cap_bright,
-                        c->cap_gamma, meas, c->target_luma);
-            } else {
-                if (err > 0 && c->cap_bright >= 64) {
-                    c->cap_gamma += (int)(err / 0.3);
-                    if (c->cap_gamma > 300) c->cap_gamma = 300;
-                    set_ctrl(c->fd, V4L2_CID_GAMMA, c->cap_gamma);
-                } else {
-                    int step = (int)(err / 1.2);
-                    if (step > 24) step = 24;
-                    if (step < -24) step = -24;
-                    c->cap_bright += step;
-                    if (c->cap_bright > 64) c->cap_bright = 64;
-                    if (c->cap_bright < 0) c->cap_bright = 0;
-                    set_ctrl(c->fd, V4L2_CID_BRIGHTNESS, c->cap_bright);
-                }
-                c->refine_left = 40;
-                c->luma_acc = 0.0; c->luma_n = 0;
-            }
-        }
-    } else {
-        c->luma_acc += l; c->luma_n++;
-        if (--c->refine_left == 0) {
-            double meas = c->luma_n ? c->luma_acc / c->luma_n : c->target_luma;
-            double ratio = meas > 1.0 ? c->target_luma / meas : 1.0;
-            if (ratio < 0.8) ratio = 0.8;
-            if (ratio > 1.25) ratio = 1.25;
-            c->lock_exp = (RK_S32)(c->lock_exp * ratio + 0.5);
-            if (c->lock_exp < 30) c->lock_exp = 30;
-            if (c->lock_exp > 330) c->lock_exp = 330;
-            set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
-            c->luma_acc = 0.0; c->luma_n = 0;
-            int converged = (ratio > 0.9 && ratio < 1.11);
-            if (++c->refine_rounds >= 5 || converged) {
-                c->lock_pending = 0;
-                fprintf(stderr, "%s: exposure: locked at %d (%dms)\n",
-                        c->dev, c->lock_exp, c->lock_exp / 10);
-            } else {
-                c->refine_left = 30;
-            }
-        }
-    }
+    pthread_mutex_unlock(&g_ae_mu);
 }
 
 static void *capture_thread(void *arg) {
@@ -2244,7 +2313,8 @@ static void *capture_thread(void *arg) {
                 c->v_last = cv;
             }
         }
-        exposure_step(c, dec_frame, pts_us);
+        if (c->exposure <= 0)
+            vc_step(c, dec_frame);
         ring_push(&c->ring, idx, pts_us);
     }
     pthread_mutex_lock(&c->ring.mu);
@@ -2342,10 +2412,13 @@ static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
     double dt = c->ts_dt_n > 0 ? (double)c->ts_dt_sum / c->ts_dt_n / 1000.0 : 0.0;
     snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
              "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f,\"u\":%.1f,\"v\":%.1f,"
-             "\"exp_ms\":%.1f,\"bright\":%d,\"gamma\":%d,\"ae_changes\":%d",
+             "\"exp_ms\":%.1f,\"gamma\":%d,\"gain\":%.3f,\"field_med\":%.0f,\"field_clip_pct\":%.2f,"
+             "\"ae_settled\":%s,\"ae_changes\":%d",
              c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
              c->ts_gap, c->seq_lost, c->luma_last, c->u_last, c->v_last,
-             c->lock_exp / 10.0, c->cap_bright, c->cap_gamma, c->ae_changes);
+             (c->exposure > 0 ? c->exposure : g_vc.exp) / 10.0, g_vc.lift,
+             g_pl ? g_pl[5 + c->idx] : 1.0, g_vc.med, g_vc.hi_pct,
+             g_vc.settled ? "true" : "false", g_vc.changes);
     return buf;
 }
 
@@ -2744,6 +2817,11 @@ int main(int argc, char **argv) {
         if (t >= 40.0 && t <= 200.0)
             g_target_luma = t;
     }
+    if (getenv("AFL_CAM_HORIZON")) {
+        double hz = atof(getenv("AFL_CAM_HORIZON"));
+        if (hz > 0.0 && hz < 0.95)
+            g_horizon = hz;
+    }
     RK_S32 wall_sec = argc > 10 ? atoi(argv[10]) : 0;
     const char *spv_path = argc > 11 ? argv[11] : "afl_cam/native/stitch_nv12.spv";
 
@@ -2774,14 +2852,14 @@ int main(int argc, char **argv) {
     if (!tight) { fprintf(stderr, "tight alloc failed\n"); return 1; }
 
     /* ---- cameras ---- */
+    if (exposure <= 0)
+        vc_init();
     cam_t cams[2] = {0};
     cams[0].dev = dev0; cams[1].dev = dev1;
     for (int i = 0; i < 2; i++) {
         cam_t *c = &cams[i];
         c->idx = i; c->peer = &cams[1 - i];
         c->width = width; c->height = height; c->fps = fps; c->exposure = exposure;
-        c->lock_pending = (exposure <= 0);
-        c->lock_exp = 166;
         /* live preview: <outdir>/cam<i>_preview.jpg every AFL_CAM_PREVIEW_SECS
          * (or AFL_CAM_PREVIEW_DIR when set — daemon mode has no outdir yet) */
         if (snap_dir && *snap_dir)

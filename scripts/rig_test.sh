@@ -16,6 +16,9 @@
 # Needs: the sudoers rule in deploy/rig-runner.md (systemctl stop/start
 # afl-camd without a password) and uv.
 set -euo pipefail
+# a runner started outside a login shell (e.g. restarted by hand) may not
+# have uv's install dirs on PATH
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 
 TREE=$(realpath "${1:?usage: rig_test.sh <tree> [pytest args]}"); shift
 RIG_HOME=${AFL_CAM_RIG_HOME:-/home/hamish/Documents/afl-cam}
