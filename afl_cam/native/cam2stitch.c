@@ -373,7 +373,8 @@ static void create_plane(VkDevice dev, VkPhysicalDeviceMemoryProperties *mprops,
 static volatile float *g_pl;           /* live params mapping */
 static int *g_ov_pts[2];               /* x,y source pixel pairs per camera */
 static int g_ov_n;
-static double g_ov_mean[2] = { -1.0, -1.0 };
+static uint8_t *g_ov_val[2];           /* latest luma at the points */
+static int g_ov_fresh[2];
 static double g_lg[2] = { 1.0, 1.0 };
 static int g_ov_frames[2];
 
@@ -412,6 +413,8 @@ static void ov_build(const float *pf, const float *m0d, const float *m1d) {
             n++;
         }
     g_ov_n = n;
+    for (int c = 0; c < 2; c++)
+        g_ov_val[c] = calloc(n ? n : 1, 1);
     fprintf(stderr, "seam gain: %d overlap sample points\n", n);
 }
 
@@ -2031,29 +2034,25 @@ static void exposure_track(cam_t *c, MppFrame dec_frame) {
     pthread_mutex_unlock(&g_ae_mu);
 }
 
-/* Mean luma of this camera over the shared overlap points. */
-static double ov_luma(const int *pts, MppFrame frame) {
+/* This camera's luma at each shared overlap point (0 = off the frame). */
+static int ov_sample(uint8_t *out, const int *pts, MppFrame frame) {
     MppBuffer buf = mpp_frame_get_buffer(frame);
     if (!buf || g_ov_n <= 0)
-        return -1.0;
+        return 0;
     RK_U8 *y = (RK_U8 *)mpp_buffer_get_ptr(buf);
     RK_U32 hs = mpp_frame_get_hor_stride(frame);
     RK_U32 w = mpp_frame_get_width(frame), h = mpp_frame_get_height(frame);
-    RK_U64 sum = 0;
-    RK_U32 n = 0;
     for (int i = 0; i < g_ov_n; i++) {
         RK_U32 x = (RK_U32)pts[2 * i], yy = (RK_U32)pts[2 * i + 1];
-        if (x >= w || yy >= h)
-            continue;
-        sum += y[yy * hs + x];
-        n++;
+        out[i] = (x < w && yy < h) ? y[yy * hs + x] : 0;
     }
-    return n ? (double)sum / n : -1.0;
+    return 1;
 }
 
-/* Both cameras' overlap means in, cam0's thread steers the gains so the two
- * match: g0*m0 == g1*m1 with g0*g1 == 1 (overall brightness is the joint
- * meter's job). Eased and clamped; a clipped or dark overlap is ignored. */
+/* Both cameras' overlap readings in, cam0's thread steers the gains so the
+ * two match: g0*m0 == g1*m1 with g0*g1 == 1 (overall brightness is the joint
+ * meter's job). Only points where BOTH cameras read 16-235 count, so clipped
+ * highlights and crushed shadows can't pull the gain. Eased and clamped. */
 static void overlap_balance(cam_t *c, MppFrame dec_frame) {
     static int off = -1;
     if (off < 0) {
@@ -2064,13 +2063,20 @@ static void overlap_balance(cam_t *c, MppFrame dec_frame) {
         return;
     if (++g_ov_frames[c->idx] % 6)
         return;
-    double m = ov_luma(g_ov_pts[c->idx], dec_frame);
     pthread_mutex_lock(&g_ae_mu);
-    g_ov_mean[c->idx] = m;
-    if (c->idx == 0 && g_ov_mean[0] >= 0.0 && g_ov_mean[1] >= 0.0) {
-        double m0 = g_ov_mean[0], m1 = g_ov_mean[1];
-        g_ov_mean[0] = g_ov_mean[1] = -1.0;
-        if (m0 > 20.0 && m1 > 20.0 && m0 < 232.0 && m1 < 232.0) {
+    g_ov_fresh[c->idx] = ov_sample(g_ov_val[c->idx], g_ov_pts[c->idx], dec_frame);
+    if (c->idx == 0 && g_ov_fresh[0] && g_ov_fresh[1]) {
+        g_ov_fresh[0] = g_ov_fresh[1] = 0;
+        double s0 = 0.0, s1 = 0.0;
+        int n = 0;
+        for (int i = 0; i < g_ov_n; i++) {
+            int a = g_ov_val[0][i], b = g_ov_val[1][i];
+            if (a < 16 || a > 235 || b < 16 || b > 235)
+                continue;
+            s0 += a; s1 += b; n++;
+        }
+        double m0 = n ? s0 / n : 0.0, m1 = n ? s1 / n : 0.0;
+        if (n >= 200 && m0 > 20.0 && m1 > 20.0) {
             double r = sqrt(m1 / m0);               /* wanted g0 (g1 = 1/g0) */
             if (r < 0.8) r = 0.8;
             if (r > 1.25) r = 1.25;
@@ -2085,11 +2091,31 @@ static void overlap_balance(cam_t *c, MppFrame dec_frame) {
                 int64_t now = now_us();
                 if (now - last > 5000000) {
                     last = now;
-                    fprintf(stderr, "seam gain: overlap luma %.1f | %.1f -> "
-                            "gain %.3f / %.3f\n", m0, m1, g_lg[0], g_lg[1]);
+                    fprintf(stderr, "seam gain: overlap luma %.1f | %.1f (%d pts) -> "
+                            "gain %.3f / %.3f\n", m0, m1, n, g_lg[0], g_lg[1]);
                 }
             }
         }
+    }
+    pthread_mutex_unlock(&g_ae_mu);
+}
+
+/* Each camera runs its own start-up lock, so they finish on different
+ * exposures and lifts (one saw more of a bright window). When the second one
+ * finishes, put cam1 on cam0's settings at once, instead of leaving a visible
+ * seam step until the joint tracker's first decision. */
+static void ae_lock_done(cam_t *c) {
+    cam_t *p = c->peer;
+    if (!p || p->lock_pending)
+        return;
+    pthread_mutex_lock(&g_ae_mu);
+    if (!g_ae_synced) {
+        g_ae_synced = 1;
+        cam_t *c0 = c->idx == 0 ? c : p;
+        ae_share(c0, c0->peer);
+        c0->ae_settle = AE_SETTLE;
+        fprintf(stderr, "exposure: both cameras locked, cam1 set to cam0's "
+                "%.1fms lift %d\n", c0->lock_exp / 10.0, c0->ae_lift);
     }
     pthread_mutex_unlock(&g_ae_mu);
 }
@@ -2166,6 +2192,7 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
             if (done) {
                 c->lock_pending = 0;
                 c->ae_lift = c->cap_bright + (c->cap_gamma > 100 ? c->cap_gamma - 100 : 0);
+                ae_lock_done(c);
                 fprintf(stderr, "%s: exposure: capped at 30ms, brightness %d gamma %d, "
                         "luma %.0f (target %.0f)\n", c->dev, c->cap_bright,
                         c->cap_gamma, meas, c->target_luma);
@@ -2202,6 +2229,7 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
             int converged = (ratio > 0.9 && ratio < 1.11);
             if (++c->refine_rounds >= 5 || converged) {
                 c->lock_pending = 0;
+                ae_lock_done(c);
                 fprintf(stderr, "%s: exposure: locked at %d (%dms)\n",
                         c->dev, c->lock_exp, c->lock_exp / 10);
             } else {
