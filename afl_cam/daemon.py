@@ -41,6 +41,7 @@ Endpoints (default port 80, AFL_CAM_PORT overrides)::
     GET  /api/selftest              pre-game checks (cameras, alignment, …)
     GET  /api/framing               seam + horizon positions for the preview
     POST /api/mode                  {"mode": "live"|"separate"} (not while recording)
+    POST /api/fps-lock              {"locked": bool} — hold 30 fps (exposure capped at 30 ms) or let it fall in dim light
     POST /api/quality               {"qp": 16..24 | 0 = CBR} live-stitch quality (not while recording)
     POST /api/recordings/<id>/stitch   re-stitch a separate-mode session
     GET  /api/live/cam0.jpg|cam1.jpg   separate-mode recording snapshots
@@ -87,6 +88,7 @@ from .config import (
     ALIGN_PYTHON, ALIGN_SCRIPT, AUDIO_DEVICES, CAMERAS, DB_PATH,
     ENCODE_CODEC, EXPOSURE_TIME, NATIVE_BITRATE_KBPS, OUTPUTS_DIR,
     PREVIEW_INTERVAL_SECS, ROOT_DIR, STITCH_BITRATE_KBPS, STITCH_QP,
+    FPS_LOCK_EXPOSURE_MS, UNLOCKED_EXPOSURE_MS,
     STITCH_QUALITY_PRESETS,
     CROP_PARAMS_DIR, STITCH_CANVAS_WIDTH, STITCH_PARAMS_DIR, STITCH_RECORDER_BIN,
     STITCH_SHADER, _discover_cameras, build_cam2h264, build_cam2stitch,
@@ -249,6 +251,8 @@ class StitchSupervisor(threading.Thread):
             "AFL_CAM_CODEC": ENCODE_CODEC,
             "AFL_CAM_STITCH_BITRATE_KBPS": str(STITCH_BITRATE_KBPS),
             "AFL_CAM_STITCH_QP": str(self.daemon.stitch_qp),
+            "AFL_CAM_AE_CAP_MS": str(FPS_LOCK_EXPOSURE_MS if self.daemon.fps_lock
+                                     else UNLOCKED_EXPOSURE_MS),
         })
         cmd = [
             str(STITCH_RECORDER_BIN),
@@ -1468,6 +1472,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._err("forbidden", status=403)
             ok, msg = self.daemon.set_quality((body or {}).get("qp"))
             return self._json({"ok": ok, "error": msg})
+        if path == "/api/fps-lock":
+            if not self._authed():
+                return self._err("forbidden", status=403)
+            ok, msg = self.daemon.set_fps_lock((body or {}).get("locked"))
+            return self._json({"ok": ok, "error": msg})
         if path == "/api/align-lock":
             if not self._authed():
                 return self._err("forbidden", status=403)
@@ -1630,6 +1639,7 @@ class CamDaemon:
         self.crop_enabled = bool(settings.get("crop"))
         qp = settings.get("stitch_qp")
         self.stitch_qp = qp if self._quality_ok(qp) else STITCH_QP
+        self.fps_lock = settings.get("fps_lock", True) is not False
         # the rig is static: once a field alignment is good, a stray tap on
         # Re-align must not replace it, so re-align is locked until unlocked
         self.align_locked = settings.get("align_locked", True) is not False
@@ -1964,6 +1974,24 @@ class CamDaemon:
             # the encoder takes its rate control at start
             self._restart_idle_pipeline("quality QP %d" % qp)
         log.info("quality: QP %d", qp)
+        return True, ""
+
+    def set_fps_lock(self, locked) -> tuple[bool, str]:
+        if not isinstance(locked, bool):
+            return False, "locked must be true or false"
+        with self._intents_lock:
+            if self.session is not None or self.state in (
+                    "recording", "finalizing") or self._pending_start:
+                return False, "can't change this while recording"
+            if locked == self.fps_lock:
+                return True, ""
+            self.fps_lock = locked
+            settings = _load_settings()
+            settings["fps_lock"] = locked
+            _save_settings(settings)
+            # exposure limits are read when the pipeline starts
+            self._restart_idle_pipeline("30 fps lock %s" % ("on" if locked else "off"))
+        log.info("30 fps lock: %s", "on" if locked else "off")
         return True, ""
 
     def start_restitch(self, session_id: int) -> tuple[bool, str]:
@@ -2922,6 +2950,7 @@ class CamDaemon:
             "mode": self.mode,
             "crop": self.crop_status(),
             "quality": self.quality_status(),
+            "fps_lock": self.fps_lock,
             "session_kind": self.session.kind if self.session else None,
             "restitch": self.restitch.summary() if self.restitch else None,
             "last_recording": self.last_recording,

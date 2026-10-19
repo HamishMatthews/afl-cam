@@ -86,6 +86,7 @@ static volatile int g_running = 1;
 /* mean luma the exposure loop holds both cameras at (BT.601 limited range,
  * 16-235); AFL_CAM_TARGET_LUMA overrides */
 static double g_target_luma = 130.0;
+static int g_ae_cap = 300;      /* longest exposure, 0.1 ms units: 300 = 30 ms holds 30 fps */
 
 static void cma_print(const char *tag) {
     FILE *f = fopen("/proc/meminfo", "r");
@@ -1840,7 +1841,10 @@ static int dec_init(cam_t *c) {
  * the exposure up to the 30 ms cap (the frame rate), then lift. Steps are
  * small and spaced (~0.7 s) so a recording sees a gradual change, except
  * when the picture is clipping, where they are coarse to recover fast. */
-#define AE_CAP 300              /* 30 ms: longer drops the sensor below 30 fps */
+/* The cap is g_ae_cap (AFL_CAM_AE_CAP_MS, default 30 ms: longer drops the
+ * sensor below 30 fps; the phone's "30 fps lock" setting raises it). */
+#define AE_CAP g_ae_cap
+#define AE_MAX (g_ae_cap > 330 ? g_ae_cap : 330)   /* start-up lock ceiling */
 #define AE_WINDOW 15            /* frames measured per decision */
 #define AE_SETTLE 6             /* frames a control change takes to show */
 static void ae_apply_lift(cam_t *c, int lift) {
@@ -1997,11 +2001,11 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
              * what auto gave is only used for the starting exposure */
             double auto_luma = c->luma_n ? c->luma_acc / c->luma_n : 64.0;
             c->target_luma = g_target_luma;
-            if (c->dt_n > 0 && (c->dt_sum / c->dt_n) > 33333) {
+            if (c->dt_n > 0 && (c->dt_sum / c->dt_n) > 33333 && g_ae_cap <= 300) {
                 /* frame rate first: auto wants a longer exposure than one
                  * 30 fps frame, which drops the sensor to ~20 fps. Cap at
                  * 30ms (image is darker, rate holds near 28 fps). */
-                c->lock_exp = 300;
+                c->lock_exp = g_ae_cap;
                 set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
                 /* manual exposure drops the camera's own boost, so the
                  * picture goes much darker than auto: lift it with the
@@ -2022,7 +2026,7 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
                 if (c->dt_n > 0) {
                     c->lock_exp = (RK_S32)((c->dt_sum / c->dt_n) / 100);
                     if (c->lock_exp < 30) c->lock_exp = 30;
-                    if (c->lock_exp > 330) c->lock_exp = 330;
+                    if (c->lock_exp > AE_MAX) c->lock_exp = AE_MAX;
                 }
                 set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
                 c->lock_phase = 1;
@@ -2076,7 +2080,7 @@ static void exposure_step(cam_t *c, MppFrame dec_frame, int64_t pts_us) {
             if (ratio > 1.25) ratio = 1.25;
             c->lock_exp = (RK_S32)(c->lock_exp * ratio + 0.5);
             if (c->lock_exp < 30) c->lock_exp = 30;
-            if (c->lock_exp > 330) c->lock_exp = 330;
+            if (c->lock_exp > AE_MAX) c->lock_exp = AE_MAX;
             set_exposure(c->fd, V4L2_EXPOSURE_MANUAL, c->lock_exp);
             c->luma_acc = 0.0; c->luma_n = 0;
             int converged = (ratio > 0.9 && ratio < 1.11);
@@ -2743,6 +2747,11 @@ int main(int argc, char **argv) {
         double t = atof(getenv("AFL_CAM_TARGET_LUMA"));
         if (t >= 40.0 && t <= 200.0)
             g_target_luma = t;
+    }
+    if (getenv("AFL_CAM_AE_CAP_MS")) {
+        int ms = atoi(getenv("AFL_CAM_AE_CAP_MS"));
+        if (ms >= 10 && ms <= 200)
+            g_ae_cap = ms * 10;
     }
     RK_S32 wall_sec = argc > 10 ? atoi(argv[10]) : 0;
     const char *spv_path = argc > 11 ? argv[11] : "afl_cam/native/stitch_nv12.spv";
