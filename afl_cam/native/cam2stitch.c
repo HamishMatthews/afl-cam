@@ -377,8 +377,7 @@ static double g_ov_mean[2] = { -1.0, -1.0 };
 static double g_lg[2] = { 1.0, 1.0 };
 static int g_ov_frames[2];
 
-static void ov_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
-                     const float *m0d, const float *m1d) {
+static void ov_build(const float *pf, const float *m0d, const float *m1d) {
     int cw = (int)pf[0], ch = (int)pf[1];
     const float *md[2] = { m0d, m1d };
     int off[2][2], mw[2], mh[2];
@@ -393,16 +392,16 @@ static void ov_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
     int n = 0;
     for (int y = OV_STEP / 2; y < ch; y += OV_STEP)
         for (int x = OV_STEP / 2; x < cw; x += OV_STEP) {
-            size_t i = ((size_t)y * cw + x) * 4;
-            if (w0d[i] < 32 || w1d[i] < 32)
-                continue;
+            /* the geometric overlap (both maps land inside their source frame),
+             * NOT the blend weights: those are a narrow feathered seam band */
             int ok = 1, sx[2], sy[2];
             for (int c = 0; c < 2 && ok; c++) {
                 int mx = x - off[c][0], my = y - off[c][1];
                 if (mx < 0 || my < 0 || mx >= mw[c] || my >= mh[c]) { ok = 0; break; }
                 const float *m = md[c] + ((size_t)my * mw[c] + mx) * 2;
                 sx[c] = (int)m[0]; sy[c] = (int)m[1];
-                if (m[0] < 8.0f || m[1] < 8.0f) ok = 0;
+                if (m[0] < 8.0f || m[1] < 8.0f ||
+                    m[0] >= pf[2] - 8.0f || m[1] >= pf[3] - 8.0f) ok = 0;
             }
             if (!ok)
                 continue;
@@ -582,8 +581,9 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     CHECK(vkMapMemory(g->dev, pbmem, 0, pbci.size, 0, &pmap));
     memcpy(pmap, params_data, pbci.size);
     g_pl = (volatile float *)pmap;      /* stays mapped: live seam gain */
-    ov_build(pf, (const uint8_t *)w0d, (const uint8_t *)w1d,
-             (const float *)m0d, (const float *)m1d);
+    ov_build(pf, (const float *)m0d, (const float *)m1d);
+    for (int c = 0; c < 2; c++)         /* start from the static gains in params */
+        g_lg[c] = pf[5 + c] > 0.0f ? pf[5 + c] : 1.0;
 
     /* ---- command pool + per-slot resources + pre-recorded cbs ---- */
     VkCommandPoolCreateInfo cpc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -2074,7 +2074,9 @@ static void overlap_balance(cam_t *c, MppFrame dec_frame) {
             double r = sqrt(m1 / m0);               /* wanted g0 (g1 = 1/g0) */
             if (r < 0.8) r = 0.8;
             if (r > 1.25) r = 1.25;
-            if (fabs(r - g_lg[0]) > 0.01) {
+            static int first = 1;       /* replace the stale static gain once */
+            if (first || fabs(r - g_lg[0]) > 0.01) {
+                first = 0;
                 g_lg[0] += 0.25 * (r - g_lg[0]);
                 g_lg[1] = 1.0 / g_lg[0];
                 g_pl[5] = (float)g_lg[0];
