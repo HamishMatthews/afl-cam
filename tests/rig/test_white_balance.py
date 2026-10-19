@@ -33,7 +33,12 @@ def _restart_pipeline():
         wake_standby()
 
 
-def test_white_balance_locks_matched_to_the_cameras_auto():
+def test_white_balance_locks_matched_to_the_cameras_auto(capsys):
+    with capsys.disabled():    # pytest hides prints of passing tests; CI logs need these
+        _check()
+
+
+def _check():
     wake_standby()
     _restart_pipeline()
     st = wait_until(
