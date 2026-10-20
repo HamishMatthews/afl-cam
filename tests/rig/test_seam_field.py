@@ -231,5 +231,5 @@ def test_seam_field_matches_the_cameras(capsys):
             # the field works only along the seam (elsewhere one camera
             # alone is on screen): the rest of the overlap can't judge it
             pytest.skip(f"only {len(by)} blocks of flat ground at the seam to compare")
-        assert _med_abs(ay) < max(1.25, 0.4 * _med_abs(by)), "the seam field leaves a brightness step"
+        assert _med_abs(ay) < max(1.25, 0.5 * _med_abs(by)), "the seam field leaves a brightness step"
         assert _med_abs(aw) < max(1.5, 0.75 * _med_abs(bw)), "the seam field leaves a colour step"

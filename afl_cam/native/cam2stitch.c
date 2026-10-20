@@ -2395,7 +2395,7 @@ static void vc_field(void) {
     int read = 0;
     for (int q = 0; q < nn; q++) {
         int m = pstart[q + 1] - pstart[q];
-        if (m < 12)
+        if (m < 8)
             continue;
         for (int p = 0; p < m; p++) {
             int x = pstart[q] + p;
