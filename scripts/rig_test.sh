@@ -86,7 +86,7 @@ for _ in $(seq 60); do
 done
 
 if [ $# -eq 0 ] && [ -z "${RIG_SLOW:-}" ]; then
-    set -- -m "not slow"
+    set -- -m "not slow" -k seam_diag
 fi
 # --durations=0 --durations-min=0 prints every test's time, slowest first, at the
 # end of the log: the place to look when the suite is slowing development down

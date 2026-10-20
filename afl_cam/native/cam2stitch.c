@@ -378,7 +378,8 @@ static void create_plane(VkDevice dev, VkPhysicalDeviceMemoryProperties *mprops,
 static volatile float *g_pl;        /* params SSBO, stays mapped: [5]/[6] = gains */
 static double g_horizon;            /* AFL_CAM_HORIZON: canvas fraction, field below */
 static int *g_mp[2], g_mn[2];       /* field points per camera: x,y source pairs */
-static int *g_op[2], g_on;          /* overlap points, the same scene point per camera */
+static int *g_op[2], g_on;
+static short *g_oxy; static unsigned char *g_ow;          /* overlap points, the same scene point per camera */
 static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
 
 /* The one exposure both cameras run, guarded by g_ae_mu. ev is the exposure
@@ -478,6 +479,7 @@ static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
             g_cp[c][2 * g_cn[c] + 1] = sy;
             g_cn[c]++;
         }
+    g_oxy = malloc(cap * sizeof(short)); g_ow = malloc(cap);
     g_on = 0;
     for (int y = VC_OV_STEP / 2; y < ch; y += VC_OV_STEP)
         for (int x = VC_OV_STEP / 2; x < cw; x += VC_OV_STEP) {
@@ -486,6 +488,8 @@ static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
                 continue;
             g_op[0][2 * g_on] = s0x; g_op[0][2 * g_on + 1] = s0y;
             g_op[1][2 * g_on] = s1x; g_op[1][2 * g_on + 1] = s1y;
+            g_oxy[2 * g_on] = (short)x; g_oxy[2 * g_on + 1] = (short)y;
+            g_ow[g_on] = w0d[((size_t)y * cw + x) * 4];
             g_on++;
         }
     fprintf(stderr, "exposure: field meter %d + %d points below canvas row %d, "
@@ -2240,6 +2244,21 @@ static void vc_trim(cam_t *c) {
     int64_t now = now_us();
     if (now - g_vc.last_trim_log > 10000000) {
         g_vc.last_trim_log = now;
+        FILE *df = fopen("outputs/_live/ov_dump.tmp", "wb");
+        if (df) {
+            float g[2] = { g_pl ? g_pl[5] : 1.0f, g_pl ? g_pl[6] : 1.0f };
+            fwrite(&g_on, sizeof g_on, 1, df);
+            fwrite(g, sizeof g, 1, df);
+            fwrite(g_oxy, sizeof(short), 2 * (size_t)g_on, df);
+            fwrite(g_ow, 1, g_on, df);
+            for (int c = 0; c < 2; c++) {
+                fwrite(g_vc.ov[c], 1, g_on, df);
+                fwrite(g_vc.ovu[c], 1, g_on, df);
+                fwrite(g_vc.ovv[c], 1, g_on, df);
+            }
+            fclose(df);
+            rename("outputs/_live/ov_dump.tmp", "outputs/_live/ov_dump.bin");
+        }
         fprintf(stderr, "seam trim: overlap %.1f | %.1f over %d points -> %.3f / %.3f, "
                 "warmth %.1f | %.1f -> %d K / %d K\n", s0 / n + 16, s1 / n + 16, n,
                 g_vc.trim[0], g_vc.trim[1], w0 / n, w1 / n, g_vc.wbk[0], g_vc.wbk[1]);
