@@ -212,6 +212,24 @@ def test_seam_field_matches_the_cameras(capsys):
                   f"|d warmth| {_med_abs(dw):.2f}; at the seam ({len(sy)} blocks) "
                   f"|dY| {_med_abs(sy):.2f}, |d warmth| {_med_abs(sw):.2f}")
 
+        # DIAG: per seam node, the ratio the readings ask for vs the field's
+        if at_seam.any():
+            a, b = _screen(d, False)
+            lyr = np.log((_luma(b) - 14) / (_luma(a) - 14))
+            fl = d["field"]
+            for q in sorted(set(_node_medians(lyr, node, flat & at_seam))):
+                j, i = divmod(q, d["gx"])
+                m = flat & (node == q)
+                ms = m & at_seam
+                want = float(np.median(lyr[m]))
+                lum = np.array([0.299, 0.587, 0.114])
+                got = float(np.log((fl[j, i, 0] @ lum) / (fl[j, i, 1] @ lum)))
+                a2, b2 = _screen(d, True)
+                print(f"[seam] node ({i},{j}) n {m.sum()}/{ms.sum()} want {want:+.3f} "
+                      f"field {got:+.3f} seam-pts want {np.median(lyr[ms]):+.3f} "
+                      f"dY before {np.median(_luma(b)[ms] - _luma(a)[ms]):+.2f} "
+                      f"after {np.median(_luma(b2)[ms] - _luma(a2)[ms]):+.2f}")
+
         # the ruler's own noise: the same node medians from two halves of the
         # points (what is left after the field can't go below this)
         a, b = _screen(d, False)
