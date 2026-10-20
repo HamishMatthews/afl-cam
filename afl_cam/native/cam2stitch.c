@@ -381,6 +381,30 @@ static int *g_mp[2], g_mn[2];       /* field points per camera: x,y source pairs
 static int *g_op[2], g_on;          /* overlap points, the same scene point per camera */
 static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
 
+/* The seam field: a smooth per-camera gain over the canvas, so the two
+ * cameras render the same brightness where they meet, whatever the units'
+ * vignetting and tone differ by there (the white balance split matches
+ * their colour). RGB per node, all three equal for now. Each overlap
+ * point belongs to its nearest node of a FD_CELL grid; the median log
+ * ratio of the two cameras' brightness over the node's points that are flat
+ * in both (parallax-proof) gives d, smoothed over time and space and faded
+ * out away from the overlap. cam0 is lifted by half of it and cam1 lowered by
+ * half, so the overall level stays. The shader reads node (i, j), camera c,
+ * channel k at params[FD_BASE + ((j * gx + i) * 2 + c) * 4 + k], bilinear.
+ * AFL_CAM_SEAM_FIELD=0 holds it at 1 (the scalar trim alone). */
+#define FD_CELL 64
+#define FD_BASE 64
+#define FD_ALPHA 0.15               /* time smoothing per overlap reading */
+#define FD_FADE 8                   /* nodes the field fades over past the overlap */
+#define FD_MAX 0.15                 /* |log ratio| limit */
+static int g_fd_on = 1, g_fd_gx, g_fd_gy;
+static int *g_fd_node;              /* overlap point -> grid node */
+static short *g_fd_xy;              /* overlap point -> canvas x, y (AFL_CAM_SEAM_DUMP) */
+static int g_fd_dump;
+static double *g_fd_d;              /* per node, 3 channels: smoothed log ratio */
+static uint8_t *g_fd_seen;          /* node has had a valid reading */
+static double g_fd_seam;            /* mean |d| (luma) over the read nodes, for the status */
+
 /* The one exposure both cameras run, guarded by g_ae_mu. ev is the exposure
  * wanted (100 us units, continuous, up to the cap); past the cap the camera
  * gamma (lift) and then a shader gain (boost) brighten further. */
@@ -398,7 +422,7 @@ static struct {
     int frames[2], settle[2];
     int settled, changes;
     double med, hi_pct;
-    uint8_t *ov[2], *ovu[2], *ovv[2];
+    uint8_t *ov[2], *ovu[2], *ovv[2], *ovf[2];  /* ovf: point locally flat */
     int ov_fresh[2];
     /* white balance: the cameras' own auto runs for the first seconds (a
      * manual temperature written before that is ignored), then both go
@@ -478,6 +502,13 @@ static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
             g_cp[c][2 * g_cn[c] + 1] = sy;
             g_cn[c]++;
         }
+    g_fd_gx = cw / FD_CELL + 2;
+    g_fd_gy = ch / FD_CELL + 2;
+    g_fd_node = malloc(cap * sizeof(int));
+    g_fd_xy = malloc(cap * 2 * sizeof(short));
+    g_fd_d = calloc((size_t)g_fd_gx * g_fd_gy * 3, sizeof(double));
+    g_fd_seen = calloc((size_t)g_fd_gx * g_fd_gy, 1);
+    if (!g_fd_node || !g_fd_xy || !g_fd_d || !g_fd_seen) { fprintf(stderr, "seam field alloc failed\n"); exit(1); }
     g_on = 0;
     for (int y = VC_OV_STEP / 2; y < ch; y += VC_OV_STEP)
         for (int x = VC_OV_STEP / 2; x < cw; x += VC_OV_STEP) {
@@ -486,6 +517,8 @@ static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
                 continue;
             g_op[0][2 * g_on] = s0x; g_op[0][2 * g_on + 1] = s0y;
             g_op[1][2 * g_on] = s1x; g_op[1][2 * g_on + 1] = s1y;
+            g_fd_node[g_on] = ((y + FD_CELL / 2) / FD_CELL) * g_fd_gx + (x + FD_CELL / 2) / FD_CELL;
+            g_fd_xy[2 * g_on] = (short)x; g_fd_xy[2 * g_on + 1] = (short)y;
             g_on++;
         }
     fprintf(stderr, "exposure: field meter %d + %d points below canvas row %d, "
@@ -649,7 +682,8 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     }
 
     VkBufferCreateInfo pbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                .size = 64 * sizeof(float),
+                                .size = (FD_BASE + (size_t)(g->canvas_w / FD_CELL + 2) *
+                                         (g->canvas_h / FD_CELL + 2) * 8) * sizeof(float),
                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
     VkBuffer pbuf;
     CHECK(vkCreateBuffer(g->dev, &pbci, NULL, &pbuf));
@@ -657,8 +691,10 @@ static void gpu_init(gpu_t *g, const char *spv_path,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void *pmap;
     CHECK(vkMapMemory(g->dev, pbmem, 0, pbci.size, 0, &pmap));
-    memcpy(pmap, params_data, pbci.size);
-    g_pl = (volatile float *)pmap;      /* stays mapped: live exposure gain */
+    memcpy(pmap, params_data, FD_BASE * sizeof(float));
+    for (size_t k = FD_BASE; k < pbci.size / sizeof(float); k++)
+        ((float *)pmap)[k] = 1.0f;      /* seam field: no correction yet */
+    g_pl = (volatile float *)pmap;      /* stays mapped: live exposure gain + seam field */
     vc_build(pf, (const uint8_t *)w0d, (const uint8_t *)w1d,
              (const float *)m0d, (const float *)m1d);
 
@@ -2030,11 +2066,14 @@ static void vc_init(void) {
     g_vc.half = hz > 0 ? (RK_S32)(10000.0 / (2.0 * hz) + 0.5) : 0;
     if ((e = getenv("AFL_CAM_EXP_SEED_MS")) && atof(e) > 0.0)
         g_vc.ev = atof(e) * 10.0;
+    g_fd_on = !((e = getenv("AFL_CAM_SEAM_FIELD")) && atoi(e) == 0);
+    g_fd_dump = (e = getenv("AFL_CAM_SEAM_DUMP")) && atoi(e) != 0;
     for (int c = 0; c < 2; c++) {
         g_vc.ov[c] = calloc(g_on > 0 ? (size_t)g_on : 1, 1);
         g_vc.ovu[c] = calloc(g_on > 0 ? (size_t)g_on : 1, 1);
         g_vc.ovv[c] = calloc(g_on > 0 ? (size_t)g_on : 1, 1);
-        if (!g_vc.ov[c] || !g_vc.ovu[c] || !g_vc.ovv[c]) { fprintf(stderr, "overlap alloc failed\n"); exit(1); }
+        g_vc.ovf[c] = calloc(g_on > 0 ? (size_t)g_on : 1, 1);
+        if (!g_vc.ov[c] || !g_vc.ovu[c] || !g_vc.ovv[c] || !g_vc.ovf[c]) { fprintf(stderr, "overlap alloc failed\n"); exit(1); }
     }
     vc_split();
     vc_apply();
@@ -2054,16 +2093,31 @@ static void vc_meter(MppFrame frame, const int *pts, int n, uint32_t *hist) {
         hist[y[(size_t)pts[2 * i + 1] * hs + pts[2 * i]]]++;
 }
 
-static void vc_overlap(MppFrame frame, const int *pts, uint8_t *out, uint8_t *ou, uint8_t *ov) {
+/* a point is flat when its 4 neighbours FLAT_R px away are within FLAT_D
+ * levels: on flat ground (a road, grass) a misaligned point still reads the
+ * same surface, so the photometric ratio there is clean of parallax */
+#define FLAT_R 6
+#define FLAT_D 3
+static void vc_overlap(MppFrame frame, const int *pts, uint8_t *out, uint8_t *ou, uint8_t *ov,
+                       uint8_t *of) {
     MppBuffer buf = mpp_frame_get_buffer(frame);
     if (!buf)
         return;
     const RK_U8 *y = mpp_buffer_get_ptr(buf);
     RK_U32 hs = mpp_frame_get_hor_stride(frame);
+    int fw = (int)mpp_frame_get_width(frame), fh = (int)mpp_frame_get_height(frame);
     const RK_U8 *uv = y + (size_t)hs * mpp_frame_get_ver_stride(frame);
     for (int i = 0; i < g_on; i++) {
         int sx = pts[2 * i], sy = pts[2 * i + 1];
-        out[i] = y[(size_t)sy * hs + sx];
+        int v0 = y[(size_t)sy * hs + sx];
+        out[i] = (uint8_t)v0;
+        of[i] = 0;
+        if (sx >= FLAT_R && sy >= FLAT_R && sx < fw - FLAT_R && sy < fh - FLAT_R) {
+            int a = y[(size_t)sy * hs + sx - FLAT_R], b = y[(size_t)sy * hs + sx + FLAT_R];
+            int c = y[(size_t)(sy - FLAT_R) * hs + sx], d = y[(size_t)(sy + FLAT_R) * hs + sx];
+            of[i] = abs(a - v0) <= FLAT_D && abs(b - v0) <= FLAT_D &&
+                    abs(c - v0) <= FLAT_D && abs(d - v0) <= FLAT_D;
+        }
         const RK_U8 *c = uv + (size_t)(sy / 2) * hs + (sx & ~1);
         ou[i] = c[0];
         ov[i] = c[1];
@@ -2216,6 +2270,219 @@ static void vc_wb_step(cam_t *c) {
 }
 
 /* both cameras' overlap readings in: steer the trim (g_ae_mu held) */
+/* limited-range NV12 -> RGB 0..1, as the shader decodes it */
+static void fd_rgb(double y, double u, double v, double *o) {
+    double yf = (y - 16.0) / 219.0;
+    u = (u - 128.0) / 255.0;
+    v = (v - 128.0) / 255.0;
+    o[0] = yf + 1.402 * v;
+    o[1] = yf - 0.344136 * u - 0.714136 * v;
+    o[2] = yf + 1.772 * u;
+}
+
+/* [1 4 6 4 1] / 16 along rows (dx 1) or columns (dx gx), edges clamped */
+static void fd_blur(double *e, double *t, int along_x) {
+    int gx = g_fd_gx, gy = g_fd_gy;
+    for (int j = 0; j < gy; j++)
+        for (int i = 0; i < gx; i++)
+            for (int k = 0; k < 3; k++) {
+                double a = 0.0;
+                static const double w[5] = { 1, 4, 6, 4, 1 };
+                for (int o = -2; o <= 2; o++) {
+                    int ii = along_x ? i + o : i, jj = along_x ? j : j + o;
+                    ii = ii < 0 ? 0 : ii >= gx ? gx - 1 : ii;
+                    jj = jj < 0 ? 0 : jj >= gy ? gy - 1 : jj;
+                    a += w[o + 2] * e[((size_t)jj * gx + ii) * 3 + k];
+                }
+                t[((size_t)j * gx + i) * 3 + k] = a / 16.0;
+            }
+    memcpy(e, t, (size_t)gx * gy * 3 * sizeof(double));
+}
+
+static int fd_cmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+/* one overlap reading of both cameras -> the seam field (g_ae_mu held).
+ * Per node, the median log brightness ratio of the points flat in both
+ * cameras (a misaligned point on flat ground still reads the same surface). */
+static void vc_field(void) {
+    static double *e, *t, *fade, *lr[1];
+    static int *first, *order;
+    int gx = g_fd_gx, gy = g_fd_gy, nn = gx * gy;
+    if (!g_pl || nn == 0)
+        return;
+    if (!e) {
+        e = malloc((size_t)nn * 3 * sizeof(double));
+        t = malloc((size_t)nn * 3 * sizeof(double));
+        fade = malloc((size_t)nn * sizeof(double));
+        first = calloc((size_t)nn + 1, sizeof(int));
+        order = malloc((g_on > 0 ? (size_t)g_on : 1) * sizeof(int));
+        lr[0] = malloc((g_on > 0 ? (size_t)g_on : 1) * sizeof(double));
+        if (!e || !t || !fade || !first || !order || !lr[0]) {
+            fprintf(stderr, "seam field alloc failed\n");
+            exit(1);
+        }
+        /* the overlap points grouped by node: order[first[q] .. first[q + 1]) */
+        for (int i = 0; i < g_on; i++) first[g_fd_node[i] + 1]++;
+        for (int q = 0; q < nn; q++) first[q + 1] += first[q];
+        int *fill = calloc((size_t)nn, sizeof(int));
+        if (!fill) { fprintf(stderr, "seam field alloc failed\n"); exit(1); }
+        for (int i = 0; i < g_on; i++) {
+            int q = g_fd_node[i];
+            order[first[q] + fill[q]++] = i;
+        }
+        free(fill);
+    }
+    /* the log ratio cam1 / cam0 of what each would put on screen */
+    double g0 = g_pl[5], g1 = g_pl[6], seam = 0.0;
+    int read = 0;
+    for (int q = 0; q < nn; q++) {
+        int m = 0;
+        for (int p = first[q]; p < first[q + 1]; p++) {
+            int i = order[p];
+            int a = g_vc.ov[0][i], b = g_vc.ov[1][i];
+            if (!g_vc.ovf[0][i] || !g_vc.ovf[1][i] || a < 24 || b < 24 || a > 232 || b > 232)
+                continue;
+            double r0[3], r1[3];
+            fd_rgb(a, g_vc.ovu[0][i], g_vc.ovv[0][i], r0);
+            fd_rgb(b, g_vc.ovu[1][i], g_vc.ovv[1][i], r1);
+            int ok = 1;
+            for (int k = 0; k < 3; k++) {
+                r0[k] *= g0; r1[k] *= g1;
+                if (r0[k] > 0.97 || r1[k] > 0.97 || r0[k] < 0.0 || r1[k] < 0.0)
+                    ok = 0;         /* a channel clipped: no ratio there */
+            }
+            if (!ok)
+                continue;
+            /* brightness only: the white balance split already matches
+             * the colour (per-channel ratios only added chroma noise) */
+            lr[0][m] = log(((b - 16.0) * g1 + 2.0) / ((a - 16.0) * g0 + 2.0));
+            m++;
+        }
+        if (m < 12)
+            continue;
+        qsort(lr[0], (size_t)m, sizeof(double), fd_cmp);
+        double d = m % 2 ? lr[0][m / 2] : 0.5 * (lr[0][m / 2 - 1] + lr[0][m / 2]);
+        d = d > FD_MAX ? FD_MAX : d < -FD_MAX ? -FD_MAX : d;
+        for (int k = 0; k < 3; k++) {
+            double *sd = g_fd_d + (size_t)q * 3 + k;
+            *sd = g_fd_seen[q] ? *sd + FD_ALPHA * (d - *sd) : d;
+        }
+        g_fd_seen[q] = 1;
+        seam += fabs(g_fd_d[(size_t)q * 3 + 1]);
+        read++;
+    }
+    if (read)
+        g_fd_seam = seam / read;
+    /* fill the grid: across holes in a row, the overlap's end values held
+     * past its ends (faded only after the smoothing, so the edge nodes, where
+     * the seam can sit, keep their full value); rows without overlap take
+     * the nearest row that has some */
+    int *row_ok = (int *)t;         /* t is free until the median */
+    for (int j = 0; j < gy; j++) {
+        int first = -1, last = -1;
+        for (int i = 0; i < gx; i++)
+            if (g_fd_seen[j * gx + i]) { if (first < 0) first = i; last = i; }
+        row_ok[j] = first >= 0;
+        if (first < 0)
+            continue;
+        int prev = first;
+        for (int i = 0; i < gx; i++) {
+            double *o = e + ((size_t)j * gx + i) * 3;
+            if (i < first || i > last) {
+                int dist = i < first ? first - i : i - last;
+                double f = 1.0 - (double)dist / FD_FADE;
+                fade[j * gx + i] = f < 0.0 ? 0.0 : f;
+                memcpy(o, g_fd_d + ((size_t)j * gx + (i < first ? first : last)) * 3,
+                       3 * sizeof(double));
+                continue;
+            }
+            fade[j * gx + i] = 1.0;
+            if (g_fd_seen[j * gx + i]) {
+                memcpy(o, g_fd_d + ((size_t)j * gx + i) * 3, 3 * sizeof(double));
+                prev = i;
+            } else {
+                int nx = i + 1;
+                while (!g_fd_seen[j * gx + nx]) nx++;
+                double f = (double)(i - prev) / (nx - prev);
+                const double *a = g_fd_d + ((size_t)j * gx + prev) * 3;
+                const double *b = g_fd_d + ((size_t)j * gx + nx) * 3;
+                for (int k = 0; k < 3; k++) o[k] = a[k] + f * (b[k] - a[k]);
+            }
+        }
+    }
+    int any = 0;
+    for (int j = 0; j < gy; j++) any |= row_ok[j];
+    if (!any)
+        return;
+    for (int j = 0; j < gy; j++) {
+        if (row_ok[j])
+            continue;
+        int src = -1;
+        for (int o = 1; o < gy && src < 0; o++) {
+            if (j - o >= 0 && row_ok[j - o]) src = j - o;
+            else if (j + o < gy && row_ok[j + o]) src = j + o;
+        }
+        memcpy(e + (size_t)j * gx * 3, e + (size_t)src * gx * 3, (size_t)gx * 3 * sizeof(double));
+        memcpy(fade + (size_t)j * gx, fade + (size_t)src * gx, (size_t)gx * sizeof(double));
+    }
+    /* a 3x3 median drops single odd nodes (a player, a pole), then the blur */
+    for (int j = 0; j < gy; j++)
+        for (int i = 0; i < gx; i++)
+            for (int k = 0; k < 3; k++) {
+                double w[9];
+                int m = 0;
+                for (int dj = -1; dj <= 1; dj++)
+                    for (int di = -1; di <= 1; di++) {
+                        int jj = j + dj, ii = i + di;
+                        if (jj >= 0 && jj < gy && ii >= 0 && ii < gx)
+                            w[m++] = e[((size_t)jj * gx + ii) * 3 + k];
+                    }
+                qsort(w, (size_t)m, sizeof(double), fd_cmp);
+                t[((size_t)j * gx + i) * 3 + k] = m % 2 ? w[m / 2] : 0.5 * (w[m / 2 - 1] + w[m / 2]);
+            }
+    memcpy(e, t, (size_t)nn * 3 * sizeof(double));
+    for (int p = 0; p < 2; p++) {
+        fd_blur(e, t, 1);
+        fd_blur(e, t, 0);
+    }
+    for (int q = 0; q < nn; q++)
+        for (int k = 0; k < 3; k++)
+            e[(size_t)q * 3 + k] *= fade[q];
+    /* cam0 up by half the ratio, cam1 down by half */
+    for (int q = 0; q < nn; q++)
+        for (int k = 0; k < 3; k++) {
+            double h = g_fd_on ? 0.5 * e[(size_t)q * 3 + k] : 0.0;
+            g_pl[FD_BASE + (q * 2 + 0) * 4 + k] = (float)exp(h);
+            g_pl[FD_BASE + (q * 2 + 1) * 4 + k] = (float)exp(-h);
+        }
+}
+
+/* the overlap readings and the seam field, for the rig test's seam check:
+ * int n, gx, gy; float gain[2]; int16 xy[2n]; per camera u8 Y, U, V, flat [n];
+ * float field[gx * gy * 8] (the shader's layout) */
+static void vc_field_dump(void) {
+    FILE *f = fopen("outputs/_live/seam_dump.tmp", "wb");
+    if (!f)
+        return;
+    int hdr[3] = { g_on, g_fd_gx, g_fd_gy };
+    float g[2] = { g_pl[5], g_pl[6] };
+    fwrite(hdr, sizeof hdr, 1, f);
+    fwrite(g, sizeof g, 1, f);
+    fwrite(g_fd_xy, sizeof(short), 2 * (size_t)g_on, f);
+    for (int c = 0; c < 2; c++) {
+        fwrite(g_vc.ov[c], 1, g_on, f);
+        fwrite(g_vc.ovu[c], 1, g_on, f);
+        fwrite(g_vc.ovv[c], 1, g_on, f);
+        fwrite(g_vc.ovf[c], 1, g_on, f);
+    }
+    fwrite((const float *)g_pl + FD_BASE, sizeof(float), (size_t)g_fd_gx * g_fd_gy * 8, f);
+    if (fclose(f) == 0)
+        rename("outputs/_live/seam_dump.tmp", "outputs/_live/seam_dump.bin");
+}
+
 static void vc_trim(cam_t *c) {
     double s0 = 0.0, s1 = 0.0, w0 = 0.0, w1 = 0.0;
     int n = 0;
@@ -2231,6 +2498,7 @@ static void vc_trim(cam_t *c) {
     if (n < 200)
         return;
     vc_colour(c, (w1 - w0) / n);
+    vc_field();
     double want = sqrt(s1 / s0);
     if (want < 0.92) want = 0.92;
     if (want > 1.08) want = 1.08;
@@ -2240,6 +2508,8 @@ static void vc_trim(cam_t *c) {
     int64_t now = now_us();
     if (now - g_vc.last_trim_log > 10000000) {
         g_vc.last_trim_log = now;
+        if (g_fd_dump)
+            vc_field_dump();
         fprintf(stderr, "seam trim: overlap %.1f | %.1f over %d points -> %.3f / %.3f, "
                 "warmth %.1f | %.1f -> %d K / %d K\n", s0 / n + 16, s1 / n + 16, n,
                 g_vc.trim[0], g_vc.trim[1], w0 / n, w1 / n, g_vc.wbk[0], g_vc.wbk[1]);
@@ -2361,7 +2631,7 @@ static void vc_step(cam_t *c, MppFrame frame) {
         vc_meter(frame, g_mp[i], g_mn[i], h);
     }
     if (want_ov)
-        vc_overlap(frame, g_op[i], g_vc.ov[i], g_vc.ovu[i], g_vc.ovv[i]);
+        vc_overlap(frame, g_op[i], g_vc.ov[i], g_vc.ovu[i], g_vc.ovv[i], g_vc.ovf[i]);
     double cs = 0.0;
     long cn = 0;
     if (want_col)
@@ -2640,13 +2910,13 @@ static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
     snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
              "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f,\"u\":%.1f,\"v\":%.1f,"
              "\"exp_ms\":%.1f,\"gamma\":%d,\"gain\":%.3f,\"field_med\":%.0f,\"field_clip_pct\":%.2f,"
-             "\"ae_settled\":%s,\"ae_changes\":%d,\"wb_k\":%d,\"wb_auto\":%s",
+             "\"ae_settled\":%s,\"ae_changes\":%d,\"wb_k\":%d,\"wb_auto\":%s,\"seam_d\":%.4f",
              c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
              c->ts_gap, c->seq_lost, c->luma_last, c->u_last, c->v_last,
              (c->exposure > 0 ? c->exposure : g_vc.exp) / 10.0, g_vc.lift,
              g_pl ? g_pl[5 + c->idx] : 1.0, g_vc.med, g_vc.hi_pct,
              g_vc.settled ? "true" : "false", g_vc.changes, g_vc.wbk[c->idx],
-             g_wbk && g_vc.wb_phase == 1 ? "false" : "true");
+             g_wbk && g_vc.wb_phase == 1 ? "false" : "true", g_fd_seam);
     return buf;
 }
 
@@ -2656,7 +2926,7 @@ static void ctl_publish(ctl_t *c, cam_t *cams, worker_ctx_t *w, pv_t *pv,
                         int skipped_start, int64_t skew_sum, int64_t skew_n) {
     if (!c)
         return;
-    char tbuf0[512], tbuf1[512];
+    char tbuf0[640], tbuf1[640];
     pthread_mutex_lock(&c->mu);
     c->rec_bytes = w->rec_bytes;
     int64_t elapsed = c->recording ? now_us() - c->rec_start_us : 0;

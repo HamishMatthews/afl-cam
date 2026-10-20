@@ -61,7 +61,15 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   limited (jpegd outputs Y 16–235 exactly, `RANGE_FULL=0`), 4-Y-bytes-per-uint
   SSBO packing; per-camera gain at params [5..6]. Live, cam2stitch writes
   it (shader gain x seam trim) into the mapped params buffer; params.bin's
-  stored value is only used by -src and the offline paths. Rebuild the .spv with `glslangValidator -V
+  stored value is only used by -src and the offline paths. After the 64
+  params floats cam2stitch keeps the seam field: a smooth per-camera gain
+  (RGB slots, brightness only for now) on a 64 px node grid (bilinear, read
+  once per thread), fitted live from the median brightness ratio of overlap
+  points flat in both cameras (parallax-proof) and faded out past the
+  overlap, so they match where they meet whatever their vignetting/tone
+  differ by (`AFL_CAM_SEAM_FIELD=0` = off; `AFL_CAM_SEAM_DUMP=1` dumps the
+  readings for `tests/rig/test_seam_field.py`). The offline re-stitch has
+  no seam field. Rebuild the .spv with `glslangValidator -V
   stitch_nv12.comp -o stitch_nv12.spv` (byte-reproducible).
 - `afl_cam/native/cam2h264.c` — per-camera recorder (separate mode).
 - `afl_cam/daemon.py` — afl-camd (stdlib only): supervises cam2stitch

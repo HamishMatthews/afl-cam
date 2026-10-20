@@ -74,7 +74,9 @@ sudo -n systemctl stop afl-camd
 # a re-align from the tests writes to a scratch dir, never calibration/
 mkdir -p rig-artifacts/realign
 # and so does the derived cropped map set
+# and cam2stitch dumps its seam readings for test_seam_field
 AFL_CAM_CROP_DIR="$TREE/rig-artifacts/crop" \
+AFL_CAM_SEAM_DUMP=1 \
 AFL_CAM_PORT=$PORT AFL_CAM_CTL_SOCK=$SOCK AFL_CAM_ALIGN_OUT="$TREE/rig-artifacts/realign" \
     .venv/bin/python -m afl_cam.cli daemon > rig-daemon.log 2>&1 &
 DPID=$!
