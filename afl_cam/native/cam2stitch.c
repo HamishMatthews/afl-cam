@@ -2472,7 +2472,9 @@ static void vc_field(void) {
         memcpy(e + (size_t)j * gx * 3, e + (size_t)src * gx * 3, (size_t)gx * 3 * sizeof(double));
         memcpy(fade + (size_t)j * gx, fade + (size_t)src * gx, (size_t)gx * sizeof(double));
     }
-    fd_blur(e, t, 1);
+    /* smoothed along the seam (down the columns) only: across it the ratio
+     * can change fast (one lens's rim) and a blur there under-corrects the
+     * seam; bilinear reads keep it continuous */
     fd_blur(e, t, 0);
     for (int q = 0; q < nn; q++)
         for (int k = 0; k < 3; k++)
