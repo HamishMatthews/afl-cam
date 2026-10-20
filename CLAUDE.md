@@ -62,12 +62,12 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   SSBO packing; per-camera gain at params [5..6]. Live, cam2stitch writes
   it (shader gain x seam trim) into the mapped params buffer; params.bin's
   stored value is only used by -src and the offline paths. After the 64
-  params floats cam2stitch keeps the seam field: a smooth per-camera gain
-  (RGB slots, brightness only for now) on a 64 px node grid (bilinear, read
-  once per thread), fitted live from the median brightness ratio of overlap
-  points flat in both cameras (parallax-proof) and faded out past the
-  overlap, so they match where they meet whatever their vignetting/tone
-  differ by (`AFL_CAM_SEAM_FIELD=0` = off; `AFL_CAM_SEAM_DUMP=1` dumps the
+  params floats cam2stitch keeps the seam field: a smooth per-camera RGB
+  gain on a 64 px node grid (bilinear, read once per thread), fitted live
+  from the median brightness ratio (and each channel's ratio over it) of
+  overlap points flat in both cameras (parallax-proof), held at the
+  overlap's edges and faded out past them, so the cameras match where they
+  meet whatever their vignetting/tone/colour shading differ by (`AFL_CAM_SEAM_FIELD=0` = off; `AFL_CAM_SEAM_DUMP=1` dumps the
   readings for `tests/rig/test_seam_field.py`). The offline re-stitch has
   no seam field. Rebuild the .spv with `glslangValidator -V
   stitch_nv12.comp -o stitch_nv12.spv` (byte-reproducible).
@@ -153,8 +153,11 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
 - `afl_cam/seam_refine.py` + `scripts/refine_seam.py` — fits the measured
   overlap misalignment (parallax) as a smooth field and warps both maps by
   half of it, fading out away from the overlap, matches exposure, and
-  re-cuts the blend as a 64 px ramp along the min-difference seam path;
-  last step of the re-align
+  re-cuts the blend as a 64 px smoothstep ramp along the min-difference
+  seam path, kept off the overlap's outer quarters (lens rims) and fully
+  inside it (until 2026-10-20 a float32 tie in `seam_path` sent the path
+  down the overlap's left edge: a hard cut at cam1's rim; a live set cut
+  before that needs one Re-align to get the soft blend); last step of the re-align
   chain, writes only if the stitch score improves (`.prev` maps kept).
 - `afl_cam/stitch_score.py` + `scripts/stitch_score.py` — THE stitch
   quality score (overlap misalignment median/p95 px, exposure step, seam
