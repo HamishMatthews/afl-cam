@@ -244,6 +244,42 @@ def test_seam_field_matches_the_cameras(capsys):
                 if m.sum() >= 20:
                     row.append(f"{lo}-{lo + 24}:{np.median(lyr[m]):+.3f}/{np.median(lyr2[m]):+.3f}({m.sum()})")
             print(f"[seam] ratio by level ({name}, before/after): " + " ".join(row))
+        # DIAG: prototype gain-only vs black offset + gain, nearest node
+        y0n, y1n = ya - 16, yb - 16
+        qs = [q for q in np.unique(node[flat]) if (flat & (node == q)).sum() >= 12]
+
+        def fit(bb):
+            r = np.log((y1n - bb / 2 + 2) / (y0n + bb / 2 + 2))
+            h = np.zeros(len(r))
+            cost = 0.0
+            for q in qs:
+                m = flat & (node == q)
+                med = np.median(r[m])
+                h[node == q] = med
+                cost += np.abs(r[m] - med).sum()
+            return cost, h
+
+        cands = np.arange(-12, 12.01, 0.5)
+        costs = [fit(bb)[0] for bb in cands]
+        best = float(cands[int(np.argmin(costs))])
+        print(f"[seam] proto offset search: best b {best:+.1f} (cost {min(costs):.1f}, "
+              f"at 0 {costs[len(cands) // 2]:.1f})")
+        for bb in (0.0, best):
+            _, h = fit(bb)
+            fitted = np.isin(node, qs)
+            y0c = (y0n + bb / 2) * np.exp(h / 2)
+            y1c = (y1n - bb / 2) * np.exp(-h / 2)
+            dd = y1c - y0c
+            sy = _node_medians(dd, node, flat & at_seam & fitted)
+            fy = _node_medians(dd, node, flat & fitted)
+            row = []
+            for lo in range(16, 236, 48):
+                m = flat & fitted & (mean_y >= lo) & (mean_y < lo + 48)
+                if m.sum() >= 20:
+                    row.append(f"{lo}:{np.median(dd[m]):+.2f}")
+            print(f"[seam] proto b {bb:+.1f}: at the seam |dY| {_med_abs(sy):.2f} ({len(sy)}), "
+                  f"flat overlap {_med_abs(fy):.2f} ({len(fy)}), per point |dY| "
+                  f"{np.median(np.abs(dd[flat & fitted])):.2f}; by level " + " ".join(row))
         xs = d["xy"][:, 0]
         row = []
         for lo in range(int(xs.min()) // 128 * 128, int(xs.max()) + 1, 128):
