@@ -71,10 +71,16 @@ for _ in $(seq 180); do
     esac
 done
 sudo -n systemctl stop afl-camd
+# the pipeline runs on a scratch copy of the live maps with the blend re-cut
+# by this tree (what the next Re-align writes), never on calibration/ itself
+mkdir -p rig-artifacts
+.venv/bin/python scripts/rig_recut_blend.py rig-artifacts/blend
+export AFL_CAM_STITCH_DIR="$PWD/rig-artifacts/blend"
 # a re-align from the tests writes to a scratch dir, never calibration/
 mkdir -p rig-artifacts/realign
 # and so does the derived cropped map set
 AFL_CAM_CROP_DIR="$TREE/rig-artifacts/crop" \
+AFL_CAM_SEAM_DUMP=1 \
 AFL_CAM_PORT=$PORT AFL_CAM_CTL_SOCK=$SOCK AFL_CAM_ALIGN_OUT="$TREE/rig-artifacts/realign" \
     .venv/bin/python -m afl_cam.cli daemon > rig-daemon.log 2>&1 &
 DPID=$!

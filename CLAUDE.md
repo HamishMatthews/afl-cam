@@ -61,7 +61,17 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   limited (jpegd outputs Y 16–235 exactly, `RANGE_FULL=0`), 4-Y-bytes-per-uint
   SSBO packing; per-camera gain at params [5..6]. Live, cam2stitch writes
   it (shader gain x seam trim) into the mapped params buffer; params.bin's
-  stored value is only used by -src and the offline paths. Rebuild the .spv with `glslangValidator -V
+  stored value is only used by -src and the offline paths. After the 64
+  params floats cam2stitch keeps the seam field: a per-camera RGB gain on a
+  64 px node grid (bilinear, no blur, read once per thread), fitted live
+  from the median brightness ratio (and each channel's ratio over it) of
+  overlap points flat in both cameras (parallax-proof), applied only along
+  the blend seam (full within 96 px, gone 320 px further). A global black
+  offset was tried (2026-10-20) and dropped: estimated from the scene it
+  wandered -10..+3 levels as the light changed (flare is additive too)
+  (`AFL_CAM_SEAM_FIELD=0` = off; `AFL_CAM_SEAM_DUMP=1` dumps the
+  readings for `tests/rig/test_seam_field.py`). The offline re-stitch has
+  no seam field. Rebuild the .spv with `glslangValidator -V
   stitch_nv12.comp -o stitch_nv12.spv` (byte-reproducible).
 - `afl_cam/native/cam2h264.c` — per-camera recorder (separate mode).
 - `afl_cam/daemon.py` — afl-camd (stdlib only): supervises cam2stitch
@@ -95,7 +105,10 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   `recapture_alignment.py`; the daemon closes the pipeline first, state
   `realigning`), framing guides (seam, overlap, horizon from the live maps,
   `afl_cam/framing.py`), PWA manifest + icons. The rig test re-aligns into
-  `AFL_CAM_ALIGN_OUT` (scratch), never `calibration/`.
+  `AFL_CAM_ALIGN_OUT` (scratch), never `calibration/`. The rig tests run the
+  pipeline on a scratch copy of the live maps whose blend `rig_test.sh`
+  re-cuts with this tree's `place_seam` (`scripts/rig_recut_blend.py`,
+  `AFL_CAM_STITCH_DIR`): they judge the blend the next Re-align writes.
   Record tab has a Live stitch / Separate switch: separate mode closes
   cam2stitch and runs one cam2h264 per camera (`SeparateRecorder`),
   proxy.mp4 = hard link to cam0.mp4; "Stitch" on a separate session runs
@@ -145,8 +158,11 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
 - `afl_cam/seam_refine.py` + `scripts/refine_seam.py` — fits the measured
   overlap misalignment (parallax) as a smooth field and warps both maps by
   half of it, fading out away from the overlap, matches exposure, and
-  re-cuts the blend as a 64 px ramp along the min-difference seam path;
-  last step of the re-align
+  re-cuts the blend as a 64 px smoothstep ramp along the min-difference
+  seam path, kept off the overlap's outer quarters (lens rims) and fully
+  inside it (until 2026-10-20 a float32 tie in `seam_path` sent the path
+  down the overlap's left edge: a hard cut at cam1's rim; a live set cut
+  before that needs one Re-align to get the soft blend); last step of the re-align
   chain, writes only if the stitch score improves (`.prev` maps kept).
 - `afl_cam/stitch_score.py` + `scripts/stitch_score.py` — THE stitch
   quality score (overlap misalignment median/p95 px, exposure step, seam

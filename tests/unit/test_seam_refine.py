@@ -113,3 +113,43 @@ def test_seam_routes_around_a_disagreement():
     w0 = placed.cams[0].weight[100:300, 406:446].astype(int)
     w1 = placed.cams[1].weight[100:300, 406:446].astype(int)
     assert (np.minimum(w0, w1) == 0).mean() > 0.95   # never mixed across it
+
+
+def test_seam_keeps_off_the_overlap_edges():
+    # the views agree best right at cam1's left edge (2026-10-20 on the rig:
+    # the path hugged it and the blend became a hard cut at the lens rim)
+    f0, f1, live = rig()
+    f1 = f1.copy()
+    f1[:, 40:] = np.clip(f1[:, 40:].astype(int) + 12, 0, 255).astype(np.uint8)   # cam1 frame x 40+ differs a little
+    placed = seam_refine.place_seam(f0, f1, wide_ramp(live))
+    w0 = placed.cams[0].weight.astype(int)
+    width = SW - OFF1
+    for r in range(0, SH, 50):
+        mid = np.flatnonzero((w0[r, OFF1:SW] > 0) & (w0[r, OFF1:SW] < 255))
+        assert mid.size > 40, "the ramp was squeezed"
+        centre = (mid.min() + mid.max()) / 2
+        assert 0.2 * width < centre < 0.8 * width, "the seam hugs an edge"
+        assert mid.min() > 0.1 * width, "the ramp runs into the edge"
+
+
+def test_ramp_eases_in_and_out():
+    f0, f1, live = rig()
+    placed = seam_refine.place_seam(f0, f1, wide_ramp(live))
+    row = placed.cams[0].weight[SH // 2, OFF1:SW].astype(int)
+    ramp = row[(row > 0) & (row < 255)]
+    steps = np.abs(np.diff(ramp))
+    assert steps[:3].max() < steps.max() and steps[-3:].max() < steps.max()   # gentle ends
+
+
+def test_seam_path_survives_rows_without_room():
+    # the overlap narrows to nothing at its top: those rows must not wash out
+    # the costs below them (float32 ties sent the path to column 0)
+    rng = np.random.default_rng(1)
+    cost = rng.uniform(5, 10, (400, 300)).astype(np.float32)
+    cost[:, 200] = 0.5                          # the clear best seam
+    valid = np.ones_like(cost, bool)
+    valid[:20] = False
+    valid[20:40, 60:] = False                   # then too narrow for the margin
+    path = seam_refine.seam_path(cost, valid, 32)
+    assert (path[:40] == -1).all()
+    assert np.abs(path[60:] - 200).max() <= 2
