@@ -84,6 +84,22 @@ d = Path("rig-artifacts/blend")
 live = stitch_maps.load(d)
 f0, f1 = (stitch_score.load_still(d / f"cam{i}.rgb", live.src) for i in (0, 1))
 print("[blend] before", json.dumps(stitch_score.score(f0, f1, live)))
+import cv2
+(v0, v1), (m0, m1) = stitch_score.warp_views(f0, f1, live)
+y0b, y1b, x0b, x1b = stitch_score.overlap_box(m0, m1)
+both = (m0 & m1)[y0b:y1b, x0b:x1b]
+def runs(b):
+    e = np.flatnonzero(np.diff(np.concatenate([[0], b.astype(int), [0]])))
+    return [(int(a) + x0b, int(c) - 1 + x0b) for a, c in zip(e[::2], e[1::2])]
+g0 = cv2.GaussianBlur(stitch_score._gray(v0[y0b:y1b, x0b:x1b]).astype(np.float32), (0, 0), 4)
+g1 = cv2.GaussianBlur(stitch_score._gray(v1[y0b:y1b, x0b:x1b]).astype(np.float32), (0, 0), 4)
+cost = cv2.GaussianBlur(np.abs(g0 - g1), (0, 0), 6)
+cost = cost + seam_refine.edge_penalty(both, float(np.median(cost[both])))
+path = seam_refine.seam_path(cost, both, 64)
+for r in range(200, y1b - y0b, 200):
+    print(f"[blend] canvas row {r + y0b}: both {runs(both[r])[:4]} m0 {runs(m0[r + y0b, x0b:x1b])[:3]} "
+          f"m1 {runs(m1[r + y0b, x0b:x1b])[:3]} path x {int(path[r]) + x0b if path[r] >= 0 else -1} "
+          f"cost min at {int(np.argmin(cost[r])) + x0b}")
 new = seam_refine.place_seam(f0, f1, live)
 print("[blend] after ", json.dumps(stitch_score.score(f0, f1, new)))
 stitch_maps.write(d, new)

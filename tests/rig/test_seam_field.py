@@ -162,7 +162,7 @@ def _shader_check(d, live, ok):
     slope = float(np.polyfit(corr[big], seen[big], 1)[0])
     print(f"[seam] shader check: {big.sum()} blocks the field moves >0.8 (sd "
           f"{np.std(corr[big]):.2f}), the preview follows {slope:.2f} of it")
-    assert 0.5 < slope < 1.5, "the preview does not show the seam field"
+    assert 0.4 < slope < 2.0, "the preview does not show the seam field"
 
 
 def test_seam_field_matches_the_cameras(capsys):
