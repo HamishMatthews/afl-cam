@@ -230,6 +230,28 @@ def test_seam_field_matches_the_cameras(capsys):
                       f"dY before {np.median(_luma(b)[ms] - _luma(a)[ms]):+.2f} "
                       f"after {np.median(_luma(b2)[ms] - _luma(a2)[ms]):+.2f}")
 
+        # DIAG: does the ratio depend on the level (tone curves) or the place?
+        a, b = _screen(d, False)
+        a2, b2 = _screen(d, True)
+        ya, yb = _luma(a), _luma(b)
+        lyr = np.log((yb - 14) / (ya - 14))
+        lyr2 = np.log((_luma(b2) - 14) / (_luma(a2) - 14))
+        mean_y = 0.5 * (ya + yb)
+        for name, sel in (("flat", flat), ("all", ok)):
+            row = []
+            for lo in range(16, 236, 24):
+                m = sel & (mean_y >= lo) & (mean_y < lo + 24)
+                if m.sum() >= 20:
+                    row.append(f"{lo}-{lo + 24}:{np.median(lyr[m]):+.3f}/{np.median(lyr2[m]):+.3f}({m.sum()})")
+            print(f"[seam] ratio by level ({name}, before/after): " + " ".join(row))
+        xs = d["xy"][:, 0]
+        row = []
+        for lo in range(int(xs.min()) // 128 * 128, int(xs.max()) + 1, 128):
+            m = ok & (xs >= lo) & (xs < lo + 128)
+            if m.sum() >= 50:
+                row.append(f"{lo}:{np.median(lyr[m]):+.3f}")
+        print("[seam] ratio by x (all): " + " ".join(row))
+
         # the ruler's own noise: the same node medians from two halves of the
         # points (what is left after the field can't go below this)
         a, b = _screen(d, False)
