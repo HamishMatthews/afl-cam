@@ -13,7 +13,6 @@ per-camera gain (params.bin [5..6], applied by the shader). Only the map
 files change: live and offline stitching both pick it up.
 """
 
-from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -26,7 +25,7 @@ def _design(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.stack([np.ones_like(y), y, y * y, y ** 3, x, x * y], axis=-1)
 
 
-def fit_field(tiles: np.ndarray, box: Tuple[int, int, int, int]):
+def fit_field(tiles: np.ndarray, box: tuple[int, int, int, int]):
     """Robust least-squares fit of (dx, dy) over the overlap. Returns
     f(xs, ys) -> (dx, dy) on canvas coords, clamped to the fitted y range."""
     y0, y1, x0, x1 = box
@@ -67,7 +66,7 @@ def _taper(xs: np.ndarray, box, side: str, fade: float) -> np.ndarray:
 
 
 def apply_field(live: stitch_maps.LiveMaps, field, box,
-                fade: Optional[float] = None) -> stitch_maps.LiveMaps:
+                fade: float | None = None) -> stitch_maps.LiveMaps:
     """Warp each camera's map by half the field, opposite ways. The score
     convention is view1(p) = view0(p + d), so view0 samples at p + d/2 and
     view1 at p - d/2: both then show what sat at p + d/2."""
@@ -169,7 +168,13 @@ def place_seam(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps,
     """Re-cut the blend: a `width`-px ramp along the path where the two views
     already agree best (min |view0 - view1|), instead of a wide ramp down
     the middle of the overlap. Residual misalignment then shows only in a
-    thin band, routed through grass rather than across lines or players."""
+    thin band, routed through grass rather than across lines or players.
+
+    The path keeps away from the overlap's edges: there one lens is at its
+    rim (darkest vignetting, softest), and a path hugging the edge left no
+    room for the ramp, so the blend was a hard cut at cam1's edge
+    (2026-10-20). The ramp is a smoothstep, not linear, so its ends don't
+    show as creases on flat ground."""
     (v0, v1), (m0, m1) = stitch_score.warp_views(f0, f1, live)
     box = stitch_score.overlap_box(m0, m1)
     y0, y1, x0, x1 = box
@@ -177,7 +182,8 @@ def place_seam(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps,
     g1 = cv2.GaussianBlur(stitch_score._gray(v1[y0:y1, x0:x1]).astype(np.float32), (0, 0), 4)
     both = (m0 & m1)[y0:y1, x0:x1]
     cost = cv2.GaussianBlur(np.abs(g0 - g1), (0, 0), 6)
-    path = seam_path(cost, both, width // 2 + 1)
+    cost = cost + edge_penalty(both, float(np.median(cost[both])) if both.any() else 1.0)
+    path = seam_path(cost, both, width)
 
     w0 = live.cams[0].weight.copy()
     w1 = live.cams[1].weight.copy()
@@ -186,8 +192,9 @@ def place_seam(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps,
     for r, sx in enumerate(path):
         if sx < 0:
             continue
-        # left camera owns everything left of the seam, ramping to 0 across it
-        a = np.clip((sx + width / 2 - xs) / width, 0, 1)
+        # left camera owns everything left of the seam, easing to 0 across it
+        t = np.clip((sx + width / 2 - xs) / width, 0, 1)
+        a = t * t * (3 - 2 * t)
         a = np.where(both[r], a, np.nan)
         wl = (w0 if left == 0 else w1)[y0 + r, x0:x1]
         wr = (w1 if left == 0 else w0)[y0 + r, x0:x1]
@@ -196,3 +203,20 @@ def place_seam(f0: np.ndarray, f1: np.ndarray, live: stitch_maps.LiveMaps,
         wr[sel] = 255 - wl[sel]
     cams = [stitch_maps.CameraMap(c.map, c.off, w) for c, w in zip(live.cams, (w0, w1))]
     return stitch_maps.LiveMaps(canvas=live.canvas, src=live.src, params=live.params, cams=cams)
+
+
+def edge_penalty(both: np.ndarray, scale: float, reach: float = 0.25) -> np.ndarray:
+    """Cost added near the left/right edges of the both-valid region, per
+    row: 0 beyond `reach` of the row's overlap width from either edge,
+    rising quadratically to 8x the typical view difference at the edge, so
+    the path only goes there when the middle disagrees far more."""
+    pen = np.zeros(both.shape, np.float32)
+    xs = np.arange(both.shape[1], dtype=np.float32)
+    for r in range(both.shape[0]):
+        cols = np.flatnonzero(both[r])
+        if cols.size < 2:
+            continue
+        lo, hi = float(cols[0]), float(cols[-1])
+        d = np.minimum(xs - lo, hi - xs) / max(1.0, reach * (hi - lo))
+        pen[r] = 8.0 * scale * np.clip(1.0 - d, 0.0, 1.0) ** 2
+    return pen
