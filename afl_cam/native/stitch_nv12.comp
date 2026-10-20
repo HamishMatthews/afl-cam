@@ -123,6 +123,13 @@ vec3 field_node(int b) {
     return vec3(P.f[b], P.f[b + 1], P.f[b + 2]);
 }
 
+// the black offset (RGB units) added to each camera before the seam field,
+// after the field's gx * gy nodes
+float black_off(int cam) {
+    int nn = (int(P.f[0]) / 64 + 2) * (int(P.f[1]) / 64 + 2);
+    return P.f[64 + nn * 8 + cam];
+}
+
 vec3 seam_field(int cam, vec2 p) {
     int gx = int(P.f[0]) / 64 + 2;
     vec2 g = p / 64.0;
@@ -136,13 +143,13 @@ vec3 seam_field(int cam, vec2 p) {
 }
 
 // blended RGB at one canvas pixel (pixel-corner coords p); g0/g1 = each
-// camera's gain, exposure x seam field
-vec3 blend_at(vec2 p, vec2 src_dims, vec2 canvas_dims, vec3 g0, vec3 g1) {
+// camera's gain, exposure x seam field; a0/a1 = its black offset x field
+vec3 blend_at(vec2 p, vec2 src_dims, vec2 canvas_dims, vec3 g0, vec3 g1, vec3 a0, vec3 a1) {
     vec2 uv_c = (p + vec2(0.5)) / canvas_dims;
     vec2 s0 = fetch_map(map0, 0, p);
     vec2 s1 = fetch_map(map1, 1, p);
-    return clamp(sample_cam(y0, uv0, s0, src_dims) * g0, 0.0, 1.0) * texture(w0, uv_c).r +
-           clamp(sample_cam(y1, uv1, s1, src_dims) * g1, 0.0, 1.0) * texture(w1, uv_c).r;
+    return clamp(sample_cam(y0, uv0, s0, src_dims) * g0 + a0, 0.0, 1.0) * texture(w0, uv_c).r +
+           clamp(sample_cam(y1, uv1, s1, src_dims) * g1 + a1, 0.0, 1.0) * texture(w1, uv_c).r;
 }
 
 void main() {
@@ -161,12 +168,13 @@ void main() {
     vec2 pc2 = vec2(gid.x * 4 + 2, gid.y);
     vec2 pc3 = vec2(gid.x * 4 + 3, gid.y);
     vec2 pf = vec2(gid.x * 4 + 2, gid.y + 1);
-    vec3 g0 = seam_field(0, pf) * cam_gain(0);
-    vec3 g1 = seam_field(1, pf) * cam_gain(1);
-    uint y0 = uint(rgb_to_y(blend_at(pc0, src_dims, canvas_dims, g0, g1)) * 255.0 + 0.5) & 0xffu;
-    uint y1 = uint(rgb_to_y(blend_at(pc1, src_dims, canvas_dims, g0, g1)) * 255.0 + 0.5) & 0xffu;
-    uint y2 = uint(rgb_to_y(blend_at(pc2, src_dims, canvas_dims, g0, g1)) * 255.0 + 0.5) & 0xffu;
-    uint y3 = uint(rgb_to_y(blend_at(pc3, src_dims, canvas_dims, g0, g1)) * 255.0 + 0.5) & 0xffu;
+    vec3 f0 = seam_field(0, pf), f1 = seam_field(1, pf);
+    vec3 g0 = f0 * cam_gain(0), g1 = f1 * cam_gain(1);
+    vec3 a0 = f0 * black_off(0), a1 = f1 * black_off(1);
+    uint y0 = uint(rgb_to_y(blend_at(pc0, src_dims, canvas_dims, g0, g1, a0, a1)) * 255.0 + 0.5) & 0xffu;
+    uint y1 = uint(rgb_to_y(blend_at(pc1, src_dims, canvas_dims, g0, g1, a0, a1)) * 255.0 + 0.5) & 0xffu;
+    uint y2 = uint(rgb_to_y(blend_at(pc2, src_dims, canvas_dims, g0, g1, a0, a1)) * 255.0 + 0.5) & 0xffu;
+    uint y3 = uint(rgb_to_y(blend_at(pc3, src_dims, canvas_dims, g0, g1, a0, a1)) * 255.0 + 0.5) & 0xffu;
     OUT.d[gid.y * cw4 + gid.x] = y0 | (y1 << 8) | (y2 << 16) | (y3 << 24);
 
     // chroma: even rows only — the 4 pixels cover TWO 2x2 blocks:
@@ -176,12 +184,12 @@ void main() {
         uint uv_base = uint(cw4 * ch);
         uint row = uint(gid.y / 2) * uint(cw / 2);
         vec2 pc0c = vec2(gid.x * 4 + 1, gid.y + 1);
-        vec3 rgb0 = blend_at(pc0c, src_dims, canvas_dims, g0, g1);
+        vec3 rgb0 = blend_at(pc0c, src_dims, canvas_dims, g0, g1, a0, a1);
         uint u0 = uint(rgb_to_u(rgb0) * 255.0 + 0.5) & 0xffu;
         uint v0 = uint(rgb_to_v(rgb0) * 255.0 + 0.5) & 0xffu;
         OUT.d[uv_base + row + gid.x * 2] = u0 | (v0 << 8);
         vec2 pc1c = vec2(gid.x * 4 + 3, gid.y + 1);
-        vec3 rgb1 = blend_at(pc1c, src_dims, canvas_dims, g0, g1);
+        vec3 rgb1 = blend_at(pc1c, src_dims, canvas_dims, g0, g1, a0, a1);
         uint u1 = uint(rgb_to_u(rgb1) * 255.0 + 0.5) & 0xffu;
         uint v1 = uint(rgb_to_v(rgb1) * 255.0 + 0.5) & 0xffu;
         OUT.d[uv_base + row + gid.x * 2 + 1] = u1 | (v1 << 8);
