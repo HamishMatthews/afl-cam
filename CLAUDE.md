@@ -105,7 +105,10 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   `recapture_alignment.py`; the daemon closes the pipeline first, state
   `realigning`), framing guides (seam, overlap, horizon from the live maps,
   `afl_cam/framing.py`), PWA manifest + icons. The rig test re-aligns into
-  `AFL_CAM_ALIGN_OUT` (scratch), never `calibration/`.
+  `AFL_CAM_ALIGN_OUT` (scratch), never `calibration/`. The rig tests run the
+  pipeline on a scratch copy of the live maps whose blend `rig_test.sh`
+  re-cuts with this tree's `place_seam` (`scripts/rig_recut_blend.py`,
+  `AFL_CAM_STITCH_DIR`): they judge the blend the next Re-align writes.
   Record tab has a Live stitch / Separate switch: separate mode closes
   cam2stitch and runs one cam2h264 per camera (`SeparateRecorder`),
   proxy.mp4 = hard link to cam0.mp4; "Stitch" on a separate session runs
