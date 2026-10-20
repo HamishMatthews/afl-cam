@@ -139,3 +139,17 @@ def test_ramp_eases_in_and_out():
     ramp = row[(row > 0) & (row < 255)]
     steps = np.abs(np.diff(ramp))
     assert steps[:3].max() < steps.max() and steps[-3:].max() < steps.max()   # gentle ends
+
+
+def test_seam_path_survives_rows_without_room():
+    # the overlap narrows to nothing at its top: those rows must not wash out
+    # the costs below them (float32 ties sent the path to column 0)
+    rng = np.random.default_rng(1)
+    cost = rng.uniform(5, 10, (400, 300)).astype(np.float32)
+    cost[:, 200] = 0.5                          # the clear best seam
+    valid = np.ones_like(cost, bool)
+    valid[:20] = False
+    valid[20:40, 60:] = False                   # then too narrow for the margin
+    path = seam_refine.seam_path(cost, valid, 32)
+    assert (path[:40] == -1).all()
+    assert np.abs(path[60:] - 200).max() <= 2
