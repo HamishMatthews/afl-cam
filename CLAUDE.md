@@ -69,7 +69,8 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   the blend seam (full within 96 px, gone 320 px further), plus one black
   offset per camera after the grid (the units' blacks differ ~3 levels: a
   gain alone matched bright ground and left dark ground 10-15% apart; the
-  offset is the one that makes each node's ratio level-independent). Rig,
+  offset comes from a quantile-quantile fit of the two cameras' overlap
+  brightness, which parallax can't bias). Rig,
   2026-10-20: at the seam |dY| 4.2 -> 0.8 levels, warmth 3.1 -> 0.5
   (`AFL_CAM_SEAM_FIELD=0` = off; `AFL_CAM_SEAM_DUMP=1` dumps the
   readings for `tests/rig/test_seam_field.py`). The offline re-stitch has

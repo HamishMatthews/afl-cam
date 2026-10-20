@@ -396,8 +396,8 @@ static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
  * channel k at params[FD_BASE + ((j * gx + i) * 2 + c) * 4 + k], bilinear.
  * The units' blacks differ too (rig 2026-10-20: cam1 ~3 levels up, so a
  * gain alone matched bright ground and left dark ground 10-15% apart): one
- * black offset, the level that makes each node's ratio the same at every
- * brightness, is added to cam0 (+half) and cam1 (-half) before the field,
+ * black offset, read from the two cameras' brightness distributions over
+ * the overlap, is added to cam0 (+half) and cam1 (-half) before the field,
  * everywhere, at params[FD_BASE + gx * gy * 8 + c] (RGB units).
  * AFL_CAM_SEAM_FIELD=0 holds it at 1 and 0 (the scalar trim alone). */
 #define FD_CELL 64
@@ -2401,58 +2401,55 @@ static void vc_field(void) {
         }
     }
     pstart[nn] = np;
-    /* the black offset: the one that makes each node's brightness ratio
-     * the same at every level (least summed spread about the node medians);
-     * a slight pull to 0 where the levels can't tell (one level per node).
-     * Read only when enough nodes at different levels have flat ground:
-     * a few nodes at one level fit any offset (the full rig suite, 224
-     * flat points: -1.3 against +3 with 750) */
+    /* the black offset, from the two cameras' brightness distributions over
+     * the whole overlap (quantile against quantile: a misaligned point
+     * moves a pixel, not the distribution, so parallax can't bias it). The
+     * quantiles 10..90% are fitted as cam1 = a * cam0 + c (screen levels
+     * above black); the offset that leaves a pure ratio is 2c / (1 + a).
+     * Read only over a spread of levels (one level fits any offset); the
+     * units' blacks hardly move, so it is smoothed slowly. The flat-point
+     * fit this replaced wandered -6..+3 with the scene (rig, 2026-10-20). */
     double ob = g_fd_black;
-    int bn = 0;
-    double blo = 1e9, bhi = -1e9;
-    for (int q = 0; q < nn; q++) {
-        int m = pstart[q + 1] - pstart[q];
-        if (m < 12)
-            continue;
-        double ys = 0.0;
-        for (int x = pstart[q]; x < pstart[q + 1]; x++)
-            ys += 0.299 * pr[0][0][x] + 0.587 * pr[0][1][x] + 0.114 * pr[0][2][x];
-        ys /= m;
-        blo = ys < blo ? ys : blo;
-        bhi = ys > bhi ? ys : bhi;
-        bn++;
-    }
-    if (g_fd_on && bn >= 8 && bhi - blo >= 0.25) {
-        double best = 1e300, bb = 0.0;
-        for (int pass = 0; pass < 2; pass++) {
-            double lo = pass ? bb - 0.75 : -12.0, step = pass ? 0.25 : 1.0;
-            int nc = pass ? 7 : 25;
-            for (int ci = 0; ci < nc; ci++) {
-                double cand = lo + ci * step, cost = 0.0;
-                double o = cand / 2.0 / 219.0;
-                for (int q = 0; q < nn; q++) {
-                    int m = pstart[q + 1] - pstart[q];
-                    if (m < 12)
-                        continue;
-                    for (int p = 0; p < m; p++) {
-                        int x = pstart[q] + p;
-                        double y0 = 0.299 * pr[0][0][x] + 0.587 * pr[0][1][x] + 0.114 * pr[0][2][x];
-                        double y1 = 0.299 * pr[1][0][x] + 0.587 * pr[1][1][x] + 0.114 * pr[1][2][x];
-                        lr[0][p] = log((y1 - o + 0.01) / (y0 + o + 0.01));
-                    }
-                    qsort(lr[0], (size_t)m, sizeof(double), fd_cmp);
-                    double med = m % 2 ? lr[0][m / 2] : 0.5 * (lr[0][m / 2 - 1] + lr[0][m / 2]);
-                    for (int p = 0; p < m; p++) cost += fabs(lr[0][p] - med);
-                }
-                cost *= 1.0 + 0.002 * fabs(cand);
-                if (cost < best) { best = cost; bb = cand; }
-            }
+    if (g_fd_on) {
+        static double h0[256], h1[256];
+        memset(h0, 0, sizeof h0);
+        memset(h1, 0, sizeof h1);
+        double tot = 0.0;
+        for (int i = 0; i < g_on; i++) {
+            int a = g_vc.ov[0][i], b = g_vc.ov[1][i];
+            if (a < 20 || b < 20 || a > 245 || b > 245)
+                continue;
+            h0[a] += 1.0; h1[b] += 1.0; tot += 1.0;
         }
-        if (best < 1e300) {
-            if (bb > FD_BMAX) bb = FD_BMAX;
-            if (bb < -FD_BMAX) bb = -FD_BMAX;
-            g_fd_black = g_fd_black == 0.0 ? bb : g_fd_black + FD_BALPHA * (bb - g_fd_black);
-            ob = g_fd_black;
+        if (tot >= 2000.0) {
+            double qx[17], qy[17];
+            for (int c = 0; c < 2; c++) {
+                const double *h = c ? h1 : h0;
+                double cum = 0.0;
+                int v = 0, n = 0;
+                for (int k = 0; k < 17; k++) {
+                    double want = (0.10 + 0.05 * k) * tot;
+                    while (v < 255 && cum + h[v] < want) cum += h[v++];
+                    /* within the bin, spread evenly over [v - 0.5, v + 0.5) */
+                    double f = h[v] > 0.0 ? (want - cum) / h[v] : 0.5;
+                    double lev = (v - 0.5 + f - 16.0) * (c ? g1 : g0);
+                    if (c) qy[n++] = lev; else qx[n++] = lev;
+                }
+            }
+            double sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (int k = 0; k < 17; k++) {
+                sx += qx[k]; sy += qy[k]; sxx += qx[k] * qx[k]; sxy += qx[k] * qy[k];
+            }
+            double den = 17.0 * sxx - sx * sx;
+            if (qx[16] - qx[0] >= 40.0 && den > 0.0) {
+                double a = (17.0 * sxy - sx * sy) / den;
+                double c = (sy - a * sx) / 17.0;
+                double bb = a > 0.5 ? 2.0 * c / (1.0 + a) : 0.0;
+                if (bb > FD_BMAX) bb = FD_BMAX;
+                if (bb < -FD_BMAX) bb = -FD_BMAX;
+                g_fd_black = g_fd_black == 0.0 ? bb : g_fd_black + FD_BALPHA * (bb - g_fd_black);
+                ob = g_fd_black;
+            }
         }
     }
     double o = ob / 2.0 / 219.0;
