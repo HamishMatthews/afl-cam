@@ -71,9 +71,49 @@ for _ in $(seq 180); do
     esac
 done
 sudo -n systemctl stop afl-camd
+# DIAG: run the live pipeline on the frozen maps with the blend re-cut by
+# this tree's seam_refine.place_seam (what the next re-align will write)
+mkdir -p rig-artifacts/blend
+cp calibration/stitch_live_full/* rig-artifacts/blend/ 2>/dev/null || true
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+import numpy as np
+from afl_cam import seam_refine, stitch_maps, stitch_score
+d = Path("rig-artifacts/blend")
+live = stitch_maps.load(d)
+f0, f1 = (stitch_score.load_still(d / f"cam{i}.rgb", live.src) for i in (0, 1))
+print("[blend] before", json.dumps(stitch_score.score(f0, f1, live)))
+import cv2
+(v0, v1), (m0, m1) = stitch_score.warp_views(f0, f1, live)
+y0b, y1b, x0b, x1b = stitch_score.overlap_box(m0, m1)
+both = (m0 & m1)[y0b:y1b, x0b:x1b]
+def runs(b):
+    e = np.flatnonzero(np.diff(np.concatenate([[0], b.astype(int), [0]])))
+    return [(int(a) + x0b, int(c) - 1 + x0b) for a, c in zip(e[::2], e[1::2])]
+g0 = cv2.GaussianBlur(stitch_score._gray(v0[y0b:y1b, x0b:x1b]).astype(np.float32), (0, 0), 4)
+g1 = cv2.GaussianBlur(stitch_score._gray(v1[y0b:y1b, x0b:x1b]).astype(np.float32), (0, 0), 4)
+cost = cv2.GaussianBlur(np.abs(g0 - g1), (0, 0), 6)
+cost = cost + seam_refine.edge_penalty(both, float(np.median(cost[both])))
+path = seam_refine.seam_path(cost, both, 64)
+for r in range(200, y1b - y0b, 200):
+    print(f"[blend] canvas row {r + y0b}: both {runs(both[r])[:4]} m0 {runs(m0[r + y0b, x0b:x1b])[:3]} "
+          f"m1 {runs(m1[r + y0b, x0b:x1b])[:3]} path x {int(path[r]) + x0b if path[r] >= 0 else -1} "
+          f"cost min at {int(np.argmin(cost[r])) + x0b}")
+new = seam_refine.place_seam(f0, f1, live)
+print("[blend] after ", json.dumps(stitch_score.score(f0, f1, new)))
+stitch_maps.write(d, new)
+stitch_score.render_seam_crop(f0, f1, new, Path("rig-artifacts/stitch-score/seam_recut.jpg"))
+xs = np.arange(2180, 3100, 24)
+for r in range(100, live.canvas[1], 200):
+    print(f"[blend] row {r:4d} old " + "".join(str(v // 26) for v in live.cams[0].weight[r, xs])
+          + "  new " + "".join(str(v // 26) for v in new.cams[0].weight[r, xs]))
+PY
+export AFL_CAM_STITCH_DIR="$PWD/rig-artifacts/blend"
 # a re-align from the tests writes to a scratch dir, never calibration/
 mkdir -p rig-artifacts/realign
 # and so does the derived cropped map set
+# and cam2stitch dumps its seam readings for test_seam_field
 AFL_CAM_CROP_DIR="$TREE/rig-artifacts/crop" \
 AFL_CAM_SEAM_DUMP=1 \
 AFL_CAM_PORT=$PORT AFL_CAM_CTL_SOCK=$SOCK AFL_CAM_ALIGN_OUT="$TREE/rig-artifacts/realign" \
@@ -87,7 +127,7 @@ for _ in $(seq 60); do
 done
 
 if [ $# -eq 0 ] && [ -z "${RIG_SLOW:-}" ]; then
-    set -- -m "not slow"
+    set -- -m "not slow" -k seam_field
 fi
 # --durations=0 --durations-min=0 prints every test's time, slowest first, at the
 # end of the log: the place to look when the suite is slowing development down

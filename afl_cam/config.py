@@ -203,7 +203,7 @@ STITCH_SHADER = ROOT_DIR / "afl_cam" / "native" / "stitch_nv12.spv"
 # Native full-resolution canvas: width is STITCH_CANVAS_WIDTH, height comes
 # from the frozen maps (currently 5304×1876). Regenerate via:
 #   scripts/dump_camera_params.py <cam0.jpg> <cam1.jpg> calibration/stitch_live_full
-STITCH_PARAMS_DIR = ROOT_DIR / "calibration" / "stitch_live_full"
+STITCH_PARAMS_DIR = Path(os.environ.get("AFL_CAM_STITCH_DIR") or ROOT_DIR / "calibration" / "stitch_live_full")  # DIAG
 # The same maps cropped to the largest fully covered rectangle (no black
 # margins), derived from STITCH_PARAMS_DIR by afl_cam/crop_maps.py when the
 # crop setting is on. Never written by hand. The rig tests point it at a
