@@ -382,13 +382,13 @@ static int *g_op[2], g_on;          /* overlap points, the same scene point per 
 static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
 
 /* The seam field: a smooth per-camera gain over the canvas, so the two
- * cameras render the same brightness where they meet, whatever the units'
- * vignetting and tone differ by there (the white balance split matches
- * their colour). RGB per node, all three equal for now. Each overlap
+ * cameras render the same brightness and colour where they meet, whatever
+ * the units' vignetting, tone and colour shading differ by there (the white
+ * balance split matches their colour on average). RGB per node. Each overlap
  * point belongs to its nearest node of a FD_CELL grid; the median log
- * ratio of the two cameras' brightness over the node's points that are flat
- * in both (parallax-proof) gives d, smoothed over time and space and faded
- * out away from the overlap. cam0 is lifted by half of it and cam1 lowered by
+ * ratio of the two cameras' brightness (and of each channel over it) over
+ * the node's points that are flat in both (parallax-proof) gives d,
+ * smoothed over time and space and faded out away from the overlap. cam0 is lifted by half of it and cam1 lowered by
  * half, so the overall level stays. The shader reads node (i, j), camera c,
  * channel k at params[FD_BASE + ((j * gx + i) * 2 + c) * 4 + k], bilinear.
  * AFL_CAM_SEAM_FIELD=0 holds it at 1 (the scalar trim alone). */
@@ -396,7 +396,8 @@ static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
 #define FD_BASE 64
 #define FD_ALPHA 0.15               /* time smoothing per overlap reading */
 #define FD_FADE 8                   /* nodes the field fades over past the overlap */
-#define FD_MAX 0.15                 /* |log ratio| limit */
+#define FD_MAX 0.15                 /* |log ratio| limit, brightness */
+#define FD_CMAX 0.08                /* and each channel's colour part */
 static int g_fd_on = 1, g_fd_gx, g_fd_gy;
 static int *g_fd_node;              /* overlap point -> grid node */
 static short *g_fd_xy;              /* overlap point -> canvas x, y (AFL_CAM_SEAM_DUMP) */
@@ -2308,7 +2309,7 @@ static int fd_cmp(const void *a, const void *b) {
  * Per node, the median log brightness ratio of the points flat in both
  * cameras (a misaligned point on flat ground still reads the same surface). */
 static void vc_field(void) {
-    static double *e, *t, *fade, *lr[1];
+    static double *e, *t, *fade, *lr[4];
     static int *first, *order;
     int gx = g_fd_gx, gy = g_fd_gy, nn = gx * gy;
     if (!g_pl || nn == 0)
@@ -2319,8 +2320,9 @@ static void vc_field(void) {
         fade = malloc((size_t)nn * sizeof(double));
         first = calloc((size_t)nn + 1, sizeof(int));
         order = malloc((g_on > 0 ? (size_t)g_on : 1) * sizeof(int));
-        lr[0] = malloc((g_on > 0 ? (size_t)g_on : 1) * sizeof(double));
-        if (!e || !t || !fade || !first || !order || !lr[0]) {
+        for (int k = 0; k < 4; k++)
+            lr[k] = malloc((g_on > 0 ? (size_t)g_on : 1) * sizeof(double));
+        if (!e || !t || !fade || !first || !order || !lr[0] || !lr[1] || !lr[2] || !lr[3]) {
             fprintf(stderr, "seam field alloc failed\n");
             exit(1);
         }
@@ -2356,19 +2358,27 @@ static void vc_field(void) {
             }
             if (!ok)
                 continue;
-            /* brightness only: the white balance split already matches
-             * the colour (per-channel ratios only added chroma noise) */
-            lr[0][m] = log(((b - 16.0) * g1 + 2.0) / ((a - 16.0) * g0 + 2.0));
+            /* brightness from luma; colour as each channel's ratio over
+             * the brightness ratio (the white balance split matches the
+             * colour on average, this the rest along the seam) */
+            double ly = log(((b - 16.0) * g1 + 2.0) / ((a - 16.0) * g0 + 2.0));
+            lr[0][m] = ly;
+            for (int k = 0; k < 3; k++)
+                lr[k + 1][m] = log((r1[k] + 0.02) / (r0[k] + 0.02)) - ly;
             m++;
         }
         if (m < 12)
             continue;
-        qsort(lr[0], (size_t)m, sizeof(double), fd_cmp);
-        double d = m % 2 ? lr[0][m / 2] : 0.5 * (lr[0][m / 2 - 1] + lr[0][m / 2]);
-        d = d > FD_MAX ? FD_MAX : d < -FD_MAX ? -FD_MAX : d;
+        double med[4];
+        for (int k = 0; k < 4; k++) {
+            qsort(lr[k], (size_t)m, sizeof(double), fd_cmp);
+            med[k] = m % 2 ? lr[k][m / 2] : 0.5 * (lr[k][m / 2 - 1] + lr[k][m / 2]);
+        }
+        double d = med[0] > FD_MAX ? FD_MAX : med[0] < -FD_MAX ? -FD_MAX : med[0];
         for (int k = 0; k < 3; k++) {
+            double cc = med[k + 1] > FD_CMAX ? FD_CMAX : med[k + 1] < -FD_CMAX ? -FD_CMAX : med[k + 1];
             double *sd = g_fd_d + (size_t)q * 3 + k;
-            *sd = g_fd_seen[q] ? *sd + FD_ALPHA * (d - *sd) : d;
+            *sd = g_fd_seen[q] ? *sd + FD_ALPHA * (d + cc - *sd) : d + cc;
         }
         g_fd_seen[q] = 1;
         seam += fabs(g_fd_d[(size_t)q * 3 + 1]);

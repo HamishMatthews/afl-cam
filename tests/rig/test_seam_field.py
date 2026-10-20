@@ -125,10 +125,11 @@ def _preview_frame():
 
 
 def _shader_check(d, live, ok):
-    """the preview follows the field where one camera renders"""
+    """the preview follows the field where one camera renders (flat points:
+    a point sample and the preview's box-downscaled pixel only agree there)"""
     frame = _preview_frame()
     w0 = live.cams[0].weight[d["xy"][:, 1], d["xy"][:, 0]]
-    one = ok & ((w0 == 0) | (w0 == 255))
+    one = ok & d["flat"][0] & d["flat"][1] & ((w0 == 0) | (w0 == 255))
     px = np.clip((d["xy"][:, 0] * frame.shape[1] / live.canvas[0]).astype(int), 0, frame.shape[1] - 1)
     py = np.clip((d["xy"][:, 1] * frame.shape[0] / live.canvas[1]).astype(int), 0, frame.shape[0] - 1)
     node = _nodes(d)
@@ -136,7 +137,7 @@ def _shader_check(d, live, ok):
     for name, wf in (("plain", False), ("field", True)):
         a, b = _screen(d, wf)
         preds[name] = np.where(w0 == 0, _luma(b), _luma(a))
-    qs = [q for q in np.unique(node[one]) if (one & (node == q)).sum() >= 12]
+    qs = [q for q in np.unique(node[one]) if (one & (node == q)).sum() >= 6]
 
     def mean(v):
         return np.array([v[one & (node == q)].mean() for q in qs])
@@ -147,20 +148,20 @@ def _shader_check(d, live, ok):
     # an offset is fitted too (exposure drift between the dump and the frame)
     corr = fld - plain
     seen = shown - plain
-    big = np.abs(corr) > 0.8
+    big = np.abs(corr) > 0.5
     print(f"[seam] preview vs prediction r {np.corrcoef(plain, shown)[0, 1]:.3f}, "
           f"median offset {np.median(seen):+.2f}")
-    if big.sum() < 10:
+    if big.sum() < 8:
         print("[seam] shader check: the field is too flat here to see in the preview")
         return
-    if np.std(corr[big]) < 0.5:
+    if np.std(corr[big]) < 0.4:
         # a near-uniform correction can't be told from the preview's own
         # level offset (compression, the box downscale, exposure drift)
         print(f"[seam] shader check: the field is too uniform here to see in the preview "
               f"(moves {big.sum()} blocks by {corr[big].mean():+.2f}, sd {np.std(corr[big]):.2f})")
         return
     slope = float(np.polyfit(corr[big], seen[big], 1)[0])
-    print(f"[seam] shader check: {big.sum()} blocks the field moves >0.8 (sd "
+    print(f"[seam] shader check: {big.sum()} blocks the field moves >0.5 (sd "
           f"{np.std(corr[big]):.2f}), the preview follows {slope:.2f} of it")
     assert 0.4 < slope < 2.0, "the preview does not show the seam field"
 
