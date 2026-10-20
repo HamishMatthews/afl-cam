@@ -2454,10 +2454,8 @@ static void vc_field(void) {
                 t[((size_t)j * gx + i) * 3 + k] = m % 2 ? w[m / 2] : 0.5 * (w[m / 2 - 1] + w[m / 2]);
             }
     memcpy(e, t, (size_t)nn * 3 * sizeof(double));
-    for (int p = 0; p < 2; p++) {
-        fd_blur(e, t, 1);
-        fd_blur(e, t, 0);
-    }
+    fd_blur(e, t, 1);
+    fd_blur(e, t, 0);
     for (int q = 0; q < nn; q++)
         for (int k = 0; k < 3; k++)
             e[(size_t)q * 3 + k] *= fade[q];

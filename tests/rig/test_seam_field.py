@@ -212,6 +212,17 @@ def test_seam_field_matches_the_cameras(capsys):
                   f"|d warmth| {_med_abs(dw):.2f}; at the seam ({len(sy)} blocks) "
                   f"|dY| {_med_abs(sy):.2f}, |d warmth| {_med_abs(sw):.2f}")
 
+        # the ruler's own noise: the same node medians from two halves of the
+        # points (what is left after the field can't go below this)
+        a, b = _screen(d, False)
+        half = (np.arange(len(y0)) % 2) == 0
+        h1 = _node_medians(_luma(b) - _luma(a), node, flat & half, 4)
+        h2 = _node_medians(_luma(b) - _luma(a), node, flat & ~half, 4)
+        both_q = sorted(set(h1) & set(h2))
+        if both_q:
+            print(f"[seam] ruler noise: half-vs-half node |dY| "
+                  f"{np.median([abs(h1[q] - h2[q]) for q in both_q]) / 2:.2f} ({len(both_q)} blocks)")
+
         if live is not None:
             _shader_check(d, live, ok)
 
