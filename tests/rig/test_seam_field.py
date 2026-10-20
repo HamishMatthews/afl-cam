@@ -31,8 +31,8 @@ SEAM_BAND = 96          # px either side of the seam that count as "at the seam"
 def _load():
     b = DUMP.read_bytes()
     n, gx, gy = (int(v) for v in np.frombuffer(b, np.int32, 3))
-    g = np.frombuffer(b, np.float32, 4, 12).astype(float)
-    o = 28
+    g = np.frombuffer(b, np.float32, 2, 12).astype(float)
+    o = 20
     xy = np.frombuffer(b, np.int16, 2 * n, o).reshape(n, 2).astype(int)
     o += 4 * n
     ch = []
@@ -40,7 +40,7 @@ def _load():
         ch.append(np.frombuffer(b, np.uint8, n, o).astype(float))
         o += n
     field = np.frombuffer(b, np.float32, gx * gy * 8, o).reshape(gy, gx, 2, 4)[..., :3]
-    return {"g": g[:2], "black": g[2:], "xy": xy, "gx": gx, "gy": gy, "cams": (ch[0:3], ch[4:7]),
+    return {"g": g, "xy": xy, "gx": gx, "gy": gy, "cams": (ch[0:3], ch[4:7]),
             "flat": (ch[3] > 0, ch[7] > 0), "field": field.astype(float)}
 
 
@@ -76,8 +76,7 @@ def _screen(d, with_field):
     for c in (0, 1):
         rgb = _rgb(*d["cams"][c]) * d["g"][c]
         if with_field:
-            # the black offset, then the field (as the shader)
-            rgb = (rgb + d["black"][c]) * _field_at(d["field"], c, d["xy"])
+            rgb = rgb * _field_at(d["field"], c, d["xy"])
         out.append(np.clip(rgb, 0, 1))
     return out
 
@@ -183,8 +182,7 @@ def test_seam_field_matches_the_cameras(capsys):
         y0, y1 = d["cams"][0][0], d["cams"][1][0]
         ok = (y0 >= 24) & (y1 >= 24) & (y0 <= 232) & (y1 <= 232)
         flat = ok & d["flat"][0] & d["flat"][1]
-        print(f"\n[seam] gains {d['g'][0]:.3f} / {d['g'][1]:.3f}, blacks cam1 - cam0 "
-              f"{d['black'][0] * 2 * 219:+.2f} levels, field cam0 "
+        print(f"\n[seam] gains {d['g'][0]:.3f} / {d['g'][1]:.3f}, field cam0 "
               f"{fld[..., 0, :].min():.3f}..{fld[..., 0, :].max():.3f}, overlap points "
               f"{len(y0)}, flat in both {flat.sum()}")
         if flat.sum() < 200:

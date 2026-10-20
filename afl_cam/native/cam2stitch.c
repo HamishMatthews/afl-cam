@@ -394,12 +394,7 @@ static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
  * alone is on screen). cam0 is lifted by half of it and cam1 lowered by
  * half, so the overall level stays. The shader reads node (i, j), camera c,
  * channel k at params[FD_BASE + ((j * gx + i) * 2 + c) * 4 + k], bilinear.
- * The units' blacks differ too (rig 2026-10-20: cam1 ~3 levels up, so a
- * gain alone matched bright ground and left dark ground 10-15% apart): one
- * black offset, read from the two cameras' brightness distributions over
- * the overlap, is added to cam0 (+half) and cam1 (-half) before the field,
- * everywhere, at params[FD_BASE + gx * gy * 8 + c] (RGB units).
- * AFL_CAM_SEAM_FIELD=0 holds it at 1 and 0 (the scalar trim alone). */
+ * AFL_CAM_SEAM_FIELD=0 holds it at 1 (the scalar trim alone). */
 #define FD_CELL 64
 #define FD_BASE 64
 #define FD_ALPHA 0.15               /* time smoothing per overlap reading */
@@ -407,8 +402,6 @@ static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
 #define FD_SEAM_FULL 96             /* px either side of the seam at full strength */
 #define FD_SEAM_FADE 320            /* px it then fades to nothing over */
 #define FD_MAX 0.30                 /* |log ratio| limit, brightness */
-#define FD_BMAX 10.0                /* |black offset| limit, Y levels */
-#define FD_BALPHA 0.05              /* its time smoothing (a property of the units) */
 #define FD_CMAX 0.08                /* and each channel's colour part */
 static int g_fd_on = 1, g_fd_gx, g_fd_gy;
 static int *g_fd_node;              /* overlap point -> grid node */
@@ -418,7 +411,6 @@ static double *g_fd_d;              /* per node, 3 channels: smoothed log ratio 
 static uint8_t *g_fd_seen;          /* node has had a valid reading */
 static double *g_fd_near;           /* per node, 1 at the blend seam fading to 0 */
 static double g_fd_seam;            /* mean |d| (luma) over the read nodes, for the status */
-static double g_fd_black;           /* cam1 - cam0 black offset, Y levels (smoothed) */
 
 /* The one exposure both cameras run, guarded by g_ae_mu. ev is the exposure
  * wanted (100 us units, continuous, up to the cap); past the cap the camera
@@ -727,7 +719,7 @@ static void gpu_init(gpu_t *g, const char *spv_path,
 
     VkBufferCreateInfo pbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                 .size = (FD_BASE + (size_t)(g->canvas_w / FD_CELL + 2) *
-                                         (g->canvas_h / FD_CELL + 2) * 8 + 4) * sizeof(float),
+                                         (g->canvas_h / FD_CELL + 2) * 8) * sizeof(float),
                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
     VkBuffer pbuf;
     CHECK(vkCreateBuffer(g->dev, &pbci, NULL, &pbuf));
@@ -736,10 +728,8 @@ static void gpu_init(gpu_t *g, const char *spv_path,
     void *pmap;
     CHECK(vkMapMemory(g->dev, pbmem, 0, pbci.size, 0, &pmap));
     memcpy(pmap, params_data, FD_BASE * sizeof(float));
-    for (size_t k = FD_BASE; k < pbci.size / sizeof(float) - 4; k++)
+    for (size_t k = FD_BASE; k < pbci.size / sizeof(float); k++)
         ((float *)pmap)[k] = 1.0f;      /* seam field: no correction yet */
-    for (size_t k = pbci.size / sizeof(float) - 4; k < pbci.size / sizeof(float); k++)
-        ((float *)pmap)[k] = 0.0f;      /* black offsets */
     g_pl = (volatile float *)pmap;      /* stays mapped: live exposure gain + seam field */
     vc_build(pf, (const uint8_t *)w0d, (const uint8_t *)w1d,
              (const float *)m0d, (const float *)m1d);
@@ -2401,59 +2391,7 @@ static void vc_field(void) {
         }
     }
     pstart[nn] = np;
-    /* the black offset, from the two cameras' brightness distributions over
-     * the whole overlap (quantile against quantile: a misaligned point
-     * moves a pixel, not the distribution, so parallax can't bias it). The
-     * quantiles 10..90% are fitted as cam1 = a * cam0 + c (screen levels
-     * above black); the offset that leaves a pure ratio is 2c / (1 + a).
-     * Read only over a spread of levels (one level fits any offset); the
-     * units' blacks hardly move, so it is smoothed slowly. The flat-point
-     * fit this replaced wandered -6..+3 with the scene (rig, 2026-10-20). */
-    double ob = g_fd_black;
-    if (g_fd_on) {
-        static double h0[256], h1[256];
-        memset(h0, 0, sizeof h0);
-        memset(h1, 0, sizeof h1);
-        double tot = 0.0;
-        for (int i = 0; i < g_on; i++) {
-            int a = g_vc.ov[0][i], b = g_vc.ov[1][i];
-            if (a < 20 || b < 20 || a > 245 || b > 245)
-                continue;
-            h0[a] += 1.0; h1[b] += 1.0; tot += 1.0;
-        }
-        if (tot >= 2000.0) {
-            double qx[17], qy[17];
-            for (int c = 0; c < 2; c++) {
-                const double *h = c ? h1 : h0;
-                double cum = 0.0;
-                int v = 0, n = 0;
-                for (int k = 0; k < 17; k++) {
-                    double want = (0.10 + 0.05 * k) * tot;
-                    while (v < 255 && cum + h[v] < want) cum += h[v++];
-                    /* within the bin, spread evenly over [v - 0.5, v + 0.5) */
-                    double f = h[v] > 0.0 ? (want - cum) / h[v] : 0.5;
-                    double lev = (v - 0.5 + f - 16.0) * (c ? g1 : g0);
-                    if (c) qy[n++] = lev; else qx[n++] = lev;
-                }
-            }
-            double sx = 0, sy = 0, sxx = 0, sxy = 0;
-            for (int k = 0; k < 17; k++) {
-                sx += qx[k]; sy += qy[k]; sxx += qx[k] * qx[k]; sxy += qx[k] * qy[k];
-            }
-            double den = 17.0 * sxx - sx * sx;
-            if (qx[16] - qx[0] >= 40.0 && den > 0.0) {
-                double a = (17.0 * sxy - sx * sy) / den;
-                double c = (sy - a * sx) / 17.0;
-                double bb = a > 0.5 ? 2.0 * c / (1.0 + a) : 0.0;
-                if (bb > FD_BMAX) bb = FD_BMAX;
-                if (bb < -FD_BMAX) bb = -FD_BMAX;
-                g_fd_black = g_fd_black == 0.0 ? bb : g_fd_black + FD_BALPHA * (bb - g_fd_black);
-                ob = g_fd_black;
-            }
-        }
-    }
-    double o = ob / 2.0 / 219.0;
-    /* per node: the log ratio cam1 / cam0 with the blacks matched */
+    /* per node: the log ratio cam1 / cam0 */
     int read = 0;
     for (int q = 0; q < nn; q++) {
         int m = pstart[q + 1] - pstart[q];
@@ -2462,7 +2400,7 @@ static void vc_field(void) {
         for (int p = 0; p < m; p++) {
             int x = pstart[q] + p;
             double r0[3], r1[3];
-            for (int k = 0; k < 3; k++) { r0[k] = pr[0][k][x] + o; r1[k] = pr[1][k][x] - o; }
+            for (int k = 0; k < 3; k++) { r0[k] = pr[0][k][x]; r1[k] = pr[1][k][x]; }
             /* brightness from luma; colour as each channel's ratio over
              * the brightness ratio (the white balance split matches the
              * colour on average, this the rest along the seam) */
@@ -2552,21 +2490,17 @@ static void vc_field(void) {
             g_pl[FD_BASE + (q * 2 + 0) * 4 + k] = (float)exp(h);
             g_pl[FD_BASE + (q * 2 + 1) * 4 + k] = (float)exp(-h);
         }
-    g_pl[FD_BASE + nn * 8 + 0] = g_fd_on ? (float)o : 0.0f;
-    g_pl[FD_BASE + nn * 8 + 1] = g_fd_on ? (float)-o : 0.0f;
 }
 
 /* the overlap readings and the seam field, for the rig test's seam check:
- * int n, gx, gy; float gain[2], black offset[2] (RGB units, added before
- * the field); int16 xy[2n]; per camera u8 Y, U, V, flat [n];
+ * int n, gx, gy; float gain[2]; int16 xy[2n]; per camera u8 Y, U, V, flat [n];
  * float field[gx * gy * 8] (the shader's layout) */
 static void vc_field_dump(void) {
     FILE *f = fopen("outputs/_live/seam_dump.tmp", "wb");
     if (!f)
         return;
     int hdr[3] = { g_on, g_fd_gx, g_fd_gy };
-    int nn = g_fd_gx * g_fd_gy;
-    float g[4] = { g_pl[5], g_pl[6], g_pl[FD_BASE + nn * 8], g_pl[FD_BASE + nn * 8 + 1] };
+    float g[2] = { g_pl[5], g_pl[6] };
     fwrite(hdr, sizeof hdr, 1, f);
     fwrite(g, sizeof g, 1, f);
     fwrite(g_fd_xy, sizeof(short), 2 * (size_t)g_on, f);
@@ -3008,13 +2942,13 @@ static const char *cam_timing(const cam_t *c, char *buf, size_t n) {
     snprintf(buf, n, "\"slot_ms\":%.2f,\"dq_ms\":%.2f,\"dec_ms\":%.2f,"
              "\"dt_ms\":%.2f,\"gap50\":%d,\"seq_lost\":%d,\"luma\":%.1f,\"u\":%.1f,\"v\":%.1f,"
              "\"exp_ms\":%.1f,\"gamma\":%d,\"gain\":%.3f,\"field_med\":%.0f,\"field_clip_pct\":%.2f,"
-             "\"ae_settled\":%s,\"ae_changes\":%d,\"wb_k\":%d,\"wb_auto\":%s,\"seam_d\":%.4f,\"seam_black\":%.2f",
+             "\"ae_settled\":%s,\"ae_changes\":%d,\"wb_k\":%d,\"wb_auto\":%s,\"seam_d\":%.4f",
              c->t_slot_us * k, c->t_dq_us * k, c->t_dec_us * k, dt,
              c->ts_gap, c->seq_lost, c->luma_last, c->u_last, c->v_last,
              (c->exposure > 0 ? c->exposure : g_vc.exp) / 10.0, g_vc.lift,
              g_pl ? g_pl[5 + c->idx] : 1.0, g_vc.med, g_vc.hi_pct,
              g_vc.settled ? "true" : "false", g_vc.changes, g_vc.wbk[c->idx],
-             g_wbk && g_vc.wb_phase == 1 ? "false" : "true", g_fd_seam, g_fd_black);
+             g_wbk && g_vc.wb_phase == 1 ? "false" : "true", g_fd_seam);
     return buf;
 }
 
