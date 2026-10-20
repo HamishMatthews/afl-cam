@@ -214,46 +214,6 @@ def test_seam_field_matches_the_cameras(capsys):
                   f"|d warmth| {_med_abs(dw):.2f}; at the seam ({len(sy)} blocks) "
                   f"|dY| {_med_abs(sy):.2f}, |d warmth| {_med_abs(sw):.2f}")
 
-        # DIAG: per seam node, the ratio the readings ask for vs the field's
-        if at_seam.any():
-            a, b = _screen(d, False)
-            lyr = np.log((_luma(b) - 14) / (_luma(a) - 14))
-            fl = d["field"]
-            for q in sorted(set(_node_medians(lyr, node, flat & at_seam))):
-                j, i = divmod(q, d["gx"])
-                m = flat & (node == q)
-                ms = m & at_seam
-                want = float(np.median(lyr[m]))
-                lum = np.array([0.299, 0.587, 0.114])
-                got = float(np.log((fl[j, i, 0] @ lum) / (fl[j, i, 1] @ lum)))
-                a2, b2 = _screen(d, True)
-                print(f"[seam] node ({i},{j}) n {m.sum()}/{ms.sum()} want {want:+.3f} "
-                      f"field {got:+.3f} seam-pts want {np.median(lyr[ms]):+.3f} "
-                      f"dY before {np.median(_luma(b)[ms] - _luma(a)[ms]):+.2f} "
-                      f"after {np.median(_luma(b2)[ms] - _luma(a2)[ms]):+.2f}")
-
-        # DIAG: does the ratio depend on the level (tone curves) or the place?
-        a, b = _screen(d, False)
-        a2, b2 = _screen(d, True)
-        ya, yb = _luma(a), _luma(b)
-        lyr = np.log((yb - 14) / (ya - 14))
-        lyr2 = np.log((_luma(b2) - 14) / (_luma(a2) - 14))
-        mean_y = 0.5 * (ya + yb)
-        for name, sel in (("flat", flat), ("all", ok)):
-            row = []
-            for lo in range(16, 236, 24):
-                m = sel & (mean_y >= lo) & (mean_y < lo + 24)
-                if m.sum() >= 20:
-                    row.append(f"{lo}-{lo + 24}:{np.median(lyr[m]):+.3f}/{np.median(lyr2[m]):+.3f}({m.sum()})")
-            print(f"[seam] ratio by level ({name}, before/after): " + " ".join(row))
-        xs = d["xy"][:, 0]
-        row = []
-        for lo in range(int(xs.min()) // 128 * 128, int(xs.max()) + 1, 128):
-            m = ok & (xs >= lo) & (xs < lo + 128)
-            if m.sum() >= 50:
-                row.append(f"{lo}:{np.median(lyr[m]):+.3f}")
-        print("[seam] ratio by x (all): " + " ".join(row))
-
         # the ruler's own noise: the same node medians from two halves of the
         # points (what is left after the field can't go below this)
         a, b = _screen(d, False)
@@ -269,5 +229,5 @@ def test_seam_field_matches_the_cameras(capsys):
             _shader_check(d, live, ok)
 
         (by, bw), (ay, aw) = res["before"], res["after"]
-        assert _med_abs(ay) < max(1.0, 0.5 * _med_abs(by)), "the seam field leaves a brightness step"
-        assert _med_abs(aw) < max(1.5, 1.5 * _med_abs(bw)), "the seam field makes a colour step"
+        assert _med_abs(ay) < max(1.25, 0.4 * _med_abs(by)), "the seam field leaves a brightness step"
+        assert _med_abs(aw) < max(1.5, 0.75 * _med_abs(bw)), "the seam field leaves a colour step"

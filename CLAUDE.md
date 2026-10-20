@@ -62,12 +62,16 @@ afl-camd (`afl_cam/web/index.html`); the GTK desk app was retired
   SSBO packing; per-camera gain at params [5..6]. Live, cam2stitch writes
   it (shader gain x seam trim) into the mapped params buffer; params.bin's
   stored value is only used by -src and the offline paths. After the 64
-  params floats cam2stitch keeps the seam field: a smooth per-camera RGB
-  gain on a 64 px node grid (bilinear, read once per thread), fitted live
+  params floats cam2stitch keeps the seam field: a per-camera RGB gain on a
+  64 px node grid (bilinear, no blur, read once per thread), fitted live
   from the median brightness ratio (and each channel's ratio over it) of
-  overlap points flat in both cameras (parallax-proof), held at the
-  overlap's edges and faded out past them, so the cameras match where they
-  meet whatever their vignetting/tone/colour shading differ by (`AFL_CAM_SEAM_FIELD=0` = off; `AFL_CAM_SEAM_DUMP=1` dumps the
+  overlap points flat in both cameras (parallax-proof), applied only along
+  the blend seam (full within 96 px, gone 320 px further), plus one black
+  offset per camera after the grid (the units' blacks differ ~3 levels: a
+  gain alone matched bright ground and left dark ground 10-15% apart; the
+  offset is the one that makes each node's ratio level-independent). Rig,
+  2026-10-20: at the seam |dY| 4.2 -> 0.8 levels, warmth 3.1 -> 0.5
+  (`AFL_CAM_SEAM_FIELD=0` = off; `AFL_CAM_SEAM_DUMP=1` dumps the
   readings for `tests/rig/test_seam_field.py`). The offline re-stitch has
   no seam field. Rebuild the .spv with `glslangValidator -V
   stitch_nv12.comp -o stitch_nv12.spv` (byte-reproducible).
