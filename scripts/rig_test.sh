@@ -71,6 +71,29 @@ for _ in $(seq 180); do
     esac
 done
 sudo -n systemctl stop afl-camd
+# DIAG: run the live pipeline on the frozen maps with the blend re-cut by
+# this tree's seam_refine.place_seam (what the next re-align will write)
+mkdir -p rig-artifacts/blend
+cp calibration/stitch_live_full/* rig-artifacts/blend/ 2>/dev/null || true
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+import numpy as np
+from afl_cam import seam_refine, stitch_maps, stitch_score
+d = Path("rig-artifacts/blend")
+live = stitch_maps.load(d)
+f0, f1 = (stitch_score.load_still(d / f"cam{i}.rgb", live.src) for i in (0, 1))
+print("[blend] before", json.dumps(stitch_score.score(f0, f1, live)))
+new = seam_refine.place_seam(f0, f1, live)
+print("[blend] after ", json.dumps(stitch_score.score(f0, f1, new)))
+stitch_maps.write(d, new)
+stitch_score.render_seam_crop(f0, f1, new, Path("rig-artifacts/stitch-score/seam_recut.jpg"))
+xs = np.arange(2180, 3100, 24)
+for r in range(100, live.canvas[1], 200):
+    print(f"[blend] row {r:4d} old " + "".join(str(v // 26) for v in live.cams[0].weight[r, xs])
+          + "  new " + "".join(str(v // 26) for v in new.cams[0].weight[r, xs]))
+PY
+export AFL_CAM_STITCH_DIR="$PWD/rig-artifacts/blend"
 # a re-align from the tests writes to a scratch dir, never calibration/
 mkdir -p rig-artifacts/realign
 # and so does the derived cropped map set
@@ -88,7 +111,7 @@ for _ in $(seq 60); do
 done
 
 if [ $# -eq 0 ] && [ -z "${RIG_SLOW:-}" ]; then
-    set -- -m "not slow"
+    set -- -m "not slow" -k seam_field
 fi
 # --durations=0 --durations-min=0 prints every test's time, slowest first, at the
 # end of the log: the place to look when the suite is slowing development down
