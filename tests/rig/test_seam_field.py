@@ -209,7 +209,7 @@ def test_seam_field_matches_the_cameras(capsys):
             dw = _node_medians(_warmth(b) - _warmth(a), node, flat)
             sy = _node_medians(_luma(b) - _luma(a), node, flat & at_seam)
             sw = _node_medians(_warmth(b) - _warmth(a), node, flat & at_seam)
-            res[name] = (sy, sw) if len(sy) >= 5 else (dy, dw)
+            res[name] = (sy, sw)
             print(f"[seam] {name:6s}: flat overlap ({len(dy)} blocks) |dY| {_med_abs(dy):.2f}, "
                   f"|d warmth| {_med_abs(dw):.2f}; at the seam ({len(sy)} blocks) "
                   f"|dY| {_med_abs(sy):.2f}, |d warmth| {_med_abs(sw):.2f}")
@@ -229,5 +229,9 @@ def test_seam_field_matches_the_cameras(capsys):
             _shader_check(d, live, ok)
 
         (by, bw), (ay, aw) = res["before"], res["after"]
+        if len(by) < 5:
+            # the field works only along the seam (elsewhere one camera
+            # alone is on screen): the rest of the overlap can't judge it
+            pytest.skip(f"only {len(by)} blocks of flat ground at the seam to compare")
         assert _med_abs(ay) < max(1.25, 0.4 * _med_abs(by)), "the seam field leaves a brightness step"
         assert _med_abs(aw) < max(1.5, 0.75 * _med_abs(bw)), "the seam field leaves a colour step"

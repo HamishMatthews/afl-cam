@@ -408,6 +408,7 @@ static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
 #define FD_SEAM_FADE 320            /* px it then fades to nothing over */
 #define FD_MAX 0.30                 /* |log ratio| limit, brightness */
 #define FD_BMAX 10.0                /* |black offset| limit, Y levels */
+#define FD_BALPHA 0.05              /* its time smoothing (a property of the units) */
 #define FD_CMAX 0.08                /* and each channel's colour part */
 static int g_fd_on = 1, g_fd_gx, g_fd_gy;
 static int *g_fd_node;              /* overlap point -> grid node */
@@ -2402,9 +2403,26 @@ static void vc_field(void) {
     pstart[nn] = np;
     /* the black offset: the one that makes each node's brightness ratio
      * the same at every level (least summed spread about the node medians);
-     * a slight pull to 0 where the levels can't tell (one level per node) */
+     * a slight pull to 0 where the levels can't tell (one level per node).
+     * Read only when enough nodes at different levels have flat ground:
+     * a few nodes at one level fit any offset (the full rig suite, 224
+     * flat points: -1.3 against +3 with 750) */
     double ob = g_fd_black;
-    if (g_fd_on) {
+    int bn = 0;
+    double blo = 1e9, bhi = -1e9;
+    for (int q = 0; q < nn; q++) {
+        int m = pstart[q + 1] - pstart[q];
+        if (m < 12)
+            continue;
+        double ys = 0.0;
+        for (int x = pstart[q]; x < pstart[q + 1]; x++)
+            ys += 0.299 * pr[0][0][x] + 0.587 * pr[0][1][x] + 0.114 * pr[0][2][x];
+        ys /= m;
+        blo = ys < blo ? ys : blo;
+        bhi = ys > bhi ? ys : bhi;
+        bn++;
+    }
+    if (g_fd_on && bn >= 8 && bhi - blo >= 0.25) {
         double best = 1e300, bb = 0.0;
         for (int pass = 0; pass < 2; pass++) {
             double lo = pass ? bb - 0.75 : -12.0, step = pass ? 0.25 : 1.0;
@@ -2433,7 +2451,7 @@ static void vc_field(void) {
         if (best < 1e300) {
             if (bb > FD_BMAX) bb = FD_BMAX;
             if (bb < -FD_BMAX) bb = -FD_BMAX;
-            g_fd_black = g_fd_black == 0.0 ? bb : g_fd_black + FD_ALPHA * (bb - g_fd_black);
+            g_fd_black = g_fd_black == 0.0 ? bb : g_fd_black + FD_BALPHA * (bb - g_fd_black);
             ob = g_fd_black;
         }
     }
