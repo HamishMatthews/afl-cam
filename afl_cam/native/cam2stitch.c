@@ -388,7 +388,9 @@ static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
  * point belongs to its nearest node of a FD_CELL grid; the median log
  * ratio of the two cameras' brightness (and of each channel over it) over
  * the node's points that are flat in both (parallax-proof) gives d,
- * smoothed over time and space and faded out away from the overlap. cam0 is lifted by half of it and cam1 lowered by
+ * smoothed over time and space, and applied only along the blend seam (full
+ * within FD_SEAM_FULL px, gone FD_SEAM_FADE px further: elsewhere one camera
+ * alone is on screen). cam0 is lifted by half of it and cam1 lowered by
  * half, so the overall level stays. The shader reads node (i, j), camera c,
  * channel k at params[FD_BASE + ((j * gx + i) * 2 + c) * 4 + k], bilinear.
  * AFL_CAM_SEAM_FIELD=0 holds it at 1 (the scalar trim alone). */
@@ -396,6 +398,8 @@ static int *g_cp[2], g_cn[2];       /* whole-canvas colour points per camera */
 #define FD_BASE 64
 #define FD_ALPHA 0.15               /* time smoothing per overlap reading */
 #define FD_FADE 8                   /* nodes the field fades over past the overlap */
+#define FD_SEAM_FULL 96             /* px either side of the seam at full strength */
+#define FD_SEAM_FADE 320            /* px it then fades to nothing over */
 #define FD_MAX 0.15                 /* |log ratio| limit, brightness */
 #define FD_CMAX 0.08                /* and each channel's colour part */
 static int g_fd_on = 1, g_fd_gx, g_fd_gy;
@@ -404,6 +408,7 @@ static short *g_fd_xy;              /* overlap point -> canvas x, y (AFL_CAM_SEA
 static int g_fd_dump;
 static double *g_fd_d;              /* per node, 3 channels: smoothed log ratio */
 static uint8_t *g_fd_seen;          /* node has had a valid reading */
+static double *g_fd_near;           /* per node, 1 at the blend seam fading to 0 */
 static double g_fd_seam;            /* mean |d| (luma) over the read nodes, for the status */
 
 /* The one exposure both cameras run, guarded by g_ae_mu. ev is the exposure
@@ -509,7 +514,36 @@ static void vc_build(const float *pf, const uint8_t *w0d, const uint8_t *w1d,
     g_fd_xy = malloc(cap * 2 * sizeof(short));
     g_fd_d = calloc((size_t)g_fd_gx * g_fd_gy * 3, sizeof(double));
     g_fd_seen = calloc((size_t)g_fd_gx * g_fd_gy, 1);
-    if (!g_fd_node || !g_fd_xy || !g_fd_d || !g_fd_seen) { fprintf(stderr, "seam field alloc failed\n"); exit(1); }
+    g_fd_near = calloc((size_t)g_fd_gx * g_fd_gy, sizeof(double));
+    /* the correction is only wanted where the two cameras meet: away from
+     * the seam one camera alone is on screen, and a gain there could only
+     * add a patch. Per node row, the seam is where cam0's weight drops
+     * below half with cam1 on screen; rows without one take the nearest */
+    if (g_fd_near) {
+        int *sx = malloc((size_t)g_fd_gy * sizeof(int));
+        for (int j = 0; sx && j < g_fd_gy; j++) {
+            int y = j * FD_CELL < ch ? j * FD_CELL : ch - 1;
+            sx[j] = -1;
+            for (int x = 0; x < cw; x++) {
+                size_t i = ((size_t)y * cw + x) * 4;
+                if (w1d[i] > 0 && w0d[i] < 128) { sx[j] = x; break; }
+            }
+        }
+        for (int j = 0; sx && j < g_fd_gy; j++) {
+            int src = -1;
+            for (int o = 0; o < g_fd_gy && src < 0; o++) {
+                if (j - o >= 0 && sx[j - o] >= 0) src = j - o;
+                else if (j + o < g_fd_gy && sx[j + o] >= 0) src = j + o;
+            }
+            for (int i = 0; src >= 0 && i < g_fd_gx; i++) {
+                double d = fabs((double)i * FD_CELL - sx[src]);
+                double f = 1.0 - (d - FD_SEAM_FULL) / FD_SEAM_FADE;
+                g_fd_near[j * g_fd_gx + i] = f > 1.0 ? 1.0 : f < 0.0 ? 0.0 : f;
+            }
+        }
+        free(sx);
+    }
+    if (!g_fd_node || !g_fd_xy || !g_fd_d || !g_fd_seen || !g_fd_near) { fprintf(stderr, "seam field alloc failed\n"); exit(1); }
     g_on = 0;
     for (int y = VC_OV_STEP / 2; y < ch; y += VC_OV_STEP)
         for (int x = VC_OV_STEP / 2; x < cw; x += VC_OV_STEP) {
@@ -2438,27 +2472,11 @@ static void vc_field(void) {
         memcpy(e + (size_t)j * gx * 3, e + (size_t)src * gx * 3, (size_t)gx * 3 * sizeof(double));
         memcpy(fade + (size_t)j * gx, fade + (size_t)src * gx, (size_t)gx * sizeof(double));
     }
-    /* a 3x3 median drops single odd nodes (a player, a pole), then the blur */
-    for (int j = 0; j < gy; j++)
-        for (int i = 0; i < gx; i++)
-            for (int k = 0; k < 3; k++) {
-                double w[9];
-                int m = 0;
-                for (int dj = -1; dj <= 1; dj++)
-                    for (int di = -1; di <= 1; di++) {
-                        int jj = j + dj, ii = i + di;
-                        if (jj >= 0 && jj < gy && ii >= 0 && ii < gx)
-                            w[m++] = e[((size_t)jj * gx + ii) * 3 + k];
-                    }
-                qsort(w, (size_t)m, sizeof(double), fd_cmp);
-                t[((size_t)j * gx + i) * 3 + k] = m % 2 ? w[m / 2] : 0.5 * (w[m / 2 - 1] + w[m / 2]);
-            }
-    memcpy(e, t, (size_t)nn * 3 * sizeof(double));
     fd_blur(e, t, 1);
     fd_blur(e, t, 0);
     for (int q = 0; q < nn; q++)
         for (int k = 0; k < 3; k++)
-            e[(size_t)q * 3 + k] *= fade[q];
+            e[(size_t)q * 3 + k] *= fade[q] * g_fd_near[q];
     /* cam0 up by half the ratio, cam1 down by half */
     for (int q = 0; q < nn; q++)
         for (int k = 0; k < 3; k++) {
